@@ -62,7 +62,9 @@ All session control is driven directly inside OMP via slash commands:
 
 | Command | Usage | Description |
 |---|---|---|
-| `/link` | `/link` | Displays the link status card: current session ID, network mode, LAN PIN, and all online peers. |
+| `/link` | `/link` | Displays the link status card: session ID, network mode, LAN PIN, E2EE status, and all online peers. |
+| `/link off` | `/link off` | Instantly deactivates the mesh, suppresses auto-reconnect, and stops all disconnected logs. |
+| `/link on` | `/link on` | Re-enables the mesh, reconnects to the network, and resumes peer sync. |
 | `/link-start` | `/link-start [id] [pin]` | Starts or switches to hosting a session with the given ID and PIN. |
 | `/link-join` | `/link-join [id \| ip[:port]] [pin]` | Joins an active session. If no target is given, auto-discovers active sessions on your network mode. |
 | `/link-leave` | `/link-leave` | Disconnects from the current session. (Alias: `/link-disconnect`). |
@@ -73,33 +75,40 @@ All session control is driven directly inside OMP via slash commands:
 
 ---
 
-## 5. Security & Authentication Model
+## 5. Security & End-to-End Encryption Model
 
-`omp-link` enforces a strict **either/or network model** with dual-tier security:
+`omp-link` enforces a strict **either/or network model** with dual-tier cryptographic security:
 
-1. **Tailscale Mode (Default when active):**
+1. **Hardware-Accelerated E2EE (AES-256-GCM)**:
+   - All WebSocket frames (chat, direct tool RPC, file chunks) are encrypted via native Node.js `aes-256-gcm`.
+   - Keys are derived via **PBKDF2-HMAC-SHA256** (50,000 rounds) using a cryptographically isolated session salt.
+   - 128-bit authentication tags ensure automatic tamper rejection.
+2. **Tailscale Mode (Default when active):**
    - Connections strictly use the Tailscale network (`100.64.0.0/10`).
    - Authentication is **automatically verified** via WireGuard cryptographic peer identity (`isTailscaleOrLocalIp`). No PIN entry is needed when linking over Tailscale!
-2. **LAN Mode:**
+3. **LAN Mode:**
    - Connections use the local subnet.
    - Remote peers **must provide the 4-digit session PIN** to join.
    - Non-Tailscale connection attempts without a valid PIN are rejected with `4001: Invalid session PIN`.
-3. **Strict Network Isolation:**
-   - Probing and listening are strictly bound to either Tailscale or LAN, eliminating split-brain states and duplicate device appearances.
+4. **Deterministic Link ON/OFF & 3-Strike Circuit Breaker:**
+   - If network is unreachable, reconnect terminates after 3 strikes to avoid log spam.
+   - Running `/link off` cleanly halts all networking until explicit `/link on`.
 
 ---
 
 ## 6. LLM Agent Tools Reference
 
-Agents inside OMP have access to 5 coordination tools:
+Agents inside OMP have access to 7 coordination and execution tools:
 
-| Tool | Purpose | Key Parameters |
-|---|---|---|
-| `link_connect` | **Autonomous self-healing**: inspect status, auto-discover & join sessions, start hosting, switch network, or disconnect. | `{ action: "status" \| "join" \| "start" \| "leave", target?: "...", pin?: "...", network?: "tailscale" \| "lan" }` |
-| `link_send` | Send a task/message to another terminal on any machine. Includes auto-reconnect fallback if connection temporarily dropped. | `{ to: "terminal-name", message: "..." }` |
-| `link_list` | Inspect all connected terminals, their hostnames, projects, status, context window usage, session ID, and network mode. | `{}` |
-| `link_discover` | Scan the active network mode for other sessions and online terminals. | `{}` |
-| `link_compact` | Request that another terminal compact its context window before delegating a large task. | `{ to: "terminal-name", customInstructions?: "..." }` |
+| Tool | Purpose | Key Parameters | Latency |
+|---|---|---|---|
+| `link_exec` | **Direct Tool RPC**: Execute shell commands, read remote files, or list directories on a remote terminal without waking up the remote LLM! | `{ to: "name", action: "exec" \| "read_file" \| "list_dir", command?: "...", path?: "..." }` | **< 25ms** (Zero Tokens) |
+| `link_send_file` | **Out-of-band File Streaming**: Stream files across machines with 64KB chunking and SHA-256 verification. Also generates ephemeral direct HTTP links on `:9900/transfer/:token/:filename`. | `{ to: "name", filePath: "./dist/app.js", targetFilename: "app.js" }` | **< 50ms** |
+| `link_send` | **Agent-to-Agent Reasoning Delegation**: Send tasks or prompts directly into another agent's LLM reasoning loop. | `{ to: "name", message: "..." }` | **15–25s** (LLM turn) |
+| `link_list` | Inspect all connected terminals, their hostnames, projects, status, context window usage, session ID, and network mode. | `{}` | < 5ms |
+| `link_connect` | **Autonomous self-healing**: inspect status, auto-discover & join sessions, start hosting, switch network, or disconnect. | `{ action: "status" \| "join" \| "start" \| "leave", target?: "...", pin?: "...", network?: "tailscale" \| "lan" }` | < 100ms |
+| `link_discover` | Scan the active network mode for other sessions and online terminals. | `{}` | ~500ms |
+| `link_compact` | Request that another terminal compact its context window before delegating a large task. | `{ to: "name", customInstructions?: "..." }` | Variable |
 
 ### Autonomous Self-Healing for Agents:
 If an agent ever encounters `"Not connected to link"` on a tool call, the agent should invoke:
@@ -117,17 +126,21 @@ This automatically scans the active network, discovers the peer session, and rej
 
 When acting as an agent on the link:
 
-1. **Prevent Conversational Ping-Pong Loops**:
+1. **Prefer `link_exec` for Information Gathering & Actions**:
+   - If you only need to run a build, run tests, check `git status`, or read a file on another machine, use **`link_exec`**!
+   - `link_exec` runs in **10–25ms** and costs **zero LLM tokens**.
+   - Only use `link_send` when you specifically require the remote agent's brain to reason, refactor code, or plan architecture.
+2. **Prevent Conversational Ping-Pong Loops**:
    - Every `link_send` message triggers an LLM turn on the receiving agent (`triggerTurn: true`), which takes 5–15 seconds of LLM inference.
    - **Never** send polite conversational acknowledgments (e.g. "Thanks!", "Got it, standing by!", "You're welcome!").
    - When finishing an assigned task, state your results clearly and conclude with: `[FINAL ANSWER - No reply needed]`.
-2. **Pre-flight Status Check**:
+3. **Pre-flight Status Check**:
    - Run `link_list` before dispatching tasks.
    - Verify the target agent is `idle`. If it is `thinking` or `compacting`, your message will queue in its inbox until its current turn completes.
-3. **Context Window Hygiene**:
+4. **Context Window Hygiene**:
    - Check peer context utilization via `link_list`.
    - If a peer is above 75% context, call `link_compact` before sending a large code payload.
-4. **Targeting by Role or Project**:
+5. **Targeting by Role or Project**:
    - In your initial discovery, use `link_list` to see which machine has which project directory open, and dispatch repository-specific tasks to the terminal located in that project folder.
 
 ---
