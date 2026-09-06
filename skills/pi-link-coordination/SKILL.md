@@ -45,7 +45,7 @@ indistinguishable from work in progress.
 ### `link_send`
 
 The message is delivered to the receiver's model. The first message to arrive opens
-a batching window of about 200ms; later arrivals do not move its deadline, so a
+a batching window of about 50ms; later arrivals do not move its deadline, so a
 steady stream is delivered window by window instead of waiting for a pause. A batch
 arrives as one `[Link: N message(s) received]` block, in arrival order, containing
 one `From "name":` block per message.
