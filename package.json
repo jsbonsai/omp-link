@@ -23,6 +23,10 @@
     "setup.sh",
     "link.example.json"
   ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jsbonsai/omp-link.git"
+  },
   "keywords": [
     "omp-link",
     "pi-package",
