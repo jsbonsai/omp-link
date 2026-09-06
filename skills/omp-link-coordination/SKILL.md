@@ -1,9 +1,9 @@
 ---
-name: pi-link-coordination
-description: Mechanics of coordinating work across Pi terminals with link_send, link_list, and link_compact — how delivery, batching, callbacks, and remote compaction actually behave.
+name: omp-link-coordination
+description: Mechanics of coordinating work across OMP and Pi terminals with link_send, link_list, and link_compact — how delivery, batching, callbacks, and remote compaction actually behave.
 ---
 
-# Pi-Link Coordination
+# OMP-Link Coordination
 
 How the pi-link transport behaves between Pi terminals.
 

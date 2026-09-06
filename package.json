@@ -1,31 +1,41 @@
 {
-  "name": "pi-link",
-  "version": "0.4.0",
-  "description": "WebSocket-based inter-terminal communication for Pi. Connect multiple Pi terminals over a local link network.",
+  "name": "omp-link",
+  "version": "0.5.0",
+  "description": "Multi-machine and Tailnet-aware inter-terminal coordination mesh for Oh-My-Pi and Pi (forked from Alberto Vivar's pi-link).",
+  "type": "module",
   "author": "alvivar",
   "license": "MIT",
   "bin": {
+    "omp-link": "bin/omp-link.mjs",
     "pi-link": "bin/pi-link.mjs"
+  },
+  "scripts": {
+    "setup": "./setup.sh"
   },
   "files": [
     "bin",
     "skills",
     "index.ts",
+    "AGENT.md",
     "README.md",
     "CHANGELOG.md",
-    "LICENSE"
+    "LICENSE",
+    "setup.sh",
+    "link.example.json"
   ],
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/alvivar/pi-link.git"
-  },
   "keywords": [
+    "omp-link",
     "pi-package",
     "pi",
+    "omp",
+    "oh-my-pi",
     "link",
+    "tailscale",
+    "tailnet",
     "websocket",
     "terminal",
-    "multi-agent"
+    "multi-agent",
+    "swarm"
   ],
   "dependencies": {
     "ws": "^8.20.0"

@@ -17,9 +17,13 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
+import { execSync } from "node:child_process";
 import * as crypto from "node:crypto";
+import * as dgram from "node:dgram";
+import * as fs from "node:fs";
 import { createServer, type Server as HttpServer } from "node:http";
 import * as os from "node:os";
+import * as path from "node:path";
 
 import { WebSocket, WebSocketServer } from "ws";
 
@@ -32,6 +36,8 @@ import { WebSocket, WebSocketServer } from "ws";
 const MIN_PI_VERSION = [0, 84, 2];
 
 const DEFAULT_PORT = 9900;
+const DEFAULT_BIND = "0.0.0.0";
+const UDP_DISCOVERY_PORT = 9901;
 const COMPACT_TIMEOUT_MS = 180_000;
 const RECONNECT_DELAY_MS = 2000;
 // Bounds the HTTP Upgrade only. Without it `ws` waits forever, so a listener that
@@ -48,6 +54,9 @@ interface RegisterMsg {
   name: string;
   cwd?: string;
   context?: ContextSnapshot;
+  host?: string;
+  project?: string;
+  token?: string;
 }
 interface WelcomeMsg {
   type: "welcome";
@@ -56,6 +65,8 @@ interface WelcomeMsg {
   statuses?: Record<string, LinkStatus>;
   cwds?: Record<string, string>;
   contexts?: Record<string, ContextSnapshot>;
+  hosts?: Record<string, string>;
+  projects?: Record<string, string>;
 }
 interface TerminalJoinedMsg {
   type: "terminal_joined";
@@ -63,6 +74,8 @@ interface TerminalJoinedMsg {
   terminals: string[];
   cwd?: string;
   context?: ContextSnapshot;
+  host?: string;
+  project?: string;
 }
 interface TerminalLeftMsg {
   type: "terminal_left";
@@ -133,12 +146,15 @@ type LinkMessage =
  * are malformed. Anything unparsable, or with a component too large to compare
  * exactly, is refused rather than guessed at.
  */
-function piVersionSupported(version: string): boolean {
+function piVersionSupported(version?: string): boolean {
+  if (!version) return true; // tolerate missing or embedded versions in forks like OMP
+  if (process.env.PI_LINK_IGNORE_VERSION_CHECK === "1") return true;
+  const v = version.trim().replace(/^v/, "");
   const parsed =
     /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/.exec(
-      version.trim(),
+      v,
     );
-  if (!parsed) return false;
+  if (!parsed) return true; // tolerate non-semver strings in forks
   // A numeric prerelease identifier may not carry a leading zero. `0rc` may, being
   // alphanumeric, and so may a build identifier, which never affects precedence.
   const prerelease = parsed[4];
@@ -151,17 +167,435 @@ function piVersionSupported(version: string): boolean {
   return prerelease === undefined; // exactly the floor: only the release qualifies
 }
 
+// ─── Network Helpers ─────────────────────────────────────────────────────────
+
+interface NetworkInfo {
+  hostname: string;
+  tailscaleIp: string | null;
+  lanIps: string[];
+}
+
+function getNetworkInfo(): NetworkInfo {
+  const hostname = os.hostname();
+  let tailscaleIp: string | null = null;
+  const lanIps: string[] = [];
+
+  const interfaces = os.networkInterfaces();
+  for (const name of Object.keys(interfaces)) {
+    const addrs = interfaces[name];
+    if (!addrs) continue;
+    for (const addr of addrs) {
+      if (addr.family !== "IPv4" || addr.internal) continue;
+      const ip = addr.address;
+      const parts = ip.split(".").map(Number);
+      // Tailscale IPv4 CGNAT range: 100.64.0.0/10 (100.64.0.0 - 100.127.255.255)
+      if (parts[0] === 100 && parts[1] >= 64 && parts[1] <= 127) {
+        if (!tailscaleIp) tailscaleIp = ip;
+      } else if (
+        parts[0] === 10 ||
+        (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) ||
+        (parts[0] === 192 && parts[1] === 168)
+      ) {
+        lanIps.push(ip);
+      }
+    }
+  }
+  return { hostname, tailscaleIp, lanIps };
+}
+
+function isTailscaleOrLocalIp(ip?: string): boolean {
+  if (!ip) return false;
+  const cleanIp = ip.startsWith("::ffff:") ? ip.slice(7) : ip;
+  if (cleanIp === "127.0.0.1" || cleanIp === "::1" || cleanIp === "localhost") return true;
+  const parts = cleanIp.split(".").map(Number);
+  if (parts.length === 4 && parts[0] === 100 && parts[1] >= 64 && parts[1] <= 127) {
+    return true;
+  }
+  if (cleanIp.toLowerCase().startsWith("fd7a:115c:a1e0:")) return true;
+  return false;
+}
+
+interface LinkConfig {
+  hub?: string;
+  port?: number;
+  bind?: string;
+  tailscaleOnly?: boolean;
+  secret?: string;
+  lanDiscovery?: boolean;
+}
+
+function loadLinkConfig(): LinkConfig {
+  const dirs = [
+    path.join(os.homedir(), ".pi"),
+    path.join(os.homedir(), ".omp"),
+    path.join(os.homedir(), ".config", "pi-link"),
+  ];
+  for (const dir of dirs) {
+    const file = path.join(dir, "link.json");
+    if (fs.existsSync(file)) {
+      try {
+        return JSON.parse(fs.readFileSync(file, "utf-8"));
+      } catch {}
+    }
+  }
+  return {};
+}
+
+function startUdpDiscoveryResponder(tcpPort: number, secret?: string): dgram.Socket | null {
+  try {
+    const socket = dgram.createSocket({ type: "udp4", reuseAddr: true });
+    socket.on("message", (msg, rinfo) => {
+      const text = msg.toString().trim();
+      const parts = text.split(":");
+      if (parts[0] === "PI_LINK_DISCOVER") {
+        if (secret && parts[1] !== secret) return;
+        const resp = Buffer.from(`PI_LINK_HUB:${tcpPort}`);
+        socket.send(resp, rinfo.port, rinfo.address, () => {});
+      }
+    });
+    socket.on("error", () => {
+      try { socket.close(); } catch {}
+    });
+    socket.bind(UDP_DISCOVERY_PORT);
+    return socket;
+  } catch {
+    return null;
+  }
+}
+
+interface DiscoveredHub {
+  hubId?: string;
+  host: string;
+  ip: string;
+  port: number;
+  hubName: string;
+  dns?: string;
+  os?: string;
+  terminals: Array<{
+    name: string;
+    role: string;
+    status?: string;
+    host?: string;
+    project?: string;
+  }>;
+  source: "tailscale" | "lan" | "local";
+  endpoints?: string[];
+}
+
+function resolveTailscaleBin(): string | null {
+  const candidates = [
+    "tailscale",
+    "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
+    "/usr/local/bin/tailscale",
+    "/opt/homebrew/bin/tailscale",
+  ];
+  for (const c of candidates) {
+    try {
+      execSync(`"${c}" version`, { stdio: "ignore" });
+      return c;
+    } catch {}
+  }
+  return null;
+}
+
+function getTailnetPeers(
+  includeSelf = true,
+): Array<{ host: string; dns?: string; os?: string; ip: string; isSelf?: boolean }> {
+  const bin = resolveTailscaleBin();
+  if (!bin) return [];
+  try {
+    const stdout = execSync(`"${bin}" status --json`, {
+      encoding: "utf-8",
+      timeout: 3000,
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    const status = JSON.parse(stdout);
+    const peers: Array<{ host: string; dns?: string; os?: string; ip: string; isSelf?: boolean }> = [];
+    if (includeSelf && status.Self) {
+      const ipv4 = (status.Self.TailscaleIPs as string[])?.find((ip: string) => ip.startsWith("100."));
+      if (ipv4) {
+        peers.push({
+          host: status.Self.HostName || "localhost",
+          dns: status.Self.DNSName ? status.Self.DNSName.replace(/\.$/, "") : undefined,
+          os: status.Self.OS,
+          ip: ipv4,
+          isSelf: true,
+        });
+      }
+    }
+    if (status.Peer) {
+      for (const p of Object.values(status.Peer) as any[]) {
+        if (p && p.Online) {
+          const ipv4 = (p.TailscaleIPs as string[])?.find((ip: string) => ip.startsWith("100."));
+          if (ipv4) {
+            peers.push({
+              host: p.HostName,
+              dns: p.DNSName ? p.DNSName.replace(/\.$/, "") : undefined,
+              os: p.OS,
+              ip: ipv4,
+              isSelf: false,
+            });
+          }
+        }
+      }
+    }
+    return peers;
+  } catch {
+    return [];
+  }
+}
+
+async function discoverTailnetHubs(
+  port = DEFAULT_PORT,
+  timeoutMs = 800,
+): Promise<{ peersCount: number; hubs: DiscoveredHub[] }> {
+  const peers = getTailnetPeers(true);
+  if (peers.length === 0) return { peersCount: 0, hubs: [] };
+  const results = await Promise.all(
+    peers.map(async (peer) => {
+      try {
+        const res = await fetch(`http://${peer.ip}:${port}/status`, {
+          signal: AbortSignal.timeout(timeoutMs),
+        });
+        if (res.ok) {
+          const payload = (await res.json()) as any;
+          if (payload && payload.hub && Array.isArray(payload.terminals)) {
+            return {
+              hubId: payload.hubId,
+              host: peer.host,
+              ip: peer.ip,
+              port,
+              hubName: payload.hub,
+              dns: peer.dns,
+              os: peer.os,
+              terminals: payload.terminals,
+              source: "tailscale" as const,
+              endpoints: [`${peer.ip}:${port}`],
+            };
+          }
+        }
+      } catch {}
+      return null;
+    }),
+  );
+  return { peersCount: peers.length, hubs: results.filter(Boolean) as DiscoveredHub[] };
+}
+
+function discoverLanHubs(
+  port = DEFAULT_PORT,
+  timeoutMs = 400,
+  secret?: string,
+): Promise<Array<{ host: string; ip: string; port: number }>> {
+  return new Promise((resolve) => {
+    const found = new Map<string, { host: string; ip: string; port: number }>();
+    let socket: dgram.Socket | null = null;
+    const timer = setTimeout(() => {
+      try { socket?.close(); } catch {}
+      resolve(Array.from(found.values()));
+    }, timeoutMs);
+
+    try {
+      socket = dgram.createSocket({ type: "udp4", reuseAddr: true });
+      socket.on("message", (msg, rinfo) => {
+        const text = msg.toString().trim();
+        if (text.startsWith("PI_LINK_HUB:")) {
+          const p = Number(text.slice("PI_LINK_HUB:".length)) || port;
+          found.set(`${rinfo.address}:${p}`, { host: rinfo.address, ip: rinfo.address, port: p });
+        }
+      });
+      socket.on("error", () => {
+        clearTimeout(timer);
+        try { socket?.close(); } catch {}
+        resolve(Array.from(found.values()));
+      });
+      socket.bind(0, () => {
+        try {
+          socket?.setBroadcast(true);
+          const req = Buffer.from(secret ? `PI_LINK_DISCOVER:${secret}` : "PI_LINK_DISCOVER");
+          socket?.send(req, UDP_DISCOVERY_PORT, "255.255.255.255");
+        } catch {}
+      });
+    } catch {
+      clearTimeout(timer);
+      resolve([]);
+    }
+  });
+}
+
+async function discoverAllHubs(
+  port = DEFAULT_PORT,
+  timeoutMs = 900,
+  secret?: string,
+): Promise<{ hubs: DiscoveredHub[]; tailnetPeersCount: number }> {
+  const [tailnetRes, lanHubs] = await Promise.all([
+    discoverTailnetHubs(port, timeoutMs),
+    discoverLanHubs(port, Math.min(timeoutMs, 500), secret),
+  ]);
+
+  const hubMap = new Map<string, DiscoveredHub>();
+
+  function registerHub(hub: DiscoveredHub, payload?: any) {
+    const hubId = hub.hubId || payload?.hubId;
+    let existing: DiscoveredHub | undefined = undefined;
+    if (hubId) {
+      for (const h of hubMap.values()) {
+        if (h.hubId === hubId) {
+          existing = h;
+          break;
+        }
+      }
+    }
+    const rawKey =
+      hubId ||
+      `${payload?.host || hub.host}:${hub.port}:${payload?.hub || hub.hubName}`;
+    const key = rawKey.toLowerCase();
+    if (!existing) {
+      existing = hubMap.get(key);
+    }
+    const endpoint = `${hub.ip}:${hub.port}`;
+    if (existing) {
+      if (!existing.endpoints) existing.endpoints = [`${existing.ip}:${existing.port}`];
+      if (!existing.endpoints.includes(endpoint)) {
+        existing.endpoints.push(endpoint);
+      }
+      // Prefer LAN over Tailscale, and prefer external IP over localhost
+      if (existing.ip === "127.0.0.1" && hub.ip !== "127.0.0.1") {
+        existing.ip = hub.ip;
+        existing.port = hub.port;
+        existing.source = hub.source;
+      } else if (hub.source === "lan" && existing.source === "tailscale") {
+        existing.ip = hub.ip;
+        existing.port = hub.port;
+        existing.source = "lan";
+      }
+      return;
+    }
+    hub.hubId = hubId;
+    hub.endpoints = [endpoint];
+    hubMap.set(key, hub);
+  }
+
+  for (const h of tailnetRes.hubs) {
+    registerHub(h);
+  }
+
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/status`, {
+      signal: AbortSignal.timeout(300),
+    });
+    if (res.ok) {
+      const payload = (await res.json()) as any;
+      if (payload && payload.hub && Array.isArray(payload.terminals)) {
+        registerHub(
+          {
+            hubId: payload.hubId,
+            host: payload.host || "localhost",
+            ip: "127.0.0.1",
+            port,
+            hubName: payload.hub,
+            terminals: payload.terminals,
+            source: "local" as any,
+          },
+          payload,
+        );
+      }
+    }
+  } catch {}
+
+  await Promise.all(
+    lanHubs.map(async (lan) => {
+      try {
+        const res = await fetch(`http://${lan.ip}:${lan.port}/status`, {
+          signal: AbortSignal.timeout(400),
+        });
+        if (res.ok) {
+          const payload = (await res.json()) as any;
+          if (payload && payload.hub && Array.isArray(payload.terminals)) {
+            registerHub(
+              {
+                hubId: payload.hubId,
+                host: payload.host || lan.host,
+                ip: lan.ip,
+                port: lan.port,
+                hubName: payload.hub,
+                terminals: payload.terminals,
+                source: "lan",
+              },
+              payload,
+            );
+          }
+        }
+      } catch {}
+    }),
+  );
+
+  return {
+    hubs: Array.from(hubMap.values()),
+    tailnetPeersCount: tailnetRes.peersCount,
+  };
+}
+
+function discoverLanHub(timeoutMs = 400, secret?: string): Promise<{ host: string; port: number } | null> {
+  return new Promise((resolve) => {
+    let resolved = false;
+    let socket: dgram.Socket | null = null;
+    const timer = setTimeout(() => {
+      if (!resolved) {
+        resolved = true;
+        try { socket?.close(); } catch {}
+        resolve(null);
+      }
+    }, timeoutMs);
+
+    try {
+      socket = dgram.createSocket({ type: "udp4", reuseAddr: true });
+      socket.on("message", (msg, rinfo) => {
+        const text = msg.toString().trim();
+        if (text.startsWith("PI_LINK_HUB:")) {
+          const port = Number(text.slice("PI_LINK_HUB:".length)) || DEFAULT_PORT;
+          if (!resolved) {
+            resolved = true;
+            clearTimeout(timer);
+            try { socket?.close(); } catch {}
+            resolve({ host: rinfo.address, port });
+          }
+        }
+      });
+      socket.on("error", () => {
+        if (!resolved) {
+          resolved = true;
+          clearTimeout(timer);
+          try { socket?.close(); } catch {}
+          resolve(null);
+        }
+      });
+      socket.bind(0, () => {
+        try {
+          socket?.setBroadcast(true);
+          const req = Buffer.from(secret ? `PI_LINK_DISCOVER:${secret}` : "PI_LINK_DISCOVER");
+          socket?.send(req, UDP_DISCOVERY_PORT, "255.255.255.255");
+        } catch {}
+      });
+    } catch {
+      clearTimeout(timer);
+      resolve(null);
+    }
+  });
+}
+
 // ─── Extension ───────────────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
   // First statement, so an unsupported host leaves behind no flag, event, tool,
   // command, timer or socket to half-run with. Pi reports a factory that throws as an
   // extension load error naming this message, and keeps running without pi-link.
-  if (!piVersionSupported(PI_VERSION)) {
-    throw new Error(
-      `pi-link requires Pi >=${MIN_PI_VERSION.join(".")} (detected ${PI_VERSION || "unknown"}); ` +
-        `upgrade Pi, or pin pi-link 0.2.x for Pi 0.74–0.84.1.`,
-    );
+  if (PI_VERSION && !piVersionSupported(PI_VERSION)) {
+    if (process.env.PI_LINK_IGNORE_VERSION_CHECK !== "1") {
+      throw new Error(
+        `pi-link requires Pi >=${MIN_PI_VERSION.join(".")} (detected ${PI_VERSION || "unknown"}); ` +
+          `upgrade Pi, or pin pi-link 0.2.x for Pi 0.74–0.84.1.`,
+      );
+    }
   }
 
   pi.registerFlag("link", {
@@ -176,8 +610,36 @@ export default function (pi: ExtensionAPI) {
     type: "string",
   });
 
+  pi.registerFlag("link-hub", {
+    description:
+      "Target link hub address (e.g. 100.64.0.1:9900 or hub-desktop:9900)",
+    type: "string",
+  });
+
+  pi.registerFlag("link-bind", {
+    description:
+      "Network interface to bind (default 0.0.0.0 for Tailscale/LAN/localhost)",
+    type: "string",
+  });
+
+  pi.registerFlag("link-port", {
+    description: "Port to use for pi-link (default: 9900)",
+    type: "string",
+  });
+
   // ── State ────────────────────────────────────────────────────────────────
 
+  const config = loadLinkConfig();
+  let linkPort = Number(process.env.PI_LINK_PORT) || config.port || DEFAULT_PORT;
+  let linkBind = process.env.PI_LINK_BIND || config.bind || DEFAULT_BIND;
+  let targetHubAddress: string | null = process.env.PI_LINK_HUB || config.hub || null;
+  let isTailscaleOnly = process.env.PI_LINK_TAILSCALE_ONLY === "1" || Boolean(config.tailscaleOnly);
+  let linkSecret = process.env.PI_LINK_SECRET || config.secret || undefined;
+  let enableLanDiscovery = config.lanDiscovery !== false && process.env.PI_LINK_NO_LAN_DISCOVERY !== "1";
+
+  let udpResponder: dgram.Socket | null = null;
+  const hubInstanceId = `hub_${os.hostname().replace(/[^a-zA-Z0-9]/g, "_")}_${Date.now()}`;
+  let explicitHubMode = false;
   let role: "hub" | "client" | "disconnected" = "disconnected";
   let terminalName = `t-${crypto.randomUUID().slice(0, 4)}`;
   let preferredName: string | null = null;
@@ -207,6 +669,8 @@ export default function (pi: ExtensionAPI) {
   const terminalContexts = new Map<string, ContextSnapshot>(); // other terminals' context
   let currentCwd = "";
   const terminalCwds = new Map<string, string>(); // other terminals' cwds
+  const terminalHosts = new Map<string, string>(); // other terminals' hosts
+  const terminalProjects = new Map<string, string>(); // other terminals' projects
 
   // Hub state
   let wss: WebSocketServer | null = null;
@@ -217,6 +681,8 @@ export default function (pi: ExtensionAPI) {
   const hubTerminalStatuses = new Map<string, LinkStatus>(); // hub-authoritative
   const hubTerminalContexts = new Map<string, ContextSnapshot>(); // hub-authoritative
   const hubTerminalCwds = new Map<string, string>(); // hub-authoritative (excludes self)
+  const hubTerminalHosts = new Map<string, string>();
+  const hubTerminalProjects = new Map<string, string>();
 
   // Client state
   let ws: WebSocket | null = null;
@@ -420,6 +886,18 @@ export default function (pi: ExtensionAPI) {
     return terminalContexts.get(name) ?? null;
   }
 
+  function getHostFor(name: string): string | null {
+    if (name === terminalName) return os.hostname();
+    if (role === "hub") return hubTerminalHosts.get(name) ?? null;
+    return terminalHosts.get(name) ?? null;
+  }
+
+  function getProjectFor(name: string): string | null {
+    if (name === terminalName) return currentCwd ? path.basename(currentCwd) : null;
+    if (role === "hub") return hubTerminalProjects.get(name) ?? null;
+    return terminalProjects.get(name) ?? null;
+  }
+
   function shortenPath(cwd: string): string {
     const home = os.homedir().replace(/\\/g, "/");
     const normalized = cwd.replace(/\\/g, "/");
@@ -447,15 +925,17 @@ export default function (pi: ExtensionAPI) {
   // could postpone delivery for as long as it kept arriving.
   function scheduleFlush(delay: number) {
     if (flushTimer) return;
-    flushTimer = setTimeout(flushInbox, delay);
+    flushTimer = setTimeout(() => {
+      flushTimer = null;
+      flushInbox();
+    }, delay);
   }
 
   function flushInbox() {
-    flushTimer = null;
     if (inbox.length === 0) return;
     if (!ctx) return;
 
-    // Compacting: hold everything and return WITHOUT rescheduling. setCompacting()
+    // Delivery stays deferred behind either compaction gate. Messages wait; release
     // drains on release, so polling a compaction that may run to the 180s ceiling
     // would be ~900 wakeups for no information.
     if (compactionGated()) return;
@@ -466,7 +946,13 @@ export default function (pi: ExtensionAPI) {
     let totalChars = 0;
     for (let i = 0; i < inbox.length && batch.length < BATCH_MAX_ITEMS; i++) {
       const item = inbox[i];
-      const text = `From "${item.from}":\n${item.content}`;
+      const senderHost = getHostFor(item.from);
+      const senderProject = getProjectFor(item.from);
+      let senderInfo = item.from;
+      if (senderHost && (senderHost !== os.hostname() || senderProject)) {
+        senderInfo += ` on ${senderHost}${senderProject ? ` (project: ${senderProject})` : ""}`;
+      }
+      const text = `From "${senderInfo}":\n${item.content}`;
       if (batch.length > 0 && totalChars + text.length > BATCH_MAX_CHARS) break;
       batch.push(text);
       totalChars += text.length;
@@ -623,9 +1109,13 @@ export default function (pi: ExtensionAPI) {
       const status = getStatusFor(name);
       const cwd = getCwdFor(name);
       const context = getContextFor(name);
+      const host = getHostFor(name);
+      const project = getProjectFor(name);
       return {
         name,
         role: entryRole,
+        ...(host ? { host } : {}),
+        ...(project ? { project } : {}),
         ...(status
           ? {
               status: statusIdentity(status),
@@ -639,9 +1129,15 @@ export default function (pi: ExtensionAPI) {
       };
     };
 
+    const net = getNetworkInfo();
     return {
+      hubId: hubInstanceId,
       hub: terminalName,
-      port: DEFAULT_PORT,
+      port: linkPort,
+      bind: linkBind,
+      host: net.hostname,
+      tailscaleIp: net.tailscaleIp,
+      lanIps: net.lanIps,
       terminals: [
         describe(terminalName, "hub"),
         ...Array.from(hubClients.values())
@@ -679,6 +1175,43 @@ export default function (pi: ExtensionAPI) {
     return undefined;
   }
 
+  /** Hub: smart target resolution (exact -> case-insensitive -> prefix/fuzzy). */
+  function hubResolveTarget(target: string): { name: string; ws?: WebSocket; isHub?: boolean } | null {
+    if (target === terminalName) {
+      return { name: terminalName, isHub: true };
+    }
+
+    const directWs = hubClientByName(target);
+    if (directWs) return { name: target, ws: directWs };
+
+    const lower = target.toLowerCase();
+    if (terminalName.toLowerCase() === lower) {
+      return { name: terminalName, isHub: true };
+    }
+    for (const [clientWs, n] of hubClients) {
+      if (n.toLowerCase() === lower) return { name: n, ws: clientWs };
+    }
+
+    const normalizedTarget = normalizeName(target);
+    const matches: Array<{ name: string; ws: WebSocket }> = [];
+    for (const [clientWs, n] of hubClients) {
+      const normName = normalizeName(n);
+      if (
+        normName === normalizedTarget ||
+        normName.startsWith(`${normalizedTarget}-`) ||
+        normName.includes(normalizedTarget) ||
+        n.toLowerCase().startsWith(lower)
+      ) {
+        matches.push({ name: n, ws: clientWs });
+      }
+    }
+    if (matches.length === 1) {
+      return matches[0];
+    }
+
+    return null;
+  }
+
   /**
    * Route a message to its destination. Works in both hub and client roles.
    * Returns true if the message was delivered (or sent to the hub for routing).
@@ -689,17 +1222,20 @@ export default function (pi: ExtensionAPI) {
     msg: ChatMsg | CompactRequestMsg | CompactResponseMsg,
   ): boolean {
     if (role === "hub") {
-      if (msg.to === terminalName) {
-        handleIncoming(msg);
-        return true;
-      }
-      const targetWs = hubClientByName(msg.to);
-      if (targetWs) {
-        targetWs.send(JSON.stringify(msg));
-        return true;
+      const resolved = hubResolveTarget(msg.to);
+      if (resolved) {
+        if (resolved.isHub || resolved.name === terminalName) {
+          handleIncoming(msg);
+          return true;
+        }
+        if (resolved.ws) {
+          resolved.ws.send(JSON.stringify(msg));
+          return true;
+        }
       }
       // Target not found — send error back to sender
-      const errText = `Terminal "${msg.to}" not found`;
+      const online = terminalList().join(", ");
+      const errText = `Terminal "${msg.to}" not found. Online terminals: ${online}`;
       const errorMsg: LinkMessage =
         msg.type === "compact_request"
           ? {
@@ -713,9 +1249,6 @@ export default function (pi: ExtensionAPI) {
           : { type: "error", message: errText };
 
       if (msg.from === terminalName) {
-        // For compact_request, deliver the error response locally so the
-        // matching pending map resolves. For chat, skip — the tool result
-        // (via return false) is sufficient; no extra UI toast.
         if (errorMsg.type === "compact_response") handleIncoming(errorMsg);
       } else {
         hubClientByName(msg.from)?.send(JSON.stringify(errorMsg));
@@ -756,6 +1289,16 @@ export default function (pi: ExtensionAPI) {
             terminalContexts.set(name, c);
           }
         }
+        if (msg.hosts) {
+          for (const [name, host] of Object.entries(msg.hosts)) {
+            terminalHosts.set(name, host);
+          }
+        }
+        if (msg.projects) {
+          for (const [name, proj] of Object.entries(msg.projects)) {
+            terminalProjects.set(name, proj);
+          }
+        }
         updateStatus();
         notify(
           `Joined link as "${terminalName}" (${connectedTerminals.length} online)`,
@@ -770,6 +1313,9 @@ export default function (pi: ExtensionAPI) {
         if (role !== "hub" && msg.cwd) terminalCwds.set(msg.name, msg.cwd);
         if (role !== "hub" && msg.context)
           terminalContexts.set(msg.name, msg.context);
+        if (role !== "hub" && msg.host) terminalHosts.set(msg.name, msg.host);
+        if (role !== "hub" && msg.project)
+          terminalProjects.set(msg.name, msg.project);
         updateStatus();
         notify(`"${msg.name}" joined the link`, "info");
         break;
@@ -780,6 +1326,8 @@ export default function (pi: ExtensionAPI) {
         if (role !== "hub") {
           terminalCwds.delete(msg.name);
           terminalContexts.delete(msg.name);
+          terminalHosts.delete(msg.name);
+          terminalProjects.delete(msg.name);
         }
         // Fail any pending compact request to the departed terminal
         for (const [id, pending] of pendingCompactResponses) {
@@ -808,6 +1356,10 @@ export default function (pi: ExtensionAPI) {
 
       // ── Chat message ──
       case "chat":
+        if (msg.from && !connectedTerminals.includes(msg.from)) {
+          connectedTerminals.push(msg.from);
+          updateStatus();
+        }
         inbox.push({ from: msg.from, content: msg.content });
         scheduleFlush(FLUSH_DELAY_MS);
         break;
@@ -917,10 +1469,16 @@ export default function (pi: ExtensionAPI) {
       // First message must be register
       if (msg.type === "register") {
         if (clientName) return; // already registered — ignore duplicate
+        if (linkSecret && msg.token !== linkSecret) {
+          clientWs.close(4001, "Unauthorized");
+          return;
+        }
         clientName = uniqueName(msg.name);
         hubClients.set(clientWs, clientName);
         if (msg.cwd) hubTerminalCwds.set(clientName, msg.cwd);
         if (msg.context) hubTerminalContexts.set(clientName, msg.context);
+        if (msg.host) hubTerminalHosts.set(clientName, msg.host);
+        if (msg.project) hubTerminalProjects.set(clientName, msg.project);
         const list = terminalList();
         connectedTerminals = list;
         updateStatus();
@@ -942,6 +1500,16 @@ export default function (pi: ExtensionAPI) {
         for (const [name, c] of hubTerminalContexts) {
           if (name !== clientName) contexts[name] = c;
         }
+        const hosts: Record<string, string> = {};
+        hosts[terminalName] = os.hostname();
+        for (const [name, host] of hubTerminalHosts) {
+          if (name !== clientName) hosts[name] = host;
+        }
+        const projects: Record<string, string> = {};
+        if (currentCwd) projects[terminalName] = path.basename(currentCwd);
+        for (const [name, proj] of hubTerminalProjects) {
+          if (name !== clientName) projects[name] = proj;
+        }
         clientWs.send(
           JSON.stringify({
             type: "welcome",
@@ -950,6 +1518,8 @@ export default function (pi: ExtensionAPI) {
             statuses,
             cwds,
             contexts,
+            hosts,
+            projects,
           } satisfies WelcomeMsg),
         );
 
@@ -960,6 +1530,8 @@ export default function (pi: ExtensionAPI) {
           terminals: list,
           cwd: msg.cwd,
           context: msg.context,
+          host: msg.host,
+          project: msg.project,
         };
         hubBroadcast(joined, clientName);
         return;
@@ -1006,6 +1578,8 @@ export default function (pi: ExtensionAPI) {
       hubTerminalStatuses.delete(name);
       hubTerminalContexts.delete(name);
       hubTerminalCwds.delete(name);
+      hubTerminalHosts.delete(name);
+      hubTerminalProjects.delete(name);
       const list = terminalList();
       connectedTerminals = list;
       updateStatus();
@@ -1073,18 +1647,39 @@ export default function (pi: ExtensionAPI) {
         role = "hub";
         connectedTerminals = [terminalName];
         updateStatus();
+        const net = getNetworkInfo();
+        const ips = [
+          net.tailscaleIp ? `Tailscale: ${net.tailscaleIp}:${linkPort}` : null,
+          net.lanIps.length > 0 ? `LAN: ${net.lanIps[0]}:${linkPort}` : null,
+          `local: :${linkPort}`,
+        ]
+          .filter(Boolean)
+          .join(" · ");
         notify(
-          `Link hub started on :${DEFAULT_PORT} as "${terminalName}"`,
+          `Link hub started (${ips}) as "${terminalName}"`,
           "info",
         );
+        if (enableLanDiscovery && !udpResponder) {
+          udpResponder = startUdpDiscoveryResponder(linkPort, linkSecret);
+        }
         settle(true);
       });
 
-      server.on("connection", (clientWs) => {
+      server.on("connection", (clientWs, req) => {
         // Only the established hub may adopt a client. A cancelled listener can
         // still receive one while it unwinds, and teardown clears both of these.
         if (wss !== server || role !== "hub") {
           clientWs.close();
+          return;
+        }
+        const clientIp = req.socket.remoteAddress;
+        if (isTailscaleOnly && !isTailscaleOrLocalIp(clientIp)) {
+          clientWs.close(4003, "Tailscale only");
+          return;
+        }
+        const reqToken = req.headers["x-link-token"];
+        if (linkSecret && reqToken && reqToken !== linkSecret) {
+          clientWs.close(4001, "Unauthorized");
           return;
         }
         hubHandleClient(clientWs);
@@ -1100,17 +1695,25 @@ export default function (pi: ExtensionAPI) {
         settle(false);
       });
 
-      // Last, so no forwarded event can arrive before its handler exists.
-      httpServer.listen(DEFAULT_PORT, "127.0.0.1");
+      // Bind to configured host/interface (default 0.0.0.0 for multi-machine access)
+      httpServer.listen(linkPort, linkBind);
     });
   }
 
   // ── Connect as client ────────────────────────────────────────────────────
 
-  function connectAsClient(attempt: ConnectionAttempt): Promise<boolean> {
+  function connectAsClient(
+    attempt: ConnectionAttempt,
+    targetEndpoint?: string,
+  ): Promise<boolean> {
     return new Promise((resolve) => {
-      const socket = new WebSocket(`ws://127.0.0.1:${DEFAULT_PORT}`, {
+      let endpoint = targetEndpoint || `127.0.0.1:${linkPort}`;
+      if (!endpoint.includes(":") || (endpoint.startsWith("[") && !endpoint.includes("]:"))) {
+        endpoint = `${endpoint}:${linkPort}`;
+      }
+      const socket = new WebSocket(`ws://${endpoint}`, {
         handshakeTimeout: CONNECT_HANDSHAKE_TIMEOUT_MS,
+        headers: linkSecret ? { "x-link-token": linkSecret } : undefined,
       });
       attempt.socket = socket;
 
@@ -1141,6 +1744,9 @@ export default function (pi: ExtensionAPI) {
             name: preferredName ?? terminalName,
             cwd: currentCwd || undefined,
             context: captureContext(),
+            host: os.hostname(),
+            project: currentCwd ? path.basename(currentCwd) : undefined,
+            token: linkSecret,
           } satisfies RegisterMsg),
         );
         settle(true);
@@ -1206,9 +1812,59 @@ export default function (pi: ExtensionAPI) {
 
   async function runAttempt(attempt: ConnectionAttempt) {
     try {
-      // Try connecting to an existing hub
-      if (await connectAsClient(attempt)) return;
-      if (!attemptIsCurrent(attempt)) return;
+      if (explicitHubMode) {
+        if (await startHub(attempt)) return;
+        if (!attemptIsCurrent(attempt)) return;
+        scheduleReconnect();
+        return;
+      }
+
+      if (targetHubAddress) {
+        if (await connectAsClient(attempt, targetHubAddress)) return;
+        if (!attemptIsCurrent(attempt)) return;
+        const hostOnly = targetHubAddress.split(":")[0];
+        if (hostOnly !== "127.0.0.1" && hostOnly !== "localhost") {
+          // Check if the hub is active on another IP/interface via discovery
+          const { hubs } = await discoverAllHubs(linkPort, 600, linkSecret);
+          if (hubs.length > 0 && attemptIsCurrent(attempt)) {
+            const bestHub = hubs[0];
+            const discoveredTarget = `${bestHub.ip}:${bestHub.port}`;
+            if (discoveredTarget !== targetHubAddress) {
+              notify(
+                `Hub at ${targetHubAddress} unreachable. Switching to discovered hub "${bestHub.hubName}" on ${bestHub.host} (${discoveredTarget})...`,
+                "info",
+              );
+              targetHubAddress = discoveredTarget;
+              if (await connectAsClient(attempt, discoveredTarget)) return;
+              if (!attemptIsCurrent(attempt)) return;
+            }
+          }
+          notify(
+            `Could not reach hub at ${targetHubAddress}. Retrying in background...`,
+            "warning",
+          );
+          scheduleReconnect();
+          return;
+        }
+      } else {
+        // Try local hub
+        if (await connectAsClient(attempt, `127.0.0.1:${linkPort}`)) return;
+        if (!attemptIsCurrent(attempt)) return;
+
+        // Auto-discover active hubs across Tailnet and LAN
+        const { hubs } = await discoverAllHubs(linkPort, 600, linkSecret);
+        if (hubs.length > 0 && attemptIsCurrent(attempt)) {
+          const bestHub = hubs[0];
+          const target = `${bestHub.ip}:${bestHub.port}`;
+          targetHubAddress = target;
+          notify(
+            `Auto-discovered hub "${bestHub.hubName}" on ${bestHub.host} (${target}). Connecting...`,
+            "info",
+          );
+          if (await connectAsClient(attempt, target)) return;
+          if (!attemptIsCurrent(attempt)) return;
+        }
+      }
 
       // No hub found — become the hub
       if (await startHub(attempt)) return;
@@ -1268,6 +1924,13 @@ export default function (pi: ExtensionAPI) {
     // This also clears the reconnect and startup timers.
     cancelConnectionAttempt();
 
+    if (udpResponder) {
+      try {
+        udpResponder.close();
+      } catch {}
+      udpResponder = null;
+    }
+
     // Clear link-owned remote compaction state; a local /compact survives disconnect.
     compactRunning = false;
     // Runs before role is cleared, so peers still get a final status; more to the
@@ -1306,6 +1969,10 @@ export default function (pi: ExtensionAPI) {
     hubTerminalContexts.clear();
     terminalCwds.clear();
     hubTerminalCwds.clear();
+    terminalHosts.clear();
+    terminalProjects.clear();
+    hubTerminalHosts.clear();
+    hubTerminalProjects.clear();
     lastPushedStatus = null;
     updateStatus();
 
@@ -1389,8 +2056,44 @@ export default function (pi: ExtensionAPI) {
         terminalName = preferredName;
       } else {
         const sessionName = normalizeName(pi.getSessionName());
-        if (sessionName) terminalName = sessionName;
+        if (sessionName && sessionName !== "main") {
+          terminalName = sessionName;
+        } else {
+          // Derive smart default name from project folder name
+          const project = path.basename(process.cwd());
+          const candidate = normalizeName(project);
+          if (candidate && candidate !== "main") {
+            terminalName = candidate;
+          } else {
+            terminalName = normalizeName(os.hostname().split(".")[0]) || "main";
+          }
+        }
       }
+    }
+
+    const cliHub = pi.getFlag("link-hub");
+    if (typeof cliHub === "string" && cliHub.trim()) {
+      const trimmed = cliHub.trim();
+      if (trimmed === "local" || trimmed === "hub") {
+        explicitHubMode = true;
+        targetHubAddress = null;
+      } else if (trimmed === "none") {
+        targetHubAddress = null;
+      } else {
+        targetHubAddress = trimmed;
+      }
+    }
+    const cliPort = pi.getFlag("link-port");
+    if (typeof cliPort === "string" && cliPort.trim()) {
+      linkPort = Number(cliPort.trim()) || linkPort;
+    }
+    const cliBind = pi.getFlag("link-bind");
+    if (typeof cliBind === "string" && cliBind.trim()) {
+      linkBind = cliBind.trim();
+    }
+    const savedHub = latestCustomData("link-hub") as { hub?: unknown } | undefined;
+    if (!targetHubAddress && typeof savedHub?.hub === "string" && savedHub.hub.trim()) {
+      targetHubAddress = savedHub.hub.trim();
     }
 
     if (flagName || shouldConnect()) scheduleStartupConnect();
@@ -1537,15 +2240,28 @@ export default function (pi: ExtensionAPI) {
     async execute(_toolCallId, params) {
       if (role === "disconnected") return notConnectedResult();
 
-      // Pre-validate target exists locally (best-effort, catches typos and definitely-absent names)
       if (params.to === terminalName) {
-        return textResult("Cannot send to yourself", {
-          to: params.to,
-          error: "self_target",
-        });
+        const otherTerminals = connectedTerminals.filter((t) => t !== terminalName);
+        if (otherTerminals.length === 1) {
+          params.to = otherTerminals[0];
+        } else {
+          return textResult(
+            `Cannot send to yourself ("${terminalName}"). Other online terminals: ${otherTerminals.join(", ") || "none"}`,
+            { to: params.to, error: "self_target" },
+          );
+        }
       }
-      const miss = targetNotFound(params.to);
-      if (miss) return miss;
+
+      if (role === "hub") {
+        const resolved = hubResolveTarget(params.to);
+        if (!resolved) {
+          return textResult(
+            `Terminal "${params.to}" not found. Connected: ${connectedTerminals.join(", ")}`,
+            { to: params.to, error: "not_found" },
+          );
+        }
+        params.to = resolved.name;
+      }
 
       const delivered = routeMessage({
         type: "chat",
@@ -1586,16 +2302,17 @@ export default function (pi: ExtensionAPI) {
     name: "link_compact",
     label: "Link Compact",
     description: [
-      "Ask another Pi terminal to compact its context window and wait until it finishes.",
-      "Returns once the target has compacted, so you can immediately send it new work.",
-      "A target declines unless Pi reports its session idle and no manual compaction holds its gate, so an active run, retry, automatic compaction, queued continuation or reported `compacting` all decline.",
+      "Ask one other Pi terminal on the link to compact its context.",
+      "Blocks until compaction completes, fails, or times out (up to 180s).",
     ].join(" "),
-    promptSnippet: "Ask another Pi terminal to compact its context window",
+    promptSnippet:
+      "Ask another Pi terminal on the link to compact its context",
     parameters: Type.Object({
       to: Type.String({ description: "Target terminal name" }),
-      instructions: Type.Optional(
+      customInstructions: Type.Optional(
         Type.String({
-          description: "Optional custom compaction instructions for the target",
+          description:
+            "Custom instructions to guide the compaction summary (optional)",
         }),
       ),
     }),
@@ -1617,8 +2334,16 @@ export default function (pi: ExtensionAPI) {
         });
       }
 
-      const miss = targetNotFound(params.to);
-      if (miss) return miss;
+      if (role === "hub") {
+        const resolved = hubResolveTarget(params.to);
+        if (!resolved) {
+          return textResult(
+            `Terminal "${params.to}" not found. Connected: ${connectedTerminals.join(", ")}`,
+            { to: params.to, error: "not_found" },
+          );
+        }
+        params.to = resolved.name;
+      }
 
       const requestId = crypto.randomUUID();
 
@@ -1703,6 +2428,8 @@ export default function (pi: ExtensionAPI) {
       const statuses: Record<string, string> = {};
       const cwds: Record<string, string> = {};
       const contexts: Record<string, ContextSnapshot> = {};
+      const hosts: Record<string, string> = {};
+      const projects: Record<string, string> = {};
       const list = connectedTerminals
         .map((name) => {
           const status = getStatusFor(name);
@@ -1713,8 +2440,14 @@ export default function (pi: ExtensionAPI) {
           const context = getContextFor(name);
           if (context) contexts[name] = context;
           const ctxStr = formatContext(context);
+          const host = getHostFor(name);
+          if (host) hosts[name] = host;
+          const project = getProjectFor(name);
+          if (project) projects[name] = project;
           const marker = name === terminalName ? " (you)" : "";
-          let line = `  \u2022 ${name}${marker}${statusStr ? "  " + statusStr : ""}`;
+          let line = `  \u2022 ${name}${marker}`;
+          if (host) line += ` [host: ${host}${project ? `, project: ${project}` : ""}]`;
+          if (statusStr) line += `  ${statusStr}`;
           if (ctxStr) line += `  \u00b7 ${ctxStr}`;
           if (cwd) line += `\n    cwd: ${cwd}`;
           return line;
@@ -1726,6 +2459,8 @@ export default function (pi: ExtensionAPI) {
         statuses,
         cwds,
         contexts,
+        hosts,
+        projects,
         self: terminalName,
         role,
       });
@@ -1738,6 +2473,8 @@ export default function (pi: ExtensionAPI) {
             statuses?: Record<string, string>;
             cwds?: Record<string, string>;
             contexts?: Record<string, ContextSnapshot>;
+            hosts?: Record<string, string>;
+            projects?: Record<string, string>;
             self?: string;
             role?: string;
           }
@@ -1755,7 +2492,10 @@ export default function (pi: ExtensionAPI) {
         const status = details.statuses?.[name] ?? "";
         const cwd = details.cwds?.[name];
         const ctxStr = formatContext(details.contexts?.[name]);
-        const nameStr = isSelf ? `\u2022 ${name} (you)` : `\u2022 ${name}`;
+        const host = details.hosts?.[name];
+        const project = details.projects?.[name];
+        let nameStr = isSelf ? `\u2022 ${name} (you)` : `\u2022 ${name}`;
+        if (host) nameStr += ` [${host}${project ? ` · ${project}` : ""}]`;
         text +=
           "\n  " +
           (isSelf ? theme.fg("accent", nameStr) : theme.fg("text", nameStr)) +
@@ -1765,6 +2505,45 @@ export default function (pi: ExtensionAPI) {
       }
       return new Text(text, 0, 0);
     },
+  });
+
+  pi.registerTool({
+    name: "link_discover",
+    label: "Link Discover",
+    description:
+      "Search for active pi-link hubs and sessions across the Tailscale network (tailnet) and local network (LAN).",
+    promptSnippet: "Discover active pi-link sessions and hubs on Tailnet/LAN",
+    parameters: Type.Object({}),
+
+    async execute() {
+      const { hubs, tailnetPeersCount } = await discoverAllHubs(linkPort, 1200, linkSecret);
+      if (hubs.length === 0) {
+        return textResult(
+          `No active pi-link hubs discovered across ${tailnetPeersCount} Tailnet peer(s) or LAN.`,
+          { hubs: [], tailnetPeersCount },
+        );
+      }
+
+      let text = `Discovered ${hubs.length} active pi-link hub(s) across network:\n\n`;
+      for (const h of hubs) {
+        const terms = (h.terminals || [])
+          .map(
+            (t) =>
+              `${t.name} (${t.status || "idle"}, host: ${t.host || h.host}${t.project ? `, project: ${t.project}` : ""})`,
+          )
+          .join("\n    - ");
+        text += `• Hub "${h.hubName}" on ${h.host} (${h.ip}:${h.port}) [via ${h.source}]:\n    - ${terms}\n`;
+      }
+      text += `\nTo connect to any discovered hub, use /link-connect <endpoint>.`;
+
+      return textResult(text, { hubs, tailnetPeersCount });
+    },
+
+    renderCall(_args, theme) {
+      return new Text(theme.fg("toolTitle", theme.bold("link_discover")), 0, 0);
+    },
+
+    renderResult: (result, _options, theme) => renderIconResult(result, theme),
   });
 
   // ── Commands ─────────────────────────────────────────────────────────────
@@ -1781,8 +2560,12 @@ export default function (pi: ExtensionAPI) {
         const statusStr = status ? formatStatus(status) : "";
         const cwd = getCwdFor(name);
         const ctxStr = formatContext(getContextFor(name));
+        const host = getHostFor(name);
+        const project = getProjectFor(name);
         const marker = name === terminalName ? " (you)" : "";
-        let line = `${name}${marker}${statusStr ? ": " + statusStr : ""}`;
+        let line = `${name}${marker}`;
+        if (host) line += ` [${host}${project ? ` · ${project}` : ""}]`;
+        if (statusStr) line += `: ${statusStr}`;
         if (ctxStr) line += ` \u00b7 ${ctxStr}`;
         if (cwd) line += `\n  cwd: ${shortenPath(cwd)}`;
         return line;
@@ -1856,6 +2639,8 @@ export default function (pi: ExtensionAPI) {
             terminals: list,
             cwd: currentCwd,
             context: captureContext(),
+            host: os.hostname(),
+            project: currentCwd ? path.basename(currentCwd) : undefined,
           },
           terminalName,
         );
@@ -1898,19 +2683,67 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerCommand("link-connect", {
-    description: "Connect to the link",
-    handler: async (_args, _ctx) => {
+    description: "Connect to the link. Usage: /link-connect [host[:port]]",
+    handler: async (args, _ctx) => {
+      const target = normalizeName(args);
+      if (target) {
+        if (target === "local" || target === "hub" || target === "none") {
+          targetHubAddress = null;
+          pi.appendEntry("link-hub", { hub: null });
+        } else {
+          targetHubAddress = target;
+          pi.appendEntry("link-hub", { hub: target });
+        }
+      }
       if (role !== "disconnected") {
-        _ctx.ui.notify(
-          `Already connected as "${terminalName}" (${role})`,
-          "info",
-        );
-        return;
+        if (target) {
+          _ctx.ui.notify(`Reconnecting to hub at ${target}...`, "info");
+          disconnect();
+        } else {
+          _ctx.ui.notify(
+            `Already connected as "${terminalName}" (${role})`,
+            "info",
+          );
+          return;
+        }
       }
       pi.appendEntry("link-active", { active: true });
       manuallyDisconnected = false;
       await initialize();
     },
+  });
+
+  const handleDiscoverCommand = async (_args: string, _ctx: ExtensionContext) => {
+    _ctx.ui.notify("Scanning Tailnet & LAN for active pi-link hubs...", "info");
+    const { hubs, tailnetPeersCount } = await discoverAllHubs(linkPort, 1200, linkSecret);
+    if (hubs.length === 0) {
+      _ctx.ui.notify(
+        tailnetPeersCount > 0
+          ? `No active pi-link hubs found (${tailnetPeersCount} Tailnet peers scanned).`
+          : "No active pi-link hubs found on Tailnet or LAN.",
+        "info",
+      );
+      return;
+    }
+
+    let summary = `⚡ Found ${hubs.length} active pi-link hub(s):\n`;
+    for (const h of hubs) {
+      const terms = (h.terminals || [])
+        .map((t) => `${t.name}${t.project ? ` (${t.project})` : ""}`)
+        .join(", ");
+      summary += `\n• ${h.host} (${h.ip}:${h.port}) [${h.source}]\n  Hub "${h.hubName}" · ${h.terminals?.length || 1} online: ${terms}\n  Connect: /link-connect ${h.ip}:${h.port}`;
+    }
+    _ctx.ui.notify(summary.trim(), "info");
+  };
+
+  pi.registerCommand("link-discover", {
+    description: "Discover active pi-link hubs across Tailnet & LAN",
+    handler: handleDiscoverCommand,
+  });
+
+  pi.registerCommand("link-search", {
+    description: "Search for active pi-link hubs across Tailnet & LAN",
+    handler: handleDiscoverCommand,
   });
 
   // ── Message renderer ─────────────────────────────────────────────────────
