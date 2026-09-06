@@ -113,7 +113,26 @@ This automatically scans the active network, discovers the peer session, and rej
 
 ---
 
-## 7. Maintenance & Debugging CLI
+## 7. Agent Guidelines for Fast Swarm Collaboration
+
+When acting as an agent on the link:
+
+1. **Prevent Conversational Ping-Pong Loops**:
+   - Every `link_send` message triggers an LLM turn on the receiving agent (`triggerTurn: true`), which takes 5–15 seconds of LLM inference.
+   - **Never** send polite conversational acknowledgments (e.g. "Thanks!", "Got it, standing by!", "You're welcome!").
+   - When finishing an assigned task, state your results clearly and conclude with: `[FINAL ANSWER - No reply needed]`.
+2. **Pre-flight Status Check**:
+   - Run `link_list` before dispatching tasks.
+   - Verify the target agent is `idle`. If it is `thinking` or `compacting`, your message will queue in its inbox until its current turn completes.
+3. **Context Window Hygiene**:
+   - Check peer context utilization via `link_list`.
+   - If a peer is above 75% context, call `link_compact` before sending a large code payload.
+4. **Targeting by Role or Project**:
+   - In your initial discovery, use `link_list` to see which machine has which project directory open, and dispatch repository-specific tasks to the terminal located in that project folder.
+
+---
+
+## 8. Maintenance & Debugging CLI
 
 Outside OMP, these CLI commands assist with maintenance:
 
@@ -134,4 +153,3 @@ Outside OMP, these CLI commands assist with maintenance:
   ```bash
   omp-link --version
   ```
-

@@ -6,6 +6,20 @@ This changelog is based on the git history from `2026-03-21` (initial commit) th
 
 ---
 
+## 0.5.1 — 2026-09-06
+
+### Added
+- **Visual ASCII Status Dashboard in Documentation:** Added exact terminal visual cards for `/link` and stream output in `README.md`.
+- **Broadcast Routing:** Hub now handles broadcast routing when `to` is set to `"*"` or `"all"`.
+- **Latency & Turn Diagnostics:** Comprehensive documentation explaining LLM inference turnaround times vs wire latency, and best practices for preventing ping-pong conversational loops.
+- **Agent Coordination Rules:** Added clear swarm guidelines in `AGENT.md` on token hygiene, status pre-flight, and non-conversational task completion.
+
+### Changed
+- **Snappier Inbox Delivery:** Decreased `FLUSH_DELAY_MS` from 200ms to 50ms, reducing debounce delay by 4x.
+- **Enhanced Peer Discovery:** Subnet broadcast probing on LAN and WireGuard fallback detection across Mac and Linux.
+
+---
+
 ## 0.4.0 — 2026-09-04
 
 ### Added

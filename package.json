@@ -1,6 +1,6 @@
 {
   "name": "omp-link",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "Multi-machine and Tailnet-aware inter-terminal coordination mesh for Oh-My-Pi and Pi (forked from Alberto Vivar's pi-link).",
   "type": "module",
   "author": "alvivar",
