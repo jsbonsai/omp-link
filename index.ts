@@ -43,7 +43,7 @@ const RECONNECT_DELAY_MS = 2000;
 // Bounds the HTTP Upgrade only. Without it `ws` waits forever, so a listener that
 // accepts the socket and never answers leaves the terminal offline with no retry.
 const CONNECT_HANDSHAKE_TIMEOUT_MS = 5_000;
-const FLUSH_DELAY_MS = 200;
+const FLUSH_DELAY_MS = 50;
 const BATCH_MAX_ITEMS = 20;
 const BATCH_MAX_CHARS = 16_000;
 
@@ -1412,6 +1412,15 @@ export default function (pi: ExtensionAPI) {
     msg: ChatMsg | CompactRequestMsg | CompactResponseMsg,
   ): boolean {
     if (role === "hub") {
+      if (msg.to === "*" || msg.to === "all") {
+        if (msg.type === "chat") {
+          hubBroadcast(msg, msg.from);
+          if (msg.from !== terminalName) {
+            handleIncoming(msg);
+          }
+          return true;
+        }
+      }
       const resolved = hubResolveTarget(msg.to);
       if (resolved) {
         if (resolved.isHub || resolved.name === terminalName) {
