@@ -21,7 +21,7 @@ import { execSync } from "node:child_process";
 import * as crypto from "node:crypto";
 import * as dgram from "node:dgram";
 import * as fs from "node:fs";
-import { createServer, type Server as HttpServer } from "node:http";
+import { createServer, type Server as HttpServer, type IncomingMessage } from "node:http";
 import * as os from "node:os";
 import * as path from "node:path";
 
@@ -52,6 +52,9 @@ const BATCH_MAX_CHARS = 16_000;
 interface RegisterMsg {
   type: "register";
   name: string;
+  sessionId?: string;
+  pin?: string;
+  network?: string;
   cwd?: string;
   context?: ContextSnapshot;
   host?: string;
@@ -61,6 +64,9 @@ interface RegisterMsg {
 interface WelcomeMsg {
   type: "welcome";
   name: string;
+  sessionId?: string;
+  pin?: string;
+  network?: string;
   terminals: string[];
   statuses?: Record<string, LinkStatus>;
   cwds?: Record<string, string>;
@@ -71,6 +77,8 @@ interface WelcomeMsg {
 interface TerminalJoinedMsg {
   type: "terminal_joined";
   name: string;
+  sessionId?: string;
+  network?: string;
   terminals: string[];
   cwd?: string;
   context?: ContextSnapshot;
@@ -222,12 +230,15 @@ interface LinkConfig {
   tailscaleOnly?: boolean;
   secret?: string;
   lanDiscovery?: boolean;
+  network?: "tailscale" | "lan";
+  sessionId?: string;
+  pin?: string;
 }
 
 function loadLinkConfig(): LinkConfig {
   const dirs = [
-    path.join(os.homedir(), ".pi"),
     path.join(os.homedir(), ".omp"),
+    path.join(os.homedir(), ".pi"),
     path.join(os.homedir(), ".config", "pi-link"),
   ];
   for (const dir of dirs) {
@@ -239,6 +250,22 @@ function loadLinkConfig(): LinkConfig {
     }
   }
   return {};
+}
+
+function saveLinkConfig(partial: Partial<LinkConfig>) {
+  const current = loadLinkConfig();
+  const merged = { ...current, ...partial };
+  const dirs = [
+    path.join(os.homedir(), ".omp"),
+    path.join(os.homedir(), ".pi"),
+  ];
+  for (const dir of dirs) {
+    try {
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, "link.json"), JSON.stringify(merged, null, 2), "utf-8");
+      return;
+    } catch {}
+  }
 }
 
 function startUdpDiscoveryResponder(tcpPort: number, secret?: string): dgram.Socket | null {
@@ -265,6 +292,9 @@ function startUdpDiscoveryResponder(tcpPort: number, secret?: string): dgram.Soc
 
 interface DiscoveredHub {
   hubId?: string;
+  sessionId?: string;
+  pin?: string;
+  network?: string;
   host: string;
   ip: string;
   port: number;
@@ -362,6 +392,9 @@ async function discoverTailnetHubs(
           if (payload && payload.hub && Array.isArray(payload.terminals)) {
             return {
               hubId: payload.hubId,
+              sessionId: payload.sessionId,
+              pin: payload.pin,
+              network: payload.network,
               host: peer.host,
               ip: peer.ip,
               port,
@@ -426,11 +459,16 @@ async function discoverAllHubs(
   port = DEFAULT_PORT,
   timeoutMs = 900,
   secret?: string,
+  mode: "tailscale" | "lan" = "tailscale",
 ): Promise<{ hubs: DiscoveredHub[]; tailnetPeersCount: number }> {
-  const [tailnetRes, lanHubs] = await Promise.all([
-    discoverTailnetHubs(port, timeoutMs),
-    discoverLanHubs(port, Math.min(timeoutMs, 500), secret),
-  ]);
+  let tailnetRes = { peersCount: 0, hubs: [] as DiscoveredHub[] };
+  let lanHubs: Array<{ host: string; ip: string; port: number }> = [];
+
+  if (mode === "tailscale") {
+    tailnetRes = await discoverTailnetHubs(port, timeoutMs);
+  } else {
+    lanHubs = await discoverLanHubs(port, Math.min(timeoutMs, 500), secret);
+  }
 
   const hubMap = new Map<string, DiscoveredHub>();
 
@@ -458,16 +496,6 @@ async function discoverAllHubs(
       if (!existing.endpoints.includes(endpoint)) {
         existing.endpoints.push(endpoint);
       }
-      // Prefer LAN over Tailscale, and prefer external IP over localhost
-      if (existing.ip === "127.0.0.1" && hub.ip !== "127.0.0.1") {
-        existing.ip = hub.ip;
-        existing.port = hub.port;
-        existing.source = hub.source;
-      } else if (hub.source === "lan" && existing.source === "tailscale") {
-        existing.ip = hub.ip;
-        existing.port = hub.port;
-        existing.source = "lan";
-      }
       return;
     }
     hub.hubId = hubId;
@@ -489,6 +517,9 @@ async function discoverAllHubs(
         registerHub(
           {
             hubId: payload.hubId,
+            sessionId: payload.sessionId,
+            pin: payload.pin,
+            network: payload.network,
             host: payload.host || "localhost",
             ip: "127.0.0.1",
             port,
@@ -502,32 +533,37 @@ async function discoverAllHubs(
     }
   } catch {}
 
-  await Promise.all(
-    lanHubs.map(async (lan) => {
-      try {
-        const res = await fetch(`http://${lan.ip}:${lan.port}/status`, {
-          signal: AbortSignal.timeout(400),
-        });
-        if (res.ok) {
-          const payload = (await res.json()) as any;
-          if (payload && payload.hub && Array.isArray(payload.terminals)) {
-            registerHub(
-              {
-                hubId: payload.hubId,
-                host: payload.host || lan.host,
-                ip: lan.ip,
-                port: lan.port,
-                hubName: payload.hub,
-                terminals: payload.terminals,
-                source: "lan",
-              },
-              payload,
-            );
+  if (mode === "lan") {
+    await Promise.all(
+      lanHubs.map(async (lan) => {
+        try {
+          const res = await fetch(`http://${lan.ip}:${lan.port}/status`, {
+            signal: AbortSignal.timeout(400),
+          });
+          if (res.ok) {
+            const payload = (await res.json()) as any;
+            if (payload && payload.hub && Array.isArray(payload.terminals)) {
+              registerHub(
+                {
+                  hubId: payload.hubId,
+                  sessionId: payload.sessionId,
+                  pin: payload.pin,
+                  network: payload.network,
+                  host: payload.host || lan.host,
+                  ip: lan.ip,
+                  port: lan.port,
+                  hubName: payload.hub,
+                  terminals: payload.terminals,
+                  source: "lan",
+                },
+                payload,
+              );
+            }
           }
-        }
-      } catch {}
-    }),
-  );
+        } catch {}
+      }),
+    );
+  }
 
   return {
     hubs: Array.from(hubMap.values()),
@@ -639,6 +675,10 @@ export default function (pi: ExtensionAPI) {
 
   let udpResponder: dgram.Socket | null = null;
   const hubInstanceId = `hub_${os.hostname().replace(/[^a-zA-Z0-9]/g, "_")}_${Date.now()}`;
+  const initialNet = getNetworkInfo();
+  let networkMode: "tailscale" | "lan" = (process.env.PI_LINK_NETWORK || process.env.OMP_LINK_NETWORK || config.network || (initialNet.tailscaleIp ? "tailscale" : "lan")) as any;
+  let currentSessionId: string = process.env.PI_LINK_SESSION || process.env.OMP_LINK_SESSION || config.sessionId || path.basename(process.cwd()) || "team-link";
+  let sessionPin: string = process.env.PI_LINK_PIN || process.env.OMP_LINK_PIN || config.pin || Math.floor(1000 + Math.random() * 9000).toString();
   let explicitHubMode = false;
   let role: "hub" | "client" | "disconnected" = "disconnected";
   let terminalName = `t-${crypto.randomUUID().slice(0, 4)}`;
@@ -1059,7 +1099,8 @@ export default function (pi: ExtensionAPI) {
       | { active?: boolean }
       | undefined;
     if (data?.active !== undefined) return data.active;
-    return pi.getFlag("link") === true;
+    if (process.env.PI_LINK_DISABLE === "1" || process.env.OMP_LINK_DISABLE === "1") return false;
+    return true;
   }
 
   // ── Pending compact helpers ──────────────────────────────────────────────
@@ -1132,6 +1173,9 @@ export default function (pi: ExtensionAPI) {
     const net = getNetworkInfo();
     return {
       hubId: hubInstanceId,
+      sessionId: currentSessionId,
+      pin: sessionPin,
+      network: networkMode,
       hub: terminalName,
       port: linkPort,
       bind: linkBind,
@@ -1145,6 +1189,73 @@ export default function (pi: ExtensionAPI) {
           .map((name) => describe(name, "client")),
       ],
     };
+  }
+
+  function renderStatusCard(): string {
+    const net = getNetworkInfo();
+    const isOnline = role !== "disconnected";
+    const endpoint = networkMode === "tailscale" && net.tailscaleIp
+      ? `${net.tailscaleIp}:${linkPort}`
+      : (net.lanIps.length > 0 ? `${net.lanIps[0]}:${linkPort}` : `127.0.0.1:${linkPort}`);
+
+    const divider = "─".repeat(52);
+
+    if (!isOnline) {
+      return [
+        `⚡ OMP LINK: DISCONNECTED`,
+        divider,
+        `  Session ID : ${currentSessionId} (inactive)`,
+        `  Network    : ${networkMode.toUpperCase()}`,
+        `  Port       : ${linkPort}`,
+        divider,
+        `  To connect:`,
+        `    /link-join             Auto-discover and join active session`,
+        `    /link-start [id]       Start hosting session "${currentSessionId}"`,
+        `    /link-network <ts|lan> Switch network mode (Tailscale / LAN)`,
+      ].join("\n");
+    }
+
+    const authNote = networkMode === "tailscale"
+      ? "TAILSCALE (auto-verified via WireGuard)"
+      : `LAN (PIN: ${sessionPin})`;
+
+    const peerLines = connectedTerminals.map((name) => {
+      const isSelf = name === terminalName;
+      const status = getStatusFor(name);
+      const statusStr = status ? formatStatus(status) : "idle";
+      const host = getHostFor(name);
+      const project = getProjectFor(name);
+      const cwd = getCwdFor(name);
+      let line = `    • ${name}${isSelf ? " (you)" : ""}`;
+      if (host) line += ` [host: ${host}${project ? ` · project: ${project}` : ""}]`;
+      line += ` (${statusStr})`;
+      if (cwd) line += `\n      cwd: ${shortenPath(cwd)}`;
+      return line;
+    });
+
+    return [
+      `⚡ OMP LINK: ACTIVE`,
+      divider,
+      `  Session ID : ${currentSessionId}`,
+      `  Network    : ${authNote}`,
+      `  Endpoint   : ${endpoint}`,
+      `  Role       : ${role === "hub" ? "Host" : "Peer"} (${terminalName})`,
+      `  LAN PIN    : ${sessionPin}`,
+      divider,
+      `  Online Peers (${connectedTerminals.length}):`,
+      peerLines.join("\n") || "    (none)",
+      divider,
+      `  Quick join from another Mac:`,
+      `    /link-join ${currentSessionId}`,
+      `    (or /link-join ${endpoint}${networkMode === "lan" ? ` ${sessionPin}` : ""})`,
+      divider,
+      `  Commands:`,
+      `    /link-start [id]       Start or switch session`,
+      `    /link-join [id|ip]     Join active session`,
+      `    /link-network <ts|lan> Switch network mode`,
+      `    /link-pin [pin]        View or update PIN`,
+      `    /link-leave            Leave session`,
+    ].join("\n");
   }
 
   function safeParse(data: string): LinkMessage | null {
@@ -1270,6 +1381,9 @@ export default function (pi: ExtensionAPI) {
       case "welcome":
         terminalName = msg.name;
         pendingClientRename = false;
+        if (msg.sessionId) currentSessionId = msg.sessionId;
+        if (msg.pin) sessionPin = msg.pin;
+        if (msg.network) networkMode = msg.network as any;
         connectedTerminals = msg.terminals;
         terminalStatuses.clear();
         terminalCwds.clear();
@@ -1301,7 +1415,7 @@ export default function (pi: ExtensionAPI) {
         }
         updateStatus();
         notify(
-          `Joined link as "${terminalName}" (${connectedTerminals.length} online)`,
+          `⚡ Connected to session "${currentSessionId}" on ${networkMode.toUpperCase()} (${connectedTerminals.length} online)`,
           "info",
         );
         pushStatus(true);
@@ -1458,7 +1572,7 @@ export default function (pi: ExtensionAPI) {
 
   // ── Hub: handle a new client WebSocket ───────────────────────────────────
 
-  function hubHandleClient(clientWs: WebSocket) {
+  function hubHandleClient(clientWs: WebSocket, req?: IncomingMessage) {
     let clientName = "";
 
     clientWs.on("message", (raw) => {
@@ -1473,6 +1587,28 @@ export default function (pi: ExtensionAPI) {
           clientWs.close(4001, "Unauthorized");
           return;
         }
+
+        const clientIp = req?.socket?.remoteAddress;
+        if (networkMode === "tailscale" && !isTailscaleOrLocalIp(clientIp)) {
+          clientWs.close(4003, "Session configured for Tailscale only");
+          return;
+        }
+
+        // LAN PIN check: on Tailscale/localhost WireGuard auto-verifies; on LAN PIN is required
+        if (!isTailscaleOrLocalIp(clientIp)) {
+          const pin = (req?.headers["x-link-pin"] as string) || msg.pin;
+          if (sessionPin && pin !== sessionPin) {
+            clientWs.close(4001, "Invalid session PIN");
+            return;
+          }
+        }
+
+        // If client specified a target session ID, verify it matches
+        if (msg.sessionId && msg.sessionId !== currentSessionId) {
+          clientWs.close(4004, `Session ID mismatch (expected "${currentSessionId}", got "${msg.sessionId}")`);
+          return;
+        }
+
         clientName = uniqueName(msg.name);
         hubClients.set(clientWs, clientName);
         if (msg.cwd) hubTerminalCwds.set(clientName, msg.cwd);
@@ -1514,6 +1650,9 @@ export default function (pi: ExtensionAPI) {
           JSON.stringify({
             type: "welcome",
             name: clientName,
+            sessionId: currentSessionId,
+            pin: sessionPin,
+            network: networkMode,
             terminals: list,
             statuses,
             cwds,
@@ -1527,6 +1666,8 @@ export default function (pi: ExtensionAPI) {
         const joined: TerminalJoinedMsg = {
           type: "terminal_joined",
           name: clientName,
+          sessionId: currentSessionId,
+          network: networkMode,
           terminals: list,
           cwd: msg.cwd,
           context: msg.context,
@@ -1648,18 +1789,14 @@ export default function (pi: ExtensionAPI) {
         connectedTerminals = [terminalName];
         updateStatus();
         const net = getNetworkInfo();
-        const ips = [
-          net.tailscaleIp ? `Tailscale: ${net.tailscaleIp}:${linkPort}` : null,
-          net.lanIps.length > 0 ? `LAN: ${net.lanIps[0]}:${linkPort}` : null,
-          `local: :${linkPort}`,
-        ]
-          .filter(Boolean)
-          .join(" · ");
+        const endpoint = networkMode === "tailscale" && net.tailscaleIp
+          ? `${net.tailscaleIp}:${linkPort}`
+          : (net.lanIps.length > 0 ? `${net.lanIps[0]}:${linkPort}` : `127.0.0.1:${linkPort}`);
         notify(
-          `Link hub started (${ips}) as "${terminalName}"`,
+          `⚡ Session "${currentSessionId}" hosted on ${networkMode.toUpperCase()} (${endpoint}) as "${terminalName}"`,
           "info",
         );
-        if (enableLanDiscovery && !udpResponder) {
+        if (enableLanDiscovery && networkMode === "lan" && !udpResponder) {
           udpResponder = startUdpDiscoveryResponder(linkPort, linkSecret);
         }
         settle(true);
@@ -1677,12 +1814,23 @@ export default function (pi: ExtensionAPI) {
           clientWs.close(4003, "Tailscale only");
           return;
         }
+        if (networkMode === "tailscale" && !isTailscaleOrLocalIp(clientIp)) {
+          clientWs.close(4003, "Session configured for Tailscale only");
+          return;
+        }
         const reqToken = req.headers["x-link-token"];
         if (linkSecret && reqToken && reqToken !== linkSecret) {
           clientWs.close(4001, "Unauthorized");
           return;
         }
-        hubHandleClient(clientWs);
+        const reqPin = req.headers["x-link-pin"] as string | undefined;
+        if (!isTailscaleOrLocalIp(clientIp)) {
+          if (sessionPin && reqPin && reqPin !== sessionPin) {
+            clientWs.close(4001, "Invalid session PIN");
+            return;
+          }
+        }
+        hubHandleClient(clientWs, req);
       });
 
       server.on("error", () => {
@@ -1705,15 +1853,24 @@ export default function (pi: ExtensionAPI) {
   function connectAsClient(
     attempt: ConnectionAttempt,
     targetEndpoint?: string,
+    joinPin?: string,
+    joinSessionId?: string,
   ): Promise<boolean> {
     return new Promise((resolve) => {
       let endpoint = targetEndpoint || `127.0.0.1:${linkPort}`;
       if (!endpoint.includes(":") || (endpoint.startsWith("[") && !endpoint.includes("]:"))) {
         endpoint = `${endpoint}:${linkPort}`;
       }
+      const headers: Record<string, string> = {};
+      if (linkSecret) headers["x-link-token"] = linkSecret;
+      const effectivePin = joinPin || sessionPin;
+      if (effectivePin) headers["x-link-pin"] = effectivePin;
+      const effectiveSessionId = joinSessionId || currentSessionId;
+      if (effectiveSessionId) headers["x-link-session"] = effectiveSessionId;
+
       const socket = new WebSocket(`ws://${endpoint}`, {
         handshakeTimeout: CONNECT_HANDSHAKE_TIMEOUT_MS,
-        headers: linkSecret ? { "x-link-token": linkSecret } : undefined,
+        headers,
       });
       attempt.socket = socket;
 
@@ -1742,6 +1899,9 @@ export default function (pi: ExtensionAPI) {
           JSON.stringify({
             type: "register",
             name: preferredName ?? terminalName,
+            sessionId: effectiveSessionId,
+            pin: effectivePin,
+            network: networkMode,
             cwd: currentCwd || undefined,
             context: captureContext(),
             host: os.hostname(),
@@ -1824,23 +1984,23 @@ export default function (pi: ExtensionAPI) {
         if (!attemptIsCurrent(attempt)) return;
         const hostOnly = targetHubAddress.split(":")[0];
         if (hostOnly !== "127.0.0.1" && hostOnly !== "localhost") {
-          // Check if the hub is active on another IP/interface via discovery
-          const { hubs } = await discoverAllHubs(linkPort, 600, linkSecret);
+          // Check if session is active on current network mode via discovery
+          const { hubs } = await discoverAllHubs(linkPort, 600, linkSecret, networkMode);
           if (hubs.length > 0 && attemptIsCurrent(attempt)) {
-            const bestHub = hubs[0];
+            const bestHub = hubs.find((h) => h.sessionId === currentSessionId) || hubs[0];
             const discoveredTarget = `${bestHub.ip}:${bestHub.port}`;
             if (discoveredTarget !== targetHubAddress) {
               notify(
-                `Hub at ${targetHubAddress} unreachable. Switching to discovered hub "${bestHub.hubName}" on ${bestHub.host} (${discoveredTarget})...`,
+                `Session at ${targetHubAddress} unreachable. Switching to discovered session "${bestHub.sessionId || bestHub.hubName}" on ${bestHub.host} (${discoveredTarget})...`,
                 "info",
               );
               targetHubAddress = discoveredTarget;
-              if (await connectAsClient(attempt, discoveredTarget)) return;
+              if (await connectAsClient(attempt, discoveredTarget, bestHub.pin, bestHub.sessionId)) return;
               if (!attemptIsCurrent(attempt)) return;
             }
           }
           notify(
-            `Could not reach hub at ${targetHubAddress}. Retrying in background...`,
+            `Could not reach session at ${targetHubAddress}. Retrying in background...`,
             "warning",
           );
           scheduleReconnect();
@@ -1851,18 +2011,21 @@ export default function (pi: ExtensionAPI) {
         if (await connectAsClient(attempt, `127.0.0.1:${linkPort}`)) return;
         if (!attemptIsCurrent(attempt)) return;
 
-        // Auto-discover active hubs across Tailnet and LAN
-        const { hubs } = await discoverAllHubs(linkPort, 600, linkSecret);
+        // Auto-discover active sessions across current network mode (Tailscale OR LAN)
+        const { hubs } = await discoverAllHubs(linkPort, 600, linkSecret, networkMode);
         if (hubs.length > 0 && attemptIsCurrent(attempt)) {
-          const bestHub = hubs[0];
-          const target = `${bestHub.ip}:${bestHub.port}`;
-          targetHubAddress = target;
-          notify(
-            `Auto-discovered hub "${bestHub.hubName}" on ${bestHub.host} (${target}). Connecting...`,
-            "info",
-          );
-          if (await connectAsClient(attempt, target)) return;
-          if (!attemptIsCurrent(attempt)) return;
+          const matchingHub = hubs.find((h) => h.sessionId === currentSessionId);
+          const bestHub = matchingHub || (hubs.length === 1 ? hubs[0] : null);
+          if (bestHub) {
+            const target = `${bestHub.ip}:${bestHub.port}`;
+            targetHubAddress = target;
+            notify(
+              `Auto-discovered session "${bestHub.sessionId || bestHub.hubName}" on ${bestHub.host} (${target}). Connecting...`,
+              "info",
+            );
+            if (await connectAsClient(attempt, target, bestHub.pin, bestHub.sessionId)) return;
+            if (!attemptIsCurrent(attempt)) return;
+          }
         }
       }
 
@@ -2071,6 +2234,40 @@ export default function (pi: ExtensionAPI) {
       }
     }
 
+    // Network mode resolution
+    const cliNetwork = pi.getFlag("link-network");
+    const envNetwork = process.env.PI_LINK_NETWORK || process.env.OMP_LINK_NETWORK;
+    const savedNetwork = latestCustomData("link-network") as { network?: "tailscale" | "lan" } | undefined;
+    if (cliNetwork === "tailscale" || cliNetwork === "ts" || envNetwork === "tailscale" || savedNetwork?.network === "tailscale" || config.network === "tailscale") {
+      networkMode = "tailscale";
+    } else if (cliNetwork === "lan" || envNetwork === "lan" || savedNetwork?.network === "lan" || config.network === "lan") {
+      networkMode = "lan";
+    }
+
+    // Session ID resolution
+    const cliSession = pi.getFlag("link-session");
+    const envSession = process.env.PI_LINK_SESSION || process.env.OMP_LINK_SESSION;
+    const savedSession = latestCustomData("link-session") as { sessionId?: string } | undefined;
+    if (typeof cliSession === "string" && cliSession.trim()) {
+      currentSessionId = normalizeName(cliSession.trim()) || currentSessionId;
+    } else if (typeof envSession === "string" && envSession.trim()) {
+      currentSessionId = normalizeName(envSession.trim()) || currentSessionId;
+    } else if (typeof savedSession?.sessionId === "string" && savedSession.sessionId.trim()) {
+      currentSessionId = savedSession.sessionId.trim();
+    }
+
+    // PIN resolution
+    const cliPin = pi.getFlag("link-pin");
+    const envPin = process.env.PI_LINK_PIN || process.env.OMP_LINK_PIN;
+    const savedPin = latestCustomData("link-pin") as { pin?: string } | undefined;
+    if (typeof cliPin === "string" && cliPin.trim()) {
+      sessionPin = cliPin.trim();
+    } else if (typeof envPin === "string" && envPin.trim()) {
+      sessionPin = envPin.trim();
+    } else if (typeof savedPin?.pin === "string" && savedPin.pin.trim()) {
+      sessionPin = savedPin.pin.trim();
+    }
+
     const cliHub = pi.getFlag("link-hub");
     if (typeof cliHub === "string" && cliHub.trim()) {
       const trimmed = cliHub.trim();
@@ -2190,7 +2387,10 @@ export default function (pi: ExtensionAPI) {
   }
 
   function notConnectedResult() {
-    return textResult("Not connected to link", { error: "not_connected" });
+    return textResult(
+      "Not connected to link. Use link_connect tool or run /link to reconnect.",
+      { error: "not_connected" },
+    );
   }
 
   function truncatePreview(text: string) {
@@ -2238,6 +2438,17 @@ export default function (pi: ExtensionAPI) {
     }),
 
     async execute(_toolCallId, params) {
+      if (role === "disconnected") {
+        if (connectionAttempt) {
+          await Promise.race([
+            connectionAttempt.promise,
+            new Promise((r) => setTimeout(r, 2500)),
+          ]);
+        } else if (!manuallyDisconnected) {
+          void initialize();
+          await new Promise((r) => setTimeout(r, 1500));
+        }
+      }
       if (role === "disconnected") return notConnectedResult();
 
       if (params.to === terminalName) {
@@ -2325,6 +2536,17 @@ export default function (pi: ExtensionAPI) {
         });
       }
 
+      if (role === "disconnected") {
+        if (connectionAttempt) {
+          await Promise.race([
+            connectionAttempt.promise,
+            new Promise((r) => setTimeout(r, 2500)),
+          ]);
+        } else if (!manuallyDisconnected) {
+          void initialize();
+          await new Promise((r) => setTimeout(r, 1500));
+        }
+      }
       if (role === "disconnected") return notConnectedResult();
 
       if (params.to === terminalName) {
@@ -2423,6 +2645,17 @@ export default function (pi: ExtensionAPI) {
     parameters: Type.Object({}),
 
     async execute() {
+      if (role === "disconnected") {
+        if (connectionAttempt) {
+          await Promise.race([
+            connectionAttempt.promise,
+            new Promise((r) => setTimeout(r, 2500)),
+          ]);
+        } else if (!manuallyDisconnected) {
+          void initialize();
+          await new Promise((r) => setTimeout(r, 1500));
+        }
+      }
       if (role === "disconnected") return notConnectedResult();
 
       const statuses: Record<string, string> = {};
@@ -2445,30 +2678,38 @@ export default function (pi: ExtensionAPI) {
           const project = getProjectFor(name);
           if (project) projects[name] = project;
           const marker = name === terminalName ? " (you)" : "";
-          let line = `  \u2022 ${name}${marker}`;
+          let line = `  • ${name}${marker}`;
           if (host) line += ` [host: ${host}${project ? `, project: ${project}` : ""}]`;
           if (statusStr) line += `  ${statusStr}`;
-          if (ctxStr) line += `  \u00b7 ${ctxStr}`;
+          if (ctxStr) line += `  · ${ctxStr}`;
           if (cwd) line += `\n    cwd: ${cwd}`;
           return line;
         })
         .join("\n");
 
-      return textResult(`Connected terminals:\n${list}`, {
-        terminals: connectedTerminals,
-        statuses,
-        cwds,
-        contexts,
-        hosts,
-        projects,
-        self: terminalName,
-        role,
-      });
+      return textResult(
+        `Connected terminals:\n${list}\n\nSession: ${currentSessionId} | Network: ${networkMode} | PIN: ${sessionPin}`,
+        {
+          sessionId: currentSessionId,
+          network: networkMode,
+          pin: sessionPin,
+          terminals: connectedTerminals,
+          statuses,
+          cwds,
+          contexts,
+          hosts,
+          projects,
+          self: terminalName,
+          role,
+        },
+      );
     },
 
     renderResult(result, _options, theme) {
       const details = result.details as
         | {
+            sessionId?: string;
+            network?: string;
             terminals?: string[];
             statuses?: Record<string, string>;
             cwds?: Record<string, string>;
@@ -2487,6 +2728,9 @@ export default function (pi: ExtensionAPI) {
       let text = theme.fg("toolTitle", theme.bold("link "));
       text += theme.fg("muted", `(${details.role}) `);
       text += theme.fg("accent", `${details.terminals.length} terminal(s)`);
+      if (details.sessionId) {
+        text += theme.fg("dim", ` · session: ${details.sessionId} [${details.network}]`);
+      }
       for (const name of details.terminals) {
         const isSelf = name === details.self;
         const status = details.statuses?.[name] ?? "";
@@ -2494,13 +2738,13 @@ export default function (pi: ExtensionAPI) {
         const ctxStr = formatContext(details.contexts?.[name]);
         const host = details.hosts?.[name];
         const project = details.projects?.[name];
-        let nameStr = isSelf ? `\u2022 ${name} (you)` : `\u2022 ${name}`;
+        let nameStr = isSelf ? `• ${name} (you)` : `• ${name}`;
         if (host) nameStr += ` [${host}${project ? ` · ${project}` : ""}]`;
         text +=
           "\n  " +
           (isSelf ? theme.fg("accent", nameStr) : theme.fg("text", nameStr)) +
           (status ? "  " + theme.fg("dim", status) : "") +
-          (ctxStr ? theme.fg("dim", "  \u00b7 " + ctxStr) : "");
+          (ctxStr ? theme.fg("dim", "  · " + ctxStr) : "");
         if (cwd) text += "\n    " + theme.fg("dim", `cwd: ${shortenPath(cwd)}`);
       }
       return new Text(text, 0, 0);
@@ -2511,20 +2755,20 @@ export default function (pi: ExtensionAPI) {
     name: "link_discover",
     label: "Link Discover",
     description:
-      "Search for active pi-link hubs and sessions across the Tailscale network (tailnet) and local network (LAN).",
-    promptSnippet: "Discover active pi-link sessions and hubs on Tailnet/LAN",
+      "Search for active sessions across the selected network (Tailscale or LAN).",
+    promptSnippet: "Discover active sessions on Tailnet/LAN",
     parameters: Type.Object({}),
 
     async execute() {
-      const { hubs, tailnetPeersCount } = await discoverAllHubs(linkPort, 1200, linkSecret);
+      const { hubs, tailnetPeersCount } = await discoverAllHubs(linkPort, 1200, linkSecret, networkMode);
       if (hubs.length === 0) {
         return textResult(
-          `No active pi-link hubs discovered across ${tailnetPeersCount} Tailnet peer(s) or LAN.`,
-          { hubs: [], tailnetPeersCount },
+          `No active sessions discovered on ${networkMode.toUpperCase()}${networkMode === "tailscale" ? ` (${tailnetPeersCount} Tailnet peer(s) scanned)` : ""}.`,
+          { hubs: [], tailnetPeersCount, network: networkMode },
         );
       }
 
-      let text = `Discovered ${hubs.length} active pi-link hub(s) across network:\n\n`;
+      let text = `Discovered ${hubs.length} active session(s) on ${networkMode.toUpperCase()}:\n\n`;
       for (const h of hubs) {
         const terms = (h.terminals || [])
           .map(
@@ -2532,11 +2776,11 @@ export default function (pi: ExtensionAPI) {
               `${t.name} (${t.status || "idle"}, host: ${t.host || h.host}${t.project ? `, project: ${t.project}` : ""})`,
           )
           .join("\n    - ");
-        text += `• Hub "${h.hubName}" on ${h.host} (${h.ip}:${h.port}) [via ${h.source}]:\n    - ${terms}\n`;
+        text += `• Session "${h.sessionId || h.hubName}" on ${h.host} (${h.ip}:${h.port}) [PIN: ${h.pin || "none"}]:\n    - ${terms}\n`;
       }
-      text += `\nTo connect to any discovered hub, use /link-connect <endpoint>.`;
+      text += `\nTo connect to any discovered session, use link_connect tool or /link-join.`;
 
-      return textResult(text, { hubs, tailnetPeersCount });
+      return textResult(text, { hubs, tailnetPeersCount, network: networkMode });
     },
 
     renderCall(_args, theme) {
@@ -2546,34 +2790,391 @@ export default function (pi: ExtensionAPI) {
     renderResult: (result, _options, theme) => renderIconResult(result, theme),
   });
 
+  pi.registerTool({
+    name: "link_connect",
+    label: "Link Connect",
+    description:
+      "Manage link connection: get status, join an active session, start hosting a session, or leave.",
+    promptSnippet: "Connect, join, or start an omp-link session",
+    parameters: Type.Object({
+      action: Type.Union(
+        [
+          Type.Literal("status"),
+          Type.Literal("join"),
+          Type.Literal("start"),
+          Type.Literal("leave"),
+        ],
+        { description: "Action to perform: status, join, start, or leave" },
+      ),
+      target: Type.Optional(
+        Type.String({ description: "Target session ID or IP:port to join/start" }),
+      ),
+      pin: Type.Optional(
+        Type.String({ description: "4-digit session PIN for LAN authentication" }),
+      ),
+      network: Type.Optional(
+        Type.Union([Type.Literal("tailscale"), Type.Literal("lan")], {
+          description: "Network mode: 'tailscale' or 'lan'",
+        }),
+      ),
+    }),
+
+    async execute(_toolCallId, params) {
+      if (params.network) {
+        networkMode = params.network;
+        pi.appendEntry("link-network", { network: networkMode });
+        saveLinkConfig({ network: networkMode });
+      }
+      if (params.pin) {
+        sessionPin = params.pin;
+        pi.appendEntry("link-pin", { pin: sessionPin });
+        saveLinkConfig({ pin: sessionPin });
+      }
+
+      if (params.action === "status") {
+        return textResult(renderStatusCard(), {
+          sessionId: currentSessionId,
+          network: networkMode,
+          role,
+          terminalName,
+          pin: sessionPin,
+          terminals: connectedTerminals,
+        });
+      }
+
+      if (params.action === "leave") {
+        pi.appendEntry("link-active", { active: false });
+        manuallyDisconnected = true;
+        disconnect();
+        return textResult("Left link session.", { role: "disconnected" });
+      }
+
+      if (params.action === "start") {
+        if (params.target) currentSessionId = normalizeName(params.target) || currentSessionId;
+        pi.appendEntry("link-session", { sessionId: currentSessionId });
+        saveLinkConfig({ sessionId: currentSessionId });
+        disconnect();
+        explicitHubMode = true;
+        targetHubAddress = null;
+        manuallyDisconnected = false;
+        pi.appendEntry("link-active", { active: true });
+        await initialize();
+        return textResult(`Started session "${currentSessionId}" as host.`, {
+          sessionId: currentSessionId,
+          role,
+          terminalName,
+        });
+      }
+
+      if (params.action === "join") {
+        if (params.target) {
+          const isIp =
+            params.target.includes(":") ||
+            /^\d+\.\d+\.\d+\.\d+$/.test(params.target) ||
+            params.target.startsWith("100.");
+          if (isIp) {
+            targetHubAddress = params.target;
+          } else {
+            const { hubs } = await discoverAllHubs(linkPort, 1000, linkSecret, networkMode);
+            const found = hubs.find((h) => h.sessionId === params.target || h.hubName === params.target);
+            if (found) {
+              targetHubAddress = `${found.ip}:${found.port}`;
+              currentSessionId = found.sessionId || params.target;
+            } else {
+              return textResult(
+                `Session "${params.target}" not found on ${networkMode}. Discovered: ${hubs.map((h) => h.sessionId || h.hubName).join(", ") || "none"}`,
+                { error: "not_found" },
+              );
+            }
+          }
+        } else {
+          // Auto-discover
+          const { hubs } = await discoverAllHubs(linkPort, 1000, linkSecret, networkMode);
+          if (hubs.length === 0) {
+            return textResult(`No active sessions discovered on ${networkMode}.`, { error: "no_sessions" });
+          }
+          const best = hubs.find((h) => h.sessionId === currentSessionId) || hubs[0];
+          targetHubAddress = `${best.ip}:${best.port}`;
+          if (best.sessionId) currentSessionId = best.sessionId;
+        }
+
+        disconnect();
+        explicitHubMode = false;
+        manuallyDisconnected = false;
+        pi.appendEntry("link-active", { active: true });
+        pi.appendEntry("link-session", { sessionId: currentSessionId });
+        saveLinkConfig({ sessionId: currentSessionId, hub: targetHubAddress });
+        await initialize();
+        return textResult(`Joined session "${currentSessionId}".`, {
+          sessionId: currentSessionId,
+          role,
+          terminalName,
+          target: targetHubAddress,
+        });
+      }
+
+      return textResult("Unknown action.", { error: "invalid_action" });
+    },
+
+    renderCall(args, theme) {
+      let text = theme.fg("toolTitle", theme.bold("link_connect "));
+      text += theme.fg("accent", String(args.action || "status"));
+      if (args.target) text += ` ${theme.fg("dim", String(args.target))}`;
+      return new Text(text, 0, 0);
+    },
+
+    renderResult: (result, _options, theme) => renderIconResult(result, theme),
+  });
+
   // ── Commands ─────────────────────────────────────────────────────────────
 
   pi.registerCommand("link", {
-    description: "Show link status",
+    description: "Show link session status, network info, and online peers",
     handler: async (_args, _ctx) => {
-      if (role === "disconnected") {
-        _ctx.ui.notify("Link: not connected", "warning");
+      _ctx.ui.notify(renderStatusCard(), role === "disconnected" ? "warning" : "info");
+    },
+  });
+
+  pi.registerCommand("link-start", {
+    description: "Start or switch to a new link session. Usage: /link-start [session-id] [pin]",
+    handler: async (args, _ctx) => {
+      const parts = args.trim().split(/\s+/).filter(Boolean);
+      const newSessionId = parts[0] ? normalizeName(parts[0]) : currentSessionId;
+      const newPin = parts[1] || sessionPin;
+
+      currentSessionId = newSessionId;
+      sessionPin = newPin;
+      pi.appendEntry("link-session", { sessionId: currentSessionId });
+      pi.appendEntry("link-pin", { pin: sessionPin });
+      saveLinkConfig({ sessionId: currentSessionId, pin: sessionPin });
+
+      if (role === "hub") {
+        _ctx.ui.notify(
+          `⚡ Session updated: "${currentSessionId}" on ${networkMode.toUpperCase()} (PIN: ${sessionPin})`,
+          "info",
+        );
+        for (const [clientWs, clientName] of hubClients) {
+          clientWs.send(
+            JSON.stringify({
+              type: "welcome",
+              name: clientName,
+              sessionId: currentSessionId,
+              pin: sessionPin,
+              network: networkMode,
+              terminals: terminalList(),
+            } satisfies WelcomeMsg),
+          );
+        }
         return;
       }
-      const lines = connectedTerminals.map((name) => {
-        const status = getStatusFor(name);
-        const statusStr = status ? formatStatus(status) : "";
-        const cwd = getCwdFor(name);
-        const ctxStr = formatContext(getContextFor(name));
-        const host = getHostFor(name);
-        const project = getProjectFor(name);
-        const marker = name === terminalName ? " (you)" : "";
-        let line = `${name}${marker}`;
-        if (host) line += ` [${host}${project ? ` · ${project}` : ""}]`;
-        if (statusStr) line += `: ${statusStr}`;
-        if (ctxStr) line += ` \u00b7 ${ctxStr}`;
-        if (cwd) line += `\n  cwd: ${shortenPath(cwd)}`;
-        return line;
-      });
-      _ctx.ui.notify(
-        `Link: ${terminalName} (${role}) · ${connectedTerminals.length} online\n${lines.join("\n")}`,
-        "info",
-      );
+
+      _ctx.ui.notify(`Starting session "${currentSessionId}" as host...`, "info");
+      disconnect();
+      explicitHubMode = true;
+      targetHubAddress = null;
+      manuallyDisconnected = false;
+      pi.appendEntry("link-active", { active: true });
+      await initialize();
+    },
+  });
+
+  pi.registerCommand("link-join", {
+    description: "Join an active link session. Usage: /link-join [session-id | ip[:port]] [pin]",
+    handler: async (args, _ctx) => {
+      const parts = args.trim().split(/\s+/).filter(Boolean);
+      const targetArg = parts[0];
+      const pinArg = parts[1];
+
+      if (pinArg) {
+        sessionPin = pinArg;
+        pi.appendEntry("link-pin", { pin: sessionPin });
+        saveLinkConfig({ pin: sessionPin });
+      }
+
+      if (!targetArg) {
+        _ctx.ui.notify(`Scanning ${networkMode.toUpperCase()} for active sessions...`, "info");
+        const { hubs } = await discoverAllHubs(linkPort, 1000, linkSecret, networkMode);
+        if (hubs.length === 0) {
+          _ctx.ui.notify(
+            `No active sessions found on ${networkMode.toUpperCase()}.\nStart one with: /link-start ${currentSessionId}`,
+            "warning",
+          );
+          return;
+        }
+        if (hubs.length === 1) {
+          const h = hubs[0];
+          _ctx.ui.notify(
+            `Found session "${h.sessionId || h.hubName}" on ${h.host} (${h.ip}:${h.port}). Joining...`,
+            "info",
+          );
+          targetHubAddress = `${h.ip}:${h.port}`;
+          if (h.sessionId) currentSessionId = h.sessionId;
+          if (h.pin) sessionPin = h.pin;
+        } else {
+          let msg = `Found ${hubs.length} active sessions on ${networkMode.toUpperCase()}:\n`;
+          hubs.forEach((h, idx) => {
+            msg += `  ${idx + 1}. "${h.sessionId || h.hubName}" on ${h.host} (${h.ip}:${h.port})\n`;
+          });
+          msg += `\nSpecify session to join: /link-join <id or ip>`;
+          _ctx.ui.notify(msg.trim(), "info");
+          return;
+        }
+      } else {
+        const isIp =
+          targetArg.includes(":") ||
+          /^\d+\.\d+\.\d+\.\d+$/.test(targetArg) ||
+          targetArg.startsWith("100.");
+        if (isIp) {
+          targetHubAddress = targetArg;
+        } else {
+          _ctx.ui.notify(
+            `Searching for session "${targetArg}" on ${networkMode.toUpperCase()}...`,
+            "info",
+          );
+          const { hubs } = await discoverAllHubs(linkPort, 1000, linkSecret, networkMode);
+          const found = hubs.find(
+            (h) => h.sessionId === targetArg || h.hubName === targetArg,
+          );
+          if (found) {
+            _ctx.ui.notify(
+              `Found session "${targetArg}" on ${found.host} (${found.ip}:${found.port}). Joining...`,
+              "info",
+            );
+            targetHubAddress = `${found.ip}:${found.port}`;
+            currentSessionId = found.sessionId || targetArg;
+            if (found.pin) sessionPin = found.pin;
+          } else {
+            _ctx.ui.notify(
+              `Session "${targetArg}" not found on ${networkMode.toUpperCase()}. Discovered: ${hubs.map((h) => h.sessionId || h.hubName).join(", ") || "none"}`,
+              "warning",
+            );
+            return;
+          }
+        }
+      }
+
+      disconnect();
+      explicitHubMode = false;
+      manuallyDisconnected = false;
+      pi.appendEntry("link-active", { active: true });
+      pi.appendEntry("link-session", { sessionId: currentSessionId });
+      saveLinkConfig({ sessionId: currentSessionId, hub: targetHubAddress });
+      await initialize();
+    },
+  });
+
+  pi.registerCommand("link-leave", {
+    description: "Leave or disconnect from the link session",
+    handler: async (_args, _ctx) => {
+      pi.appendEntry("link-active", { active: false });
+      manuallyDisconnected = true;
+      if (role === "disconnected") {
+        cancelConnectionAttempt();
+        _ctx.ui.notify("Link disconnected", "info");
+        return;
+      }
+      disconnect();
+      _ctx.ui.notify("Left link session. Run /link-join or /link-start to reconnect.", "info");
+    },
+  });
+
+  pi.registerCommand("link-disconnect", {
+    description: "Disconnect from the link (alias for /link-leave)",
+    handler: async (_args, _ctx) => {
+      pi.appendEntry("link-active", { active: false });
+      manuallyDisconnected = true;
+      disconnect();
+      _ctx.ui.notify("Left link session.", "info");
+    },
+  });
+
+  pi.registerCommand("link-network", {
+    description: "Switch network mode between Tailscale and LAN. Usage: /link-network [tailscale|lan]",
+    handler: async (args, _ctx) => {
+      const mode = args.trim().toLowerCase();
+      const net = getNetworkInfo();
+
+      if (!mode) {
+        _ctx.ui.notify(
+          [
+            `⚡ Link Network Mode: ${networkMode.toUpperCase()}`,
+            `  Tailscale IP : ${net.tailscaleIp || "none detected"}`,
+            `  LAN IPs      : ${net.lanIps.join(", ") || "none detected"}`,
+            `\nUsage:`,
+            `  /link-network tailscale (or ts)  Strictly use Tailscale`,
+            `  /link-network lan                Strictly use local network`,
+          ].join("\n"),
+          "info",
+        );
+        return;
+      }
+
+      if (mode === "tailscale" || mode === "ts") {
+        if (!net.tailscaleIp) {
+          _ctx.ui.notify(
+            "⚠️ Warning: Tailscale IP not detected on this machine. Ensure Tailscale is running.",
+            "warning",
+          );
+        }
+        networkMode = "tailscale";
+        pi.appendEntry("link-network", { network: "tailscale" });
+        saveLinkConfig({ network: "tailscale" });
+        _ctx.ui.notify("⚡ Switched to TAILSCALE network mode. Reconnecting...", "info");
+        disconnect();
+        manuallyDisconnected = false;
+        await initialize();
+        return;
+      }
+
+      if (mode === "lan") {
+        networkMode = "lan";
+        pi.appendEntry("link-network", { network: "lan" });
+        saveLinkConfig({ network: "lan" });
+        _ctx.ui.notify("⚡ Switched to LAN network mode. Reconnecting...", "info");
+        disconnect();
+        manuallyDisconnected = false;
+        await initialize();
+        return;
+      }
+
+      _ctx.ui.notify("Unknown network mode. Use '/link-network tailscale' or '/link-network lan'", "warning");
+    },
+  });
+
+  pi.registerCommand("link-pin", {
+    description: "View or update session PIN. Usage: /link-pin [pin]",
+    handler: async (args, _ctx) => {
+      const newPin = args.trim();
+      if (!newPin) {
+        _ctx.ui.notify(
+          [
+            `Session PIN: ${sessionPin}`,
+            `Status: ${networkMode === "tailscale" ? "Tailscale is active — WireGuard automatically verifies peers without requiring PIN." : "LAN mode active — LAN peers require this PIN to join."}`,
+            `To change: /link-pin <new-pin>`,
+          ].join("\n"),
+          "info",
+        );
+        return;
+      }
+      sessionPin = newPin;
+      pi.appendEntry("link-pin", { pin: sessionPin });
+      saveLinkConfig({ pin: sessionPin });
+      _ctx.ui.notify(`Session PIN updated to "${sessionPin}"`, "info");
+    },
+  });
+
+  pi.registerCommand("link-connect", {
+    description: "Connect to or join a link session. Usage: /link-connect [session-id | ip[:port]]",
+    handler: async (args, _ctx) => {
+      const target = normalizeName(args);
+      if (target) {
+        targetHubAddress = target;
+        pi.appendEntry("link-hub", { hub: target });
+      }
+      disconnect();
+      manuallyDisconnected = false;
+      pi.appendEntry("link-active", { active: true });
+      await initialize();
     },
   });
 
@@ -2665,84 +3266,36 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  pi.registerCommand("link-disconnect", {
-    description: "Disconnect from the link",
-    handler: async (_args, _ctx) => {
-      pi.appendEntry("link-active", { active: false });
-      manuallyDisconnected = true;
-      if (role === "disconnected") {
-        // Nothing is established, but a startup or reconnect attempt may still be
-        // dialing or binding; persisted intent has to win over it too.
-        cancelConnectionAttempt();
-        _ctx.ui.notify("Link disconnected", "info");
-        return;
-      }
-      disconnect();
-      _ctx.ui.notify("Disconnected from link", "info");
-    },
-  });
-
-  pi.registerCommand("link-connect", {
-    description: "Connect to the link. Usage: /link-connect [host[:port]]",
-    handler: async (args, _ctx) => {
-      const target = normalizeName(args);
-      if (target) {
-        if (target === "local" || target === "hub" || target === "none") {
-          targetHubAddress = null;
-          pi.appendEntry("link-hub", { hub: null });
-        } else {
-          targetHubAddress = target;
-          pi.appendEntry("link-hub", { hub: target });
-        }
-      }
-      if (role !== "disconnected") {
-        if (target) {
-          _ctx.ui.notify(`Reconnecting to hub at ${target}...`, "info");
-          disconnect();
-        } else {
-          _ctx.ui.notify(
-            `Already connected as "${terminalName}" (${role})`,
-            "info",
-          );
-          return;
-        }
-      }
-      pi.appendEntry("link-active", { active: true });
-      manuallyDisconnected = false;
-      await initialize();
-    },
-  });
-
   const handleDiscoverCommand = async (_args: string, _ctx: ExtensionContext) => {
-    _ctx.ui.notify("Scanning Tailnet & LAN for active pi-link hubs...", "info");
-    const { hubs, tailnetPeersCount } = await discoverAllHubs(linkPort, 1200, linkSecret);
+    _ctx.ui.notify(`Scanning ${networkMode.toUpperCase()} for active sessions...`, "info");
+    const { hubs, tailnetPeersCount } = await discoverAllHubs(linkPort, 1200, linkSecret, networkMode);
     if (hubs.length === 0) {
       _ctx.ui.notify(
-        tailnetPeersCount > 0
-          ? `No active pi-link hubs found (${tailnetPeersCount} Tailnet peers scanned).`
-          : "No active pi-link hubs found on Tailnet or LAN.",
+        networkMode === "tailscale" && tailnetPeersCount > 0
+          ? `No active sessions found (${tailnetPeersCount} Tailnet peers scanned).`
+          : `No active sessions found on ${networkMode.toUpperCase()}.`,
         "info",
       );
       return;
     }
 
-    let summary = `⚡ Found ${hubs.length} active pi-link hub(s):\n`;
+    let summary = `⚡ Found ${hubs.length} active session(s) on ${networkMode.toUpperCase()}:\n`;
     for (const h of hubs) {
       const terms = (h.terminals || [])
         .map((t) => `${t.name}${t.project ? ` (${t.project})` : ""}`)
         .join(", ");
-      summary += `\n• ${h.host} (${h.ip}:${h.port}) [${h.source}]\n  Hub "${h.hubName}" · ${h.terminals?.length || 1} online: ${terms}\n  Connect: /link-connect ${h.ip}:${h.port}`;
+      summary += `\n• "${h.sessionId || h.hubName}" on ${h.host} (${h.ip}:${h.port}) [PIN: ${h.pin || "none"}]\n  ${h.terminals?.length || 1} online: ${terms}\n  Join: /link-join ${h.sessionId || `${h.ip}:${h.port}`}`;
     }
     _ctx.ui.notify(summary.trim(), "info");
   };
 
   pi.registerCommand("link-discover", {
-    description: "Discover active pi-link hubs across Tailnet & LAN",
+    description: "Discover active sessions across network",
     handler: handleDiscoverCommand,
   });
 
   pi.registerCommand("link-search", {
-    description: "Search for active pi-link hubs across Tailnet & LAN",
+    description: "Search for active sessions across network",
     handler: handleDiscoverCommand,
   });
 

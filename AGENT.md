@@ -39,109 +39,99 @@ Execute the turnkey setup script from the root of this repository:
 
 ---
 
-## 3. Launching & Connecting
+## 3. Launching & Linking
 
-Ask the user or determine whether this machine is the **Main Hub** or a **Worker**:
+There is **no external hub vs worker launcher required**. You launch OMP normally:
 
-### Option A: This Machine is the MAIN HUB
-Run:
 ```bash
-omp-link hub [session-name]
+omp
+# or:
+omp-link
 ```
-- Binds to `0.0.0.0:9900`.
-- Acts as the central message router for all machines.
-- Prints reachable Tailscale and LAN IPs on startup.
 
-### Option B: This Machine is a WORKER (Joining an Existing Hub)
-
-#### 1. Auto-discovery (No IP needed):
-```bash
-omp-link join [session-name]
-```
-*(Scans all online Tailnet peers via Tailscale CLI and LAN UDP 9901 broadcast. If one hub is found, connects automatically).*
-
-#### 2. Manual IP connection:
-```bash
-omp-link join <HUB_TAILSCALE_OR_LAN_IP> [session-name]
-```
-*(Connects directly to the specified hub. Add `--save` to persist as the default hub in `~/.omp/link.json`).*
+OMP automatically loads `omp-link` on startup from `~/.omp/agent/extensions/omp-link`.
+- By default, it creates an active session using the project/directory name (e.g. `ag-exp`).
+- If another session with this name is already active on your network, it joins automatically.
+- Otherwise, it begins hosting the session on port 9900.
 
 ---
 
-## 4. Verification & Status Commands
+## 4. In-Session Slash Commands
 
-As an agent, you can run these CLI commands in bash to inspect or debug the link:
+All session control is driven directly inside OMP via slash commands:
 
-- **Update to the latest version:**
-  ```bash
-  omp-link update
-  ```
-  *(Fetches latest changes from git, updates dependencies, and refreshes extension links).*
-- **Clean up lingering hub processes / release port 9900:**
-  ```bash
-  omp-link clean
-  ```
-  *(Terminates any stale background hub processes occupying port 9900 and resets cached hub).*
-- **Scan Tailnet & LAN for active hubs:**
-  ```bash
-  omp-link find
-  # or with machine-readable JSON:
-  omp-link find --json
-  ```
-- **Show live connected terminals across all machines:**
-  ```bash
-  omp-link --status
-  # or machine-readable:
-  omp-link --status --json
-  ```
-- **Inspect local network config and saved hub:**
-  ```bash
-  omp-link config
-  ```
-- **Clear saved hub target:**
-  ```bash
-  omp-link config hub clear
-  ```
+| Command | Usage | Description |
+|---|---|---|
+| `/link` | `/link` | Displays the link status card: current session ID, network mode, LAN PIN, and all online peers. |
+| `/link-start` | `/link-start [id] [pin]` | Starts or switches to hosting a session with the given ID and PIN. |
+| `/link-join` | `/link-join [id \| ip[:port]] [pin]` | Joins an active session. If no target is given, auto-discovers active sessions on your network mode. |
+| `/link-leave` | `/link-leave` | Disconnects from the current session. (Alias: `/link-disconnect`). |
+| `/link-network` | `/link-network <tailscale \| lan>` | Switches strictly between Tailscale and LAN to prevent duplicate device probing. |
+| `/link-pin` | `/link-pin [pin]` | Displays current PIN or sets a new 4-digit PIN. |
+| `/link-name` | `/link-name [name]` | Changes the terminal's display name on the mesh. |
+| `/link-discover` | `/link-discover` | Scans the selected network mode and lists all discovered sessions. |
 
 ---
 
-## 5. How OMP / Pi Loads This Extension
+## 5. Security & Authentication Model
 
-OMP and Pi automatically discover extensions by inspecting directories in `~/.omp/agent/extensions/` and `~/.pi/agent/extensions/`.
-Because `./setup.sh` created a symlink `~/.omp/agent/extensions/omp-link -> <repo-root>`, OMP reads `package.json`:
-```json
-"pi": {
-  "extensions": ["./index.ts"],
-  "skills": ["./skills"]
-}
-```
-And loads `index.ts` whenever OMP starts. In addition, the `omp-link` CLI wrapper acts as a fallback by passing `--extension <path-to-index.ts>` if the symlink is ever missing.
+`omp-link` enforces a strict **either/or network model** with dual-tier security:
+
+1. **Tailscale Mode (Default when active):**
+   - Connections strictly use the Tailscale network (`100.64.0.0/10`).
+   - Authentication is **automatically verified** via WireGuard cryptographic peer identity (`isTailscaleOrLocalIp`). No PIN entry is needed when linking over Tailscale!
+2. **LAN Mode:**
+   - Connections use the local subnet.
+   - Remote peers **must provide the 4-digit session PIN** to join.
+   - Non-Tailscale connection attempts without a valid PIN are rejected with `4001: Invalid session PIN`.
+3. **Strict Network Isolation:**
+   - Probing and listening are strictly bound to either Tailscale or LAN, eliminating split-brain states and duplicate device appearances.
 
 ---
 
-## 6. In-Session Tools Reference (When Running Inside OMP)
+## 6. LLM Agent Tools Reference
 
-Inside an active session, the LLM has access to these tools:
+Agents inside OMP have access to 5 coordination tools:
 
 | Tool | Purpose | Key Parameters |
 |---|---|---|
-| `link_list` | Inspect all connected terminals, their hostnames, projects, status, and token window usage. | `{}` |
-| `link_discover` | Probe Tailnet and LAN for other active hubs and sessions. | `{}` |
-| `link_send` | Send a task/message to another terminal on any machine. | `{ to: "terminal-name", content: "..." }` |
-| `link_compact` | Request that another terminal compact its context window before delegating a large task. | `{ to: "terminal-name", instructions?: "..." }` |
+| `link_connect` | **Autonomous self-healing**: inspect status, auto-discover & join sessions, start hosting, switch network, or disconnect. | `{ action: "status" \| "join" \| "start" \| "leave", target?: "...", pin?: "...", network?: "tailscale" \| "lan" }` |
+| `link_send` | Send a task/message to another terminal on any machine. Includes auto-reconnect fallback if connection temporarily dropped. | `{ to: "terminal-name", message: "..." }` |
+| `link_list` | Inspect all connected terminals, their hostnames, projects, status, context window usage, session ID, and network mode. | `{}` |
+| `link_discover` | Scan the active network mode for other sessions and online terminals. | `{}` |
+| `link_compact` | Request that another terminal compact its context window before delegating a large task. | `{ to: "terminal-name", customInstructions?: "..." }` |
 
-### In-Session Slash Commands (for Human or Agent interactive prompt):
-- `/link` — View current terminal and online peers.
-- `/link-discover` — Scan Tailnet and LAN for active hubs.
-- `/link-connect [target]` — Connect/reconnect to a remote hub or `local`.
-- `/link-name [name]` — Change terminal name on the link.
-- `/link-disconnect` — Disconnect from the link.
+### Autonomous Self-Healing for Agents:
+If an agent ever encounters `"Not connected to link"` on a tool call, the agent should invoke:
+```json
+{
+  "name": "link_connect",
+  "parameters": { "action": "join" }
+}
+```
+This automatically scans the active network, discovers the peer session, and rejoins without user intervention.
 
 ---
 
-## 7. Important Security Note
+## 7. Maintenance & Debugging CLI
 
-There is currently **no application-level authentication** or token verification enforced by default.
-- On Tailscale, security and encryption are provided at the network layer by WireGuard.
-- On LAN, port 9900 is open to local network peers.
-- **Do not expose port 9900 to the public internet without a firewall or reverse proxy.**
+Outside OMP, these CLI commands assist with maintenance:
+
+- **Clean up lingering processes & reset stale configs:**
+  ```bash
+  omp-link clean
+  ```
+  *(Kills processes on ports 9900/9901 and resets cached hub).*
+- **Update to latest version from GitHub:**
+  ```bash
+  omp-link update
+  ```
+- **Scan network for active sessions:**
+  ```bash
+  omp-link find
+  ```
+- **Check version:**
+  ```bash
+  omp-link --version
+  ```
+

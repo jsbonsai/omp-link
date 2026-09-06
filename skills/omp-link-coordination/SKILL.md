@@ -87,7 +87,12 @@ anything the target learned but has not written down or reported can be lost.
 
 ### `link_discover`
 
-Searches for active pi-link hubs and sessions across the user's Tailscale tailnet and LAN. Returns a list of reachable machines, endpoints, hub names, and connected terminals/projects. When disconnected or seeking to coordinate with an agent on another machine, use `link_discover` to locate target endpoints.
+Searches for active sessions across the selected network (Tailscale or LAN). Returns reachable machines, endpoints, session IDs, PIN status, and connected terminals/projects.
+
+### `link_connect`
+
+Enables agents to autonomously inspect session status, auto-discover and join active sessions, start hosting a session, or disconnect. If `link_send` ever reports that the terminal is disconnected, invoke `link_connect` with `{ action: "join" }` or `{ action: "start" }` to self-heal the connection without human intervention.
+
 
 ---
 

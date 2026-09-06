@@ -82,44 +82,43 @@ if [[ ":$PATH:" != *":$HOME/.local/bin:"* ]]; then
 fi
 
 # 6. Link extension into OMP and Pi agent extensions directories as omp-link
-mkdir -p "$HOME/.omp/agent/extensions"
-mkdir -p "$HOME/.pi/agent/extensions"
+mkdir -p "$HOME/.omp/agent/extensions" "$HOME/.omp/extensions"
+mkdir -p "$HOME/.pi/agent/extensions" "$HOME/.pi/extensions"
 ln -sfn "$REPO_DIR" "$HOME/.omp/agent/extensions/omp-link"
+ln -sfn "$REPO_DIR" "$HOME/.omp/extensions/omp-link"
 ln -sfn "$REPO_DIR" "$HOME/.pi/agent/extensions/omp-link"
+ln -sfn "$REPO_DIR" "$HOME/.pi/extensions/omp-link"
 
-# 7. Detect IP addresses for easy copy-paste
-CONFIG_INFO="$("$REPO_DIR/bin/omp-link.mjs" config 2>/dev/null || true)"
-TS_IP="$(echo "$CONFIG_INFO" | grep "Tailscale IPv4" | awk -F': ' '{print $2}' | tr -d ' ')"
-LAN_IP="$(echo "$CONFIG_INFO" | grep "Local LAN IPv4" | awk -F': ' '{print $2}' | tr -d ' ')"
-
-MAIN_IP="${TS_IP:-$LAN_IP}"
-MAIN_IP="${MAIN_IP:-(your-hub-ip)}"
+# Link skills
+mkdir -p "$HOME/.omp/agent/skills" "$HOME/.omp/skills"
+mkdir -p "$HOME/.pi/agent/skills" "$HOME/.pi/skills"
+if [[ -d "$REPO_DIR/skills" ]]; then
+  ln -sfn "$REPO_DIR/skills" "$HOME/.omp/agent/skills/omp-link"
+  ln -sfn "$REPO_DIR/skills" "$HOME/.pi/agent/skills/omp-link"
+fi
 
 echo ""
 echo "======================================================================="
 echo "  ✓ Setup complete! omp-link is ready (with pi-link alias)."
 echo "======================================================================="
 echo ""
-echo "  [MAIN MACHINE] (Run on the machine you choose as the main hub):"
-echo "    omp-link hub [session-name]"
+echo "  Just start your coding session normally:"
+echo "    omp"
+echo "    (or omp-link)"
 echo ""
-if [[ -n "$TS_IP" && "$TS_IP" != "(not detected)" ]]; then
-  echo "    Reachable via Tailscale at: $TS_IP:9900"
-fi
-if [[ -n "$LAN_IP" && "$LAN_IP" != "(not detected)" ]]; then
-  echo "    Reachable via LAN at:       $LAN_IP:9900"
-fi
+echo "  All coordination happens via slash commands inside OMP:"
+echo "    /link                   View session status, network, PIN, and peers"
+echo "    /link-join              Auto-discover & join active session"
+echo "    /link-start [id]        Start hosting a session"
+echo "    /link-network <ts|lan>  Switch network mode (Tailscale / LAN)"
+echo "    /link-pin [pin]         View or change PIN"
+echo "    /link-leave             Leave session"
 echo ""
-echo "  [WORKER / CLIENT MACHINES] (Run on other machines to join):"
-echo "    omp-link join $MAIN_IP [session-name]"
-echo "    (or simply: omp-link join  to auto-discover on Tailnet/LAN)"
+echo "  Maintenance commands:"
+echo "    omp-link clean          Release ports 9900/9901 & clear stale configs"
+echo "    omp-link update         Pull latest version from GitHub"
+echo "    omp-link find           Scan network for live link sessions"
 echo ""
-echo "  [STATUS & DISCOVERY]"
-echo "    omp-link find      (Scan Tailnet & LAN for active hubs)"
-echo "    omp-link --status  (Check active terminals and projects)"
-echo "    omp-link clean     (Clean lingering processes / ports)"
-echo "    omp-link update    (Pull latest version from git)"
-echo ""
-echo "  [AI ASSISTANTS / LLMS]"
+echo "  [AI ASSISTANTS / AGENTS]"
 echo "    See AGENT.md for automated agent coordination and tool reference."
 echo "======================================================================="
