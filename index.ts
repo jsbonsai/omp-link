@@ -886,6 +886,52 @@ export default function (pi: ExtensionAPI) {
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   let startupConnectTimer: ReturnType<typeof setTimeout> | null = null;
 
+  // ── Mutation Guard & Territorial Sovereignty State ──
+  let mutationGuard = process.env.OMP_LINK_ALLOW_MUTATION !== "1" && process.env.OMP_LINK_MUTATION_GUARD !== "0";
+  let blockedMutationCount = 0;
+  interface BlockedMutationRecord {
+    timestamp: number;
+    from: string;
+    command: string;
+    reason: string;
+  }
+  const blockedMutationLog: BlockedMutationRecord[] = [];
+
+  const MUTATION_PATTERNS: Array<{ pattern: RegExp; reason: string }> = [
+    { pattern: /\b(rm|rmdir|unlink|shred)\b/i, reason: "File deletion command" },
+    { pattern: /\b(sed|awk)\b.*-i/i, reason: "In-place file edit" },
+    { pattern: /(?:^|[^&|0-9>])>(?!>)\s*(?!\/dev\/null\b)\S+/, reason: "Shell file overwrite (>)" },
+    { pattern: />>\s*(?!\/dev\/null\b)\S+/, reason: "Shell file append (>>)" },
+    { pattern: /\bgit\s+(commit|push|checkout|reset|rebase|merge|cherry-pick|revert|stash|clean|branch\s+-[dD])\b/i, reason: "Git working tree / branch mutation" },
+    { pattern: /\b(chmod|chown|chgrp|mv|truncate|dd|mkfs)\b/i, reason: "File permissions, rename, or disk mutation" },
+    { pattern: /\b(npm|pnpm|yarn|bun)\s+(install|add|remove|uninstall|update|i\b)/i, reason: "Package manager dependency mutation" },
+    { pattern: /\bpip\s+(install|uninstall)/i, reason: "Python package mutation" },
+    { pattern: /\b(reboot|shutdown|init\s+[06]|poweroff)\b/i, reason: "System power/reboot command" },
+  ];
+
+  function checkMutationGuard(command: string, fromPeer: string): { blocked: boolean; reason?: string } {
+    if (!mutationGuard) return { blocked: false };
+    for (const { pattern, reason } of MUTATION_PATTERNS) {
+      if (pattern.test(command)) {
+        blockedMutationCount++;
+        const record: BlockedMutationRecord = {
+          timestamp: Date.now(),
+          from: fromPeer,
+          command,
+          reason,
+        };
+        blockedMutationLog.push(record);
+        if (blockedMutationLog.length > 50) blockedMutationLog.shift();
+        notify(
+          `🛡️ [Mutation Guard] BLOCKED mutating command from "${fromPeer}": "${command}" (${reason}). Territorial Sovereignty enforced.`,
+          "warning"
+        );
+        return { blocked: true, reason };
+      }
+    }
+    return { blocked: false };
+  }
+
   // Status tracking (local truth)
   let agentRunning = false; // agent_start until agent_settled, not until agent_end
   let compactRunning = false; // true while compacting for a remote request
@@ -1457,6 +1503,7 @@ export default function (pi: ExtensionAPI) {
       `  Endpoint   : ${endpoint}`,
       `  Role       : ${role === "hub" ? "Host" : "Peer"} (${terminalName})`,
       `  LAN PIN    : ${sessionPin}`,
+      `  Security   : E2EE (AES-256-GCM) · Mutation Guard: ${mutationGuard ? "ON" : "OFF"}${blockedMutationCount > 0 ? ` (${blockedMutationCount} blocked)` : ""}`,
       divider,
       `  Online Peers (${connectedTerminals.length}):`,
       peerLines.join("\n") || "    (none)",
@@ -1914,6 +1961,17 @@ export default function (pi: ExtensionAPI) {
         respond(false, undefined, "Missing command parameter");
         return;
       }
+      if (mutationGuard) {
+        const guardCheck = checkMutationGuard(params.command, from);
+        if (guardCheck.blocked) {
+          respond(
+            false,
+            undefined,
+            `MUTATION GUARD BLOCKED: Command "${params.command}" was rejected (${guardCheck.reason}). Territorial Sovereignty Policy: Remote terminals may only execute read-only inspection commands (e.g. git status, git diff, pytest, npm test, cat, ls). If code changes are required, use link_send to request the local agent apply the change in its own session.`,
+          );
+          return;
+        }
+      }
       const execCwd = params.cwd ? path.resolve(currentCwd, params.cwd) : currentCwd;
       exec(params.command, { cwd: execCwd, timeout: 30_000, maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
         if (err) {
@@ -1998,7 +2056,15 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
-      const relPath = transfer.offer.destRelPath || path.join(".omp", "transfers", transfer.offer.filename);
+      let relPath = transfer.offer.destRelPath || path.join(".omp", "transfers", transfer.offer.filename);
+      if (mutationGuard && transfer.offer.destRelPath && !transfer.offer.destRelPath.startsWith(".omp/transfers")) {
+        const safeName = path.basename(transfer.offer.filename);
+        relPath = path.join(".omp", "transfers", safeName);
+        notify(
+          `🛡️ [Mutation Guard] Isolated file transfer from "${transfer.offer.from}" to ".omp/transfers/${safeName}" to protect local project code.`,
+          "info"
+        );
+      }
       const savePath = path.isAbsolute(relPath) ? relPath : path.resolve(currentCwd, relPath);
       try {
         await fs.promises.mkdir(path.dirname(savePath), { recursive: true });
@@ -3490,8 +3556,8 @@ export default function (pi: ExtensionAPI) {
     name: "link_exec",
     label: "Link Exec",
     description:
-      "Direct Tool RPC: Execute a shell command or read a file/directory directly on another terminal across the mesh without triggering an LLM turn on the remote agent (< 30ms latency).",
-    promptSnippet: "Execute a command or read a file directly on another terminal across the link",
+      "Direct Tool RPC: Execute read-only inspection commands (e.g. git status, git diff, pytest, npm test, cat, ls) or inspect files/directories on another terminal across the mesh (< 30ms latency). STRICT PROTOCOL (Territorial Sovereignty): You are strictly FORBIDDEN from running mutating commands (rm, sed -i, git commit, writing files). If remote code needs to be modified, you MUST use link_send to request the peer agent perform the change within its own session. Mutating commands will be rejected by the peer's Mutation Guard.",
+    promptSnippet: "Execute a read-only inspection command or read a file on another terminal across the link",
     parameters: Type.Object({
       to: Type.String({ description: "Target terminal name" }),
       action: Type.Union(
@@ -3503,7 +3569,7 @@ export default function (pi: ExtensionAPI) {
         { description: "Action: 'exec' (run shell command), 'read_file' (read file content), or 'list_dir' (list directory files)" },
       ),
       command: Type.Optional(
-        Type.String({ description: "Shell command to run (required if action is 'exec')" }),
+        Type.String({ description: "Read-only shell command to run (required if action is 'exec'). Mutating commands (rm, sed -i, git commit, etc.) are blocked by the Mutation Guard." }),
       ),
       filePath: Type.Optional(
         Type.String({ description: "File or directory path (required for 'read_file' or 'list_dir')" }),
@@ -3711,6 +3777,10 @@ export default function (pi: ExtensionAPI) {
         await turnLinkOn(_ctx);
         return;
       }
+      if (trimmed === "mutation" || trimmed.startsWith("mutation ") || trimmed.startsWith("guard")) {
+        handleMutationCommand(args.replace(/^(?:mutation|guard)\s*/i, ""), _ctx);
+        return;
+      }
       let card = renderStatusCard();
       if (linkActive && (role === "disconnected" || (role === "hub" && connectedTerminals.length <= 1))) {
         const { hubs } = await discoverAllHubs(linkPort, 900, linkSecret);
@@ -3739,6 +3809,48 @@ export default function (pi: ExtensionAPI) {
     description: "Turn link networking ON (auto-discovering and connecting to active session)",
     handler: async (_args, _ctx) => {
       await turnLinkOn(_ctx);
+    },
+  });
+
+  function handleMutationCommand(args: string, ctx: ExtensionContext) {
+    const trimmed = args.trim().toLowerCase();
+    if (trimmed === "off" || trimmed === "disable") {
+      mutationGuard = false;
+      ctx.ui.notify("⚠️ Mutation Guard DISABLED: Remote peers can now run mutating shell commands via link_exec.", "warning");
+      return;
+    }
+    if (trimmed === "on" || trimmed === "enable") {
+      mutationGuard = true;
+      ctx.ui.notify("🛡️ Mutation Guard ENABLED: Remote peers are restricted to read-only commands (Territorial Sovereignty enforced).", "info");
+      return;
+    }
+    if (trimmed === "log" || trimmed === "history") {
+      if (blockedMutationLog.length === 0) {
+        ctx.ui.notify("🛡️ Mutation Guard Log: Zero blocked attempts recorded.", "info");
+        return;
+      }
+      let logOutput = `🛡️ Mutation Guard Block Log (${blockedMutationLog.length} attempts):\n`;
+      blockedMutationLog.slice(-10).forEach((rec, idx) => {
+        const timeAgo = Math.round((Date.now() - rec.timestamp) / 1000);
+        logOutput += `  ${idx + 1}. [${timeAgo}s ago] from "${rec.from}" (${rec.reason}):\n     ${rec.command}\n`;
+      });
+      ctx.ui.notify(logOutput, "warning");
+      return;
+    }
+    let msg = `🛡️ Mutation Guard: ${mutationGuard ? "ACTIVE (ENFORCED)" : "DISABLED"}\n`;
+    msg += `  Policy: ${mutationGuard ? "Remote peers cannot mutate local files, git commits, or packages." : "Unrestricted remote execution allowed."}\n`;
+    msg += `  Blocked Attempts: ${blockedMutationCount}\n`;
+    msg += `  Usage:\n`;
+    msg += `    /link-mutation on      Enable protection\n`;
+    msg += `    /link-mutation off     Disable protection\n`;
+    msg += `    /link-mutation log     View recent blocked command log`;
+    ctx.ui.notify(msg, mutationGuard ? "info" : "warning");
+  }
+
+  pi.registerCommand("link-mutation", {
+    description: "Inspect or toggle Mutation Guard (Territorial Sovereignty protection). Usage: /link-mutation [on|off|log]",
+    handler: async (args, _ctx) => {
+      handleMutationCommand(args, _ctx);
     },
   });
 

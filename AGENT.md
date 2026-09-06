@@ -72,6 +72,7 @@ All session control is driven directly inside OMP via slash commands:
 | `/link-pin` | `/link-pin [pin]` | Displays current PIN or sets a new 4-digit PIN. |
 | `/link-name` | `/link-name [name]` | Changes the terminal's display name on the mesh. |
 | `/link-discover` | `/link-discover` | Scans the selected network mode and lists all discovered sessions. |
+| `/link-mutation` | `/link-mutation [on\|off\|log]` | Inspects, toggles, or displays the audit log for the Mutation Guard. |
 
 ---
 
@@ -93,6 +94,9 @@ All session control is driven directly inside OMP via slash commands:
 4. **Deterministic Link ON/OFF & 3-Strike Circuit Breaker:**
    - If network is unreachable, reconnect terminates after 3 strikes to avoid log spam.
    - Running `/link off` cleanly halts all networking until explicit `/link on`.
+5. **Local Mutation Guard (Active by Default)**:
+   - Blocks unauthorized remote peers from executing mutating commands (`rm`, `sed -i`, `git commit`, `chmod`, overwrite redirections).
+   - Enforces workspace isolation: transferred files are saved to `.omp/transfers/` and cannot clobber local project source files.
 
 ---
 
@@ -102,9 +106,9 @@ Agents inside OMP have access to 7 coordination and execution tools:
 
 | Tool | Purpose | Key Parameters | Latency |
 |---|---|---|---|
-| `link_exec` | **Direct Tool RPC**: Execute shell commands, read remote files, or list directories on a remote terminal without waking up the remote LLM! | `{ to: "name", action: "exec" \| "read_file" \| "list_dir", command?: "...", path?: "..." }` | **< 25ms** (Zero Tokens) |
-| `link_send_file` | **Out-of-band File Streaming**: Stream files across machines with 64KB chunking and SHA-256 verification. Also generates ephemeral direct HTTP links on `:9900/transfer/:token/:filename`. | `{ to: "name", filePath: "./dist/app.js", targetFilename: "app.js" }` | **< 50ms** |
-| `link_send` | **Agent-to-Agent Reasoning Delegation**: Send tasks or prompts directly into another agent's LLM reasoning loop. | `{ to: "name", message: "..." }` | **15–25s** (LLM turn) |
+| `link_exec` | **Direct Tool RPC (Read-Only)**: Execute inspection commands (`git status`, `git diff`, `pytest`, `cat`, `ls`) or read files on a remote terminal (< 30ms latency). Mutating commands are rejected by the peer node's Mutation Guard. | `{ to: "name", action: "exec" \| "read_file" \| "list_dir", command?: "...", path?: "..." }` | **< 25ms** (Zero Tokens) |
+| `link_send_file` | **Out-of-band File Streaming**: Stream files across machines with 64KB chunking and SHA-256 verification into `.omp/transfers/`. Also generates ephemeral direct HTTP links on `:9900/transfer/:token/:filename`. | `{ to: "name", filePath: "./dist/app.js", targetFilename: "app.js" }` | **< 50ms** |
+| `link_send` | **Agent-to-Agent Reasoning Delegation**: Send tasks or prompts directly into another agent's LLM reasoning loop. Use when code changes or planning are required! | `{ to: "name", message: "..." }` | **15–25s** (LLM turn) |
 | `link_list` | Inspect all connected terminals, their hostnames, projects, status, context window usage, session ID, and network mode. | `{}` | < 5ms |
 | `link_connect` | **Autonomous self-healing**: inspect status, auto-discover & join sessions, start hosting, switch network, or disconnect. | `{ action: "status" \| "join" \| "start" \| "leave", target?: "...", pin?: "...", network?: "tailscale" \| "lan" }` | < 100ms |
 | `link_discover` | Scan the active network mode for other sessions and online terminals. | `{}` | ~500ms |
@@ -126,21 +130,25 @@ This automatically scans the active network, discovers the peer session, and rej
 
 When acting as an agent on the link:
 
-1. **Prefer `link_exec` for Information Gathering & Actions**:
+1. **Territorial Sovereignty (Local Domain Authority)**:
+   - **Rule**: Every agent is the sole authoritative writer of its own local workspace.
+   - **Never mutate peer code directly**: Never attempt to run `sed`, `rm`, `git commit`, or overwrite files on another machine. That desynchronizes the peer's context window and clobbers working trees.
+   - **Observe -> Advise -> Local Execution**: Use `link_exec` to inspect peer code (`git diff`, `cat`, test runs). If changes are needed, send a task to the peer agent via `link_send` asking it to review and make the fix.
+2. **Prefer `link_exec` for Information Gathering & Actions**:
    - If you only need to run a build, run tests, check `git status`, or read a file on another machine, use **`link_exec`**!
    - `link_exec` runs in **10–25ms** and costs **zero LLM tokens**.
    - Only use `link_send` when you specifically require the remote agent's brain to reason, refactor code, or plan architecture.
-2. **Prevent Conversational Ping-Pong Loops**:
+3. **Prevent Conversational Ping-Pong Loops**:
    - Every `link_send` message triggers an LLM turn on the receiving agent (`triggerTurn: true`), which takes 5–15 seconds of LLM inference.
    - **Never** send polite conversational acknowledgments (e.g. "Thanks!", "Got it, standing by!", "You're welcome!").
    - When finishing an assigned task, state your results clearly and conclude with: `[FINAL ANSWER - No reply needed]`.
-3. **Pre-flight Status Check**:
+4. **Pre-flight Status Check**:
    - Run `link_list` before dispatching tasks.
    - Verify the target agent is `idle`. If it is `thinking` or `compacting`, your message will queue in its inbox until its current turn completes.
-4. **Context Window Hygiene**:
+5. **Context Window Hygiene**:
    - Check peer context utilization via `link_list`.
    - If a peer is above 75% context, call `link_compact` before sending a large code payload.
-5. **Targeting by Role or Project**:
+6. **Targeting by Role or Project**:
    - In your initial discovery, use `link_list` to see which machine has which project directory open, and dispatch repository-specific tasks to the terminal located in that project folder.
 
 ---

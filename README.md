@@ -58,6 +58,7 @@ All coordination happens directly inside OMP via slash commands:
 | **`/link-join`** | `/link-join`<br>`/link-join [id] [pin]` | **Connect**: With no arguments, scans your network and **auto-joins** the active session! Or specify session ID / IP and PIN. |
 | **`/link-start`** | `/link-start [id] [pin]` | **Host**: Start or switch to hosting a session with a custom ID or PIN. |
 | **`/link-leave`** | `/link-leave` | **Disconnect**: Cleanly leave the session and release the network port. |
+| **`/link-mutation`** | `/link-mutation`<br>`/link-mutation [on\|off\|log]` | **Mutation Guard**: Inspect, toggle, or view the real-time blocked command audit log. |
 
 ### Secondary Slash Commands & Environment Flags
 - `/link-network <tailscale | lan>`: Switch between Tailscale (WireGuard auto-auth) and LAN mode.
@@ -65,6 +66,7 @@ All coordination happens directly inside OMP via slash commands:
 - `/link-pin [pin]`: Inspect or set a new 4-digit PIN for LAN mode.
 - `/link-name [name]`: Change your terminal's display name on the mesh.
 - `OMP_LINK_OFF=1` or `omp --no-link`: Launch OMP with link completely disabled from startup.
+- `OMP_LINK_ALLOW_MUTATION=1`: Disable the Mutation Guard to allow unrestricted remote shell execution.
 
 ---
 
@@ -73,7 +75,7 @@ All coordination happens directly inside OMP via slash commands:
 Agents running inside OMP have access to 7 built-in coordination and execution tools:
 
 ### 1. `link_exec` (Direct Tool RPC — < 25ms execution, Zero LLM Tokens)
-Execute shell commands or read files directly on a remote terminal without waking up the remote agent's LLM reasoning loop!
+Execute fast, read-only inspection commands or read files directly on a remote terminal without waking up the remote agent's LLM reasoning loop!
 ```json
 {
   "to": "linux-workstation",
@@ -89,7 +91,7 @@ Or inspect remote files without turning the remote model:
   "path": "/home/js/backend/src/server.ts"
 }
 ```
-*Round trip latency is under 25ms over encrypted WebSocket, completely eliminating the 15–25s LLM inference wait.*
+*Round trip latency is under 25ms over encrypted WebSocket. By default, mutating commands (`rm`, `sed -i`, `git commit`, file overwrite redirects) are automatically blocked by the remote terminal's **Mutation Guard** to uphold Territorial Sovereignty.*
 
 ### 2. `link_send_file` (Out-of-Band Streaming File Transfer)
 Stream files directly between machines across LAN or Tailscale with chunked delivery, SHA-256 integrity verification, and zero MCP server overhead:
@@ -178,6 +180,13 @@ When you send a message with `link_send` and wait for a reply, the turn takes 15
 4. **Deterministic Link ON/OFF & Circuit Breaker**:
    - Run `/link off` to completely detach from the mesh, terminate listeners, and suppress all background reconnect loops.
    - 3-strike circuit breaker: after 3 consecutive failed reconnection attempts, OMP ceases dialing and stays silent until explicit user activation (`/link on` or `/link-join`).
+5. **Territorial Sovereignty & The Mutation Guard**:
+   - **The Problem**: In multi-machine swarms, an eager agent on Machine A that spots a bug on Machine B might attempt to directly edit, overwrite, or commit code on Machine B, clobbering Machine B's working tree and desynchronizing its LLM context.
+   - **The Principle**: Every agent is the sole authoritative writer of its own local workspace.
+   - **The Defense**: Each terminal runs a local **Mutation Guard** (active by default). If a remote peer attempts a mutating command (`rm`, `sed -i`, `git commit`, `chmod`, `>`/`>>` redirects, or package updates) via `link_exec`, the command is **blocked immediately**.
+   - **Monitoring & Audit Log**: Blocked attempts are alerted on-screen in real time (`🛡️ [Mutation Guard] BLOCKED...`) and recorded in a live audit log viewable via `/link-mutation log`.
+   - **Workspace Isolation**: Transferred files via `link_send_file` are strictly isolated to `.omp/transfers/` and cannot clobber local project source code.
+   - **Toggling**: Run `/link-mutation off` to allow unrestricted execution, or `/link-mutation on` to re-enable (or launch with `OMP_LINK_ALLOW_MUTATION=1`).
 
 ---
 

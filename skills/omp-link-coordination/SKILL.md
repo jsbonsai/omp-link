@@ -85,6 +85,13 @@ may mean the compaction is still running.
 Compaction discards detail. What survives is whatever the summary keeps, so
 anything the target learned but has not written down or reported can be lost.
 
+### `link_exec`
+
+Execute read-only inspection commands or inspect files/directories on remote terminals (< 25ms latency).
+- **Read-Only Inspection**: Use `link_exec` for fast information gathering (`git status`, `git diff`, `npm test`, `pytest`, `cat`, `ls`).
+- **Territorial Sovereignty**: You are strictly FORBIDDEN from running mutating commands (e.g. `rm`, `sed -i`, `git commit`, `git checkout`, writing files) on peer machines. Mutating commands will be rejected by the peer node's **Mutation Guard**.
+- **Change Delegation**: If you notice a bug or need code changed in a peer's repository, you MUST use `link_send` to ask the peer agent to make the change in its own session.
+
 ### `link_discover`
 
 Searches for active sessions across the selected network (Tailscale or LAN). Returns reachable machines, endpoints, session IDs, PIN status, and connected terminals/projects.
@@ -92,6 +99,19 @@ Searches for active sessions across the selected network (Tailscale or LAN). Ret
 ### `link_connect`
 
 Enables agents to autonomously inspect session status, auto-discover and join active sessions, start hosting a session, or disconnect. If `link_send` ever reports that the terminal is disconnected, invoke `link_connect` with `{ action: "join" }` or `{ action: "start" }` to self-heal the connection without human intervention.
+
+---
+
+## Territorial Sovereignty & Swarm Governance
+
+When multiple agents coordinate across machines and repositories:
+1. **Local Domain Ownership**: Every agent is the sole authoritative writer of its local workspace.
+2. **Never Clobber Peer Code**: Do not attempt to fix or patch code on a peer machine directly via RPC or file writes. Doing so desynchronizes the peer's context window and causes git/file conflicts.
+3. **Observe -> Advise -> Local Execution**:
+   - Inspect peer status via `link_exec` (read-only).
+   - Report the issue or task to the peer agent via `link_send`.
+   - Let the peer agent review, edit, test, and commit the fix in its own workspace.
+4. **Mutation Guard**: Each terminal enforces a local Mutation Guard that intercepts and rejects unauthorized remote modification attempts. Violations are logged and alerted in real time.
 
 
 ---
