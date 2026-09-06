@@ -17,7 +17,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { execSync } from "node:child_process";
+import { execSync, exec } from "node:child_process";
 import * as crypto from "node:crypto";
 import * as dgram from "node:dgram";
 import * as fs from "node:fs";
@@ -124,6 +124,69 @@ interface CompactResponseMsg {
   reason?: string; // "busy" | "not_found" | "unsupported" | error text; absent on success
 }
 
+interface RpcRequestMsg {
+  type: "rpc_request";
+  id: string;
+  from: string;
+  to: string;
+  action: "exec" | "read_file" | "list_dir";
+  params: {
+    command?: string;
+    cwd?: string;
+    filePath?: string;
+  };
+}
+
+interface RpcResponseMsg {
+  type: "rpc_response";
+  id: string;
+  from: string;
+  to: string;
+  ok: boolean;
+  result?: string;
+  error?: string;
+}
+
+interface FileOfferMsg {
+  type: "file_offer";
+  transferId: string;
+  from: string;
+  to: string;
+  filename: string;
+  destRelPath?: string;
+  sizeBytes: number;
+  sha256: string;
+  totalChunks: number;
+  downloadUrl?: string;
+}
+
+interface FileChunkMsg {
+  type: "file_chunk";
+  transferId: string;
+  from: string;
+  to: string;
+  chunkIndex: number;
+  totalChunks: number;
+  data: string;
+}
+
+interface FileAckMsg {
+  type: "file_ack";
+  transferId: string;
+  from: string;
+  to: string;
+  ok: boolean;
+  savedPath?: string;
+  error?: string;
+}
+
+interface EncryptedMsg {
+  type: "encrypted";
+  iv: string;
+  tag: string;
+  data: string;
+}
+
 type LinkStatus =
   | { kind: "idle"; since: number }
   | { kind: "thinking"; since: number }
@@ -141,7 +204,13 @@ type LinkMessage =
   | StatusUpdateMsg
   | ErrorMsg
   | CompactRequestMsg
-  | CompactResponseMsg;
+  | CompactResponseMsg
+  | RpcRequestMsg
+  | RpcResponseMsg
+  | FileOfferMsg
+  | FileChunkMsg
+  | FileAckMsg
+  | EncryptedMsg;
 
 /**
  * True when Pi is at or above MIN_PI_VERSION. A fixed floor needs an ordered compare
@@ -742,6 +811,12 @@ export default function (pi: ExtensionAPI) {
     type: "string",
   });
 
+  pi.registerFlag("no-link", {
+    description: "Disable link networking entirely for this session",
+    type: "boolean",
+    default: false,
+  });
+
   // ── State ────────────────────────────────────────────────────────────────
 
   const config = loadLinkConfig();
@@ -769,6 +844,45 @@ export default function (pi: ExtensionAPI) {
   let ctx: ExtensionContext | undefined;
   let disposed = false;
   let manuallyDisconnected = false;
+  let linkActive = process.env.OMP_LINK_OFF !== "1" && process.env.PI_LINK_DISABLE !== "1";
+  let reconnectAttempts = 0;
+  const MAX_RECONNECT_ATTEMPTS = 3;
+
+  // ── E2EE State ──
+  let sessionKey: Buffer | null = null;
+  function updateSessionKey() {
+    const pin = sessionPin || "0000";
+    const sid = currentSessionId || "team-swarm";
+    sessionKey = crypto.pbkdf2Sync(pin, `omp-link-salt-${sid}`, 50_000, 32, "sha256");
+  }
+  updateSessionKey();
+
+  // ── Direct Tool RPC State ──
+  const pendingRpcRequests = new Map<
+    string,
+    { resolve: (res: RpcResponseMsg) => void; timeout: NodeJS.Timeout }
+  >();
+
+  // ── Out-of-band File Transfer State ──
+  interface EphemeralTransfer {
+    buffer: Buffer;
+    filename: string;
+    sha256: string;
+    expires: number;
+  }
+  const ephemeralTransfers = new Map<string, EphemeralTransfer>();
+
+  interface IncomingTransfer {
+    offer: FileOfferMsg;
+    chunks: Map<number, Buffer>;
+    startedAt: number;
+  }
+  const incomingTransfers = new Map<string, IncomingTransfer>();
+  const pendingFileAcks = new Map<
+    string,
+    { resolve: (ack: FileAckMsg) => void; timeout: NodeJS.Timeout }
+  >();
+
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   let startupConnectTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -852,6 +966,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   function notify(message: string, level: "info" | "warning" | "error") {
+    if (!linkActive && level === "warning") return;
     getUi()?.notify(message, level);
   }
 
@@ -859,6 +974,10 @@ export default function (pi: ExtensionAPI) {
     const ui = getUi();
     if (!ui) return;
     const theme = ui.theme;
+    if (!linkActive) {
+      ui.setStatus("link", theme.fg("dim", "link: off"));
+      return;
+    }
     const count = connectedTerminals.length;
     const info =
       role === "disconnected"
@@ -1174,11 +1293,16 @@ export default function (pi: ExtensionAPI) {
   // ── Connection intent ──────────────────────────────────────────────────
 
   function shouldConnect(): boolean {
+    if (!linkActive) return false;
+    if (pi.getFlag("no-link") === true) return false;
+    if (process.env.PI_LINK_DISABLE === "1" || process.env.OMP_LINK_DISABLE === "1" || process.env.OMP_LINK_OFF === "1") return false;
     const data = latestCustomData("link-active") as
       | { active?: boolean }
       | undefined;
-    if (data?.active !== undefined) return data.active;
-    if (process.env.PI_LINK_DISABLE === "1" || process.env.OMP_LINK_DISABLE === "1") return false;
+    if (data?.active !== undefined) {
+      linkActive = data.active;
+      return data.active;
+    }
     return true;
   }
 
@@ -1279,6 +1403,19 @@ export default function (pi: ExtensionAPI) {
 
     const divider = "─".repeat(52);
 
+    if (!linkActive) {
+      return [
+        `⚡ OMP LINK: DISABLED (OFF)`,
+        divider,
+        `  Status     : All sockets closed & background retries halted`,
+        `  Network    : ${networkMode.toUpperCase()}`,
+        `  Session ID : ${currentSessionId}`,
+        divider,
+        `  To turn back on:`,
+        `    /link on`,
+      ].join("\n");
+    }
+
     if (!isOnline) {
       return [
         `⚡ OMP LINK: DISCONNECTED`,
@@ -1337,9 +1474,47 @@ export default function (pi: ExtensionAPI) {
     ].join("\n");
   }
 
+  function serializeForWire(msg: LinkMessage): string {
+    const json = JSON.stringify(msg);
+    if (!sessionKey) updateSessionKey();
+    if (!sessionKey) return json;
+    try {
+      const iv = crypto.randomBytes(12);
+      const cipher = crypto.createCipheriv("aes-256-gcm", sessionKey, iv);
+      let enc = cipher.update(json, "utf8", "base64");
+      enc += cipher.final("base64");
+      const tag = cipher.getAuthTag();
+      const wrapped: EncryptedMsg = {
+        type: "encrypted",
+        iv: iv.toString("base64"),
+        tag: tag.toString("base64"),
+        data: enc,
+      };
+      return JSON.stringify(wrapped);
+    } catch {
+      return json;
+    }
+  }
+
   function safeParse(data: string): LinkMessage | null {
     try {
-      return JSON.parse(data);
+      const parsed = JSON.parse(data);
+      if (parsed && typeof parsed === "object" && parsed.type === "encrypted") {
+        if (!sessionKey) updateSessionKey();
+        if (!sessionKey) return null;
+        try {
+          const iv = Buffer.from(parsed.iv, "base64");
+          const tag = Buffer.from(parsed.tag, "base64");
+          const decipher = crypto.createDecipheriv("aes-256-gcm", sessionKey!, iv);
+          decipher.setAuthTag(tag);
+          let dec = decipher.update(parsed.data, "base64", "utf8");
+          dec += decipher.final("utf8");
+          return JSON.parse(dec);
+        } catch {
+          return null;
+        }
+      }
+      return parsed;
     } catch {
       return null;
     }
@@ -1349,9 +1524,9 @@ export default function (pi: ExtensionAPI) {
 
   /** Hub: broadcast a message to every terminal except `excludeName`. */
   function hubBroadcast(msg: LinkMessage, excludeName?: string) {
-    const json = JSON.stringify(msg);
+    const wire = serializeForWire(msg);
     for (const [clientWs, name] of hubClients) {
-      if (name !== excludeName) clientWs.send(json);
+      if (name !== excludeName) clientWs.send(wire);
     }
     // Also deliver to the hub itself (unless excluded)
     if (excludeName !== terminalName) handleIncoming(msg);
@@ -1409,7 +1584,15 @@ export default function (pi: ExtensionAPI) {
    * still reject via protocol-level error responses).
    */
   function routeMessage(
-    msg: ChatMsg | CompactRequestMsg | CompactResponseMsg,
+    msg:
+      | ChatMsg
+      | CompactRequestMsg
+      | CompactResponseMsg
+      | RpcRequestMsg
+      | RpcResponseMsg
+      | FileOfferMsg
+      | FileChunkMsg
+      | FileAckMsg,
   ): boolean {
     if (role === "hub") {
       if (msg.to === "*" || msg.to === "all") {
@@ -1428,34 +1611,54 @@ export default function (pi: ExtensionAPI) {
           return true;
         }
         if (resolved.ws) {
-          resolved.ws.send(JSON.stringify(msg));
+          resolved.ws.send(serializeForWire(msg));
           return true;
         }
       }
       // Target not found — send error back to sender
       const online = terminalList().join(", ");
       const errText = `Terminal "${msg.to}" not found. Online terminals: ${online}`;
-      const errorMsg: LinkMessage =
-        msg.type === "compact_request"
-          ? {
-              type: "compact_response",
-              id: msg.id,
-              from: terminalName,
-              to: msg.from,
-              ok: false,
-              reason: "not_found",
-            }
-          : { type: "error", message: errText };
+      let errorMsg: LinkMessage;
+      if (msg.type === "compact_request") {
+        errorMsg = {
+          type: "compact_response",
+          id: msg.id,
+          from: terminalName,
+          to: msg.from,
+          ok: false,
+          reason: "not_found",
+        };
+      } else if (msg.type === "rpc_request") {
+        errorMsg = {
+          type: "rpc_response",
+          id: msg.id,
+          from: terminalName,
+          to: msg.from,
+          ok: false,
+          error: "not_found",
+        };
+      } else if (msg.type === "file_offer") {
+        errorMsg = {
+          type: "file_ack",
+          transferId: msg.transferId,
+          from: terminalName,
+          to: msg.from,
+          ok: false,
+          error: "not_found",
+        };
+      } else {
+        errorMsg = { type: "error", message: errText };
+      }
 
       if (msg.from === terminalName) {
-        if (errorMsg.type === "compact_response") handleIncoming(errorMsg);
+        handleIncoming(errorMsg);
       } else {
-        hubClientByName(msg.from)?.send(JSON.stringify(errorMsg));
+        hubClientByName(msg.from)?.send(serializeForWire(errorMsg));
       }
       return false;
     }
     if (role === "client" && ws?.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify(msg));
+      ws.send(serializeForWire(msg));
       return true; // optimistic — hub will handle errors via protocol
     }
     return false;
@@ -1655,6 +1858,170 @@ export default function (pi: ExtensionAPI) {
       case "error":
         notify(`Link: ${msg.message}`, "error");
         break;
+
+      // ── Direct Tool RPC ──
+      case "rpc_request":
+        handleRpcRequest(msg);
+        break;
+
+      case "rpc_response": {
+        const pending = pendingRpcRequests.get(msg.id);
+        if (pending) {
+          clearTimeout(pending.timeout);
+          pendingRpcRequests.delete(msg.id);
+          pending.resolve(msg);
+        }
+        break;
+      }
+
+      // ── File Transfer ──
+      case "file_offer":
+        handleFileOffer(msg);
+        break;
+
+      case "file_chunk":
+        handleFileChunk(msg);
+        break;
+
+      case "file_ack": {
+        const pending = pendingFileAcks.get(msg.transferId);
+        if (pending) {
+          clearTimeout(pending.timeout);
+          pendingFileAcks.delete(msg.transferId);
+          pending.resolve(msg);
+        }
+        break;
+      }
+    }
+  }
+
+  function handleRpcRequest(msg: RpcRequestMsg) {
+    const { id, from, action, params } = msg;
+    const respond = (ok: boolean, result?: string, error?: string) => {
+      routeMessage({
+        type: "rpc_response",
+        id,
+        from: terminalName,
+        to: from,
+        ok,
+        result,
+        error,
+      });
+    };
+
+    if (action === "exec") {
+      if (!params.command) {
+        respond(false, undefined, "Missing command parameter");
+        return;
+      }
+      const execCwd = params.cwd ? path.resolve(currentCwd, params.cwd) : currentCwd;
+      exec(params.command, { cwd: execCwd, timeout: 30_000, maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
+        if (err) {
+          respond(false, (stdout ? stdout + "\n" : "") + (stderr || ""), err.message);
+        } else {
+          respond(true, stdout || (stderr ? `[stderr]\n${stderr}` : "[Command completed with no output]"));
+        }
+      });
+      return;
+    }
+
+    if (action === "read_file") {
+      if (!params.filePath) {
+        respond(false, undefined, "Missing filePath parameter");
+        return;
+      }
+      const fullPath = path.isAbsolute(params.filePath) ? params.filePath : path.resolve(currentCwd, params.filePath);
+      fs.promises.readFile(fullPath, "utf-8").then(
+        (content) => respond(true, content),
+        (err) => respond(false, undefined, err.message),
+      );
+      return;
+    }
+
+    if (action === "list_dir") {
+      const dirPath = params.filePath ? (path.isAbsolute(params.filePath) ? params.filePath : path.resolve(currentCwd, params.filePath)) : currentCwd;
+      fs.promises.readdir(dirPath, { withFileTypes: true }).then(
+        (entries) => {
+          const list = entries.map((e) => `${e.isDirectory() ? "📁" : "📄"} ${e.name}`).join("\n");
+          respond(true, list);
+        },
+        (err) => respond(false, undefined, err.message),
+      );
+      return;
+    }
+
+    respond(false, undefined, `Unsupported action "${action}"`);
+  }
+
+  function handleFileOffer(msg: FileOfferMsg) {
+    incomingTransfers.set(msg.transferId, {
+      offer: msg,
+      chunks: new Map(),
+      startedAt: Date.now(),
+    });
+  }
+
+  async function handleFileChunk(msg: FileChunkMsg) {
+    const transfer = incomingTransfers.get(msg.transferId);
+    if (!transfer) return;
+
+    transfer.chunks.set(msg.chunkIndex, Buffer.from(msg.data, "base64"));
+    if (transfer.chunks.size >= msg.totalChunks) {
+      incomingTransfers.delete(msg.transferId);
+      const orderedChunks: Buffer[] = [];
+      for (let i = 0; i < msg.totalChunks; i++) {
+        const chunk = transfer.chunks.get(i);
+        if (!chunk) {
+          routeMessage({
+            type: "file_ack",
+            transferId: msg.transferId,
+            from: terminalName,
+            to: transfer.offer.from,
+            ok: false,
+            error: `Missing chunk ${i}`,
+          });
+          return;
+        }
+        orderedChunks.push(chunk);
+      }
+      const fullBuffer = Buffer.concat(orderedChunks);
+      const computedSha = crypto.createHash("sha256").update(fullBuffer).digest("hex");
+      if (computedSha !== transfer.offer.sha256) {
+        routeMessage({
+          type: "file_ack",
+          transferId: msg.transferId,
+          from: terminalName,
+          to: transfer.offer.from,
+          ok: false,
+          error: "SHA-256 checksum mismatch",
+        });
+        return;
+      }
+
+      const relPath = transfer.offer.destRelPath || path.join(".omp", "transfers", transfer.offer.filename);
+      const savePath = path.isAbsolute(relPath) ? relPath : path.resolve(currentCwd, relPath);
+      try {
+        await fs.promises.mkdir(path.dirname(savePath), { recursive: true });
+        await fs.promises.writeFile(savePath, fullBuffer);
+        routeMessage({
+          type: "file_ack",
+          transferId: msg.transferId,
+          from: terminalName,
+          to: transfer.offer.from,
+          ok: true,
+          savedPath: savePath,
+        });
+        notify(`📥 Received file "${transfer.offer.filename}" (${(fullBuffer.length / 1024).toFixed(1)} KB) from ${transfer.offer.from} -> ${shortenPath(savePath)}`, "info");
+      } catch (err: any) {
+        routeMessage({
+          type: "file_ack",
+          transferId: msg.transferId,
+          from: terminalName,
+          to: transfer.offer.from,
+          ok: false,
+          error: err.message,
+        });
+      }
     }
   }
 
@@ -1735,7 +2102,7 @@ export default function (pi: ExtensionAPI) {
           if (name !== clientName) projects[name] = proj;
         }
         clientWs.send(
-          JSON.stringify({
+          serializeForWire({
             type: "welcome",
             name: clientName,
             sessionId: currentSessionId,
@@ -1780,20 +2147,25 @@ export default function (pi: ExtensionAPI) {
           status: msg.status,
           context: msg.context, // undefined omitted by JSON; null forwarded to clear
         };
-        const json = JSON.stringify(normalized);
+        const wire = serializeForWire(normalized);
         for (const [otherWs, name] of hubClients) {
-          if (name !== clientName) otherWs.send(json);
+          if (name !== clientName) otherWs.send(wire);
         }
         return;
       }
 
-      // Route chat and compact messages.
+      // Route chat, compact, rpc, and file transfer messages.
       // Normalize `from` to the hub's authoritative socket→name mapping,
       // mirroring the status_update path above. Don't trust the client.
       if (
         msg.type === "chat" ||
         msg.type === "compact_request" ||
-        msg.type === "compact_response"
+        msg.type === "compact_response" ||
+        msg.type === "rpc_request" ||
+        msg.type === "rpc_response" ||
+        msg.type === "file_offer" ||
+        msg.type === "file_chunk" ||
+        msg.type === "file_ack"
       ) {
         routeMessage({ ...msg, from: clientName });
       }
@@ -1839,6 +2211,26 @@ export default function (pi: ExtensionAPI) {
           res.end(JSON.stringify(buildStatusPayload()));
           return;
         }
+        if (req.method === "GET" && req.url?.startsWith("/transfer/")) {
+          const parts = req.url.split("/").filter(Boolean);
+          if (parts.length >= 2) {
+            const transferId = parts[1];
+            const transfer = ephemeralTransfers.get(transferId);
+            if (transfer && Date.now() < transfer.expires) {
+              res.writeHead(200, {
+                "content-type": "application/octet-stream",
+                "content-disposition": `attachment; filename="${encodeURIComponent(transfer.filename)}"`,
+                "content-length": transfer.buffer.length,
+                "x-sha256": transfer.sha256,
+              });
+              res.end(transfer.buffer);
+              return;
+            }
+          }
+          res.writeHead(404, { "content-type": "text/plain" });
+          res.end("Transfer expired or not found");
+          return;
+        }
         res.writeHead(404);
         res.end();
       });
@@ -1865,6 +2257,7 @@ export default function (pi: ExtensionAPI) {
           settle(false);
           return;
         }
+        reconnectAttempts = 0;
         wss = server;
         hubHttpServer = httpServer;
         // If a client `/link-name` was in flight when the previous hub vanished,
@@ -1978,9 +2371,13 @@ export default function (pi: ExtensionAPI) {
         // socket that is neither.
         ws = socket;
         role = "client";
+        reconnectAttempts = 0;
+        if (effectivePin) sessionPin = effectivePin;
+        if (effectiveSessionId) currentSessionId = effectiveSessionId;
+        updateSessionKey();
         // Register with preferred name if available, otherwise current name
         socket.send(
-          JSON.stringify({
+          serializeForWire({
             type: "register",
             name: preferredName ?? terminalName,
             sessionId: effectiveSessionId,
@@ -2158,11 +2555,20 @@ export default function (pi: ExtensionAPI) {
   }
 
   function scheduleReconnect() {
-    if (disposed || manuallyDisconnected || reconnectTimer) return;
-    const delay = RECONNECT_DELAY_MS + Math.random() * 3000;
+    if (!linkActive || disposed || manuallyDisconnected || reconnectTimer) return;
+    reconnectAttempts++;
+    if (reconnectAttempts > MAX_RECONNECT_ATTEMPTS) {
+      reconnectTimer = null;
+      notify(
+        "Link: Peer unreachable after 3 attempts. Standing by (run /link-join or /link on to reconnect).",
+        "info",
+      );
+      return;
+    }
+    const delay = RECONNECT_DELAY_MS + Math.random() * 2000;
     reconnectTimer = setTimeout(() => {
       reconnectTimer = null;
-      if (role === "disconnected" && !disposed && !manuallyDisconnected)
+      if (linkActive && role === "disconnected" && !disposed && !manuallyDisconnected)
         void initialize();
     }, delay);
   }
@@ -2194,6 +2600,32 @@ export default function (pi: ExtensionAPI) {
         );
       }
     }
+
+    for (const [id, pending] of pendingRpcRequests) {
+      clearTimeout(pending.timeout);
+      pending.resolve({
+        type: "rpc_response",
+        id,
+        from: terminalName,
+        to: "",
+        ok: false,
+        error: "Link disconnected",
+      });
+    }
+    pendingRpcRequests.clear();
+
+    for (const [id, pending] of pendingFileAcks) {
+      clearTimeout(pending.timeout);
+      pending.resolve({
+        type: "file_ack",
+        transferId: id,
+        from: terminalName,
+        to: "",
+        ok: false,
+        error: "Link disconnected",
+      });
+    }
+    pendingFileAcks.clear();
 
     // Close client connection
     if (ws) {
@@ -2228,6 +2660,32 @@ export default function (pi: ExtensionAPI) {
 
     // Inbox survives disconnect; flush unless a local /compact still gates it.
     if (!flushTimer) releaseInbox();
+  }
+
+  function turnLinkOff(uiCtx?: ExtensionContext) {
+    linkActive = false;
+    manuallyDisconnected = true;
+    reconnectAttempts = 0;
+    pi.appendEntry("link-active", { active: false });
+    disconnect();
+    const ui = uiCtx?.ui || getUi();
+    if (ui) {
+      ui.setStatus("link", ui.theme.fg("dim", "link: off"));
+      ui.notify("Link turned OFF. Sockets closed, background discovery & retries halted.", "info");
+    }
+  }
+
+  async function turnLinkOn(uiCtx?: ExtensionContext) {
+    linkActive = true;
+    manuallyDisconnected = false;
+    reconnectAttempts = 0;
+    pi.appendEntry("link-active", { active: true });
+    const ui = uiCtx?.ui || getUi();
+    if (ui) {
+      ui.notify("Link turned ON. Scanning network...", "info");
+    }
+    updateStatus();
+    await scheduleStartupConnect();
   }
 
   function cleanup() {
@@ -2380,7 +2838,18 @@ export default function (pi: ExtensionAPI) {
       targetHubAddress = savedHub.hub.trim();
     }
 
-    if (flagName || shouldConnect()) scheduleStartupConnect();
+    updateSessionKey();
+
+    if (pi.getFlag("no-link") === true || process.env.OMP_LINK_OFF === "1" || process.env.PI_LINK_DISABLE === "1") {
+      linkActive = false;
+    } else {
+      const savedActive = latestCustomData("link-active") as { active?: boolean } | undefined;
+      if (savedActive?.active !== undefined) {
+        linkActive = savedActive.active;
+      }
+    }
+
+    if (linkActive && (flagName || shouldConnect())) scheduleStartupConnect();
   });
 
   pi.on("session_shutdown", async () => {
@@ -3017,13 +3486,233 @@ export default function (pi: ExtensionAPI) {
     renderResult: (result, _options, theme) => renderIconResult(result, theme),
   });
 
+  pi.registerTool({
+    name: "link_exec",
+    label: "Link Exec",
+    description:
+      "Direct Tool RPC: Execute a shell command or read a file/directory directly on another terminal across the mesh without triggering an LLM turn on the remote agent (< 30ms latency).",
+    promptSnippet: "Execute a command or read a file directly on another terminal across the link",
+    parameters: Type.Object({
+      to: Type.String({ description: "Target terminal name" }),
+      action: Type.Union(
+        [
+          Type.Literal("exec"),
+          Type.Literal("read_file"),
+          Type.Literal("list_dir"),
+        ],
+        { description: "Action: 'exec' (run shell command), 'read_file' (read file content), or 'list_dir' (list directory files)" },
+      ),
+      command: Type.Optional(
+        Type.String({ description: "Shell command to run (required if action is 'exec')" }),
+      ),
+      filePath: Type.Optional(
+        Type.String({ description: "File or directory path (required for 'read_file' or 'list_dir')" }),
+      ),
+      cwd: Type.Optional(
+        Type.String({ description: "Optional working directory relative to remote project root" }),
+      ),
+    }),
+
+    async execute(_toolCallId, params) {
+      if (!linkActive || role === "disconnected") return notConnectedResult();
+      const requestId = `rpc-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+      const target = params.to;
+
+      try {
+        const response = await new Promise<RpcResponseMsg>((resolve, reject) => {
+          const timeout = setTimeout(() => {
+            pendingRpcRequests.delete(requestId);
+            reject(new Error(`RPC request to "${target}" timed out after 30s`));
+          }, 30_000);
+          pendingRpcRequests.set(requestId, { resolve, timeout });
+
+          const routed = routeMessage({
+            type: "rpc_request",
+            id: requestId,
+            from: terminalName,
+            to: target,
+            action: params.action,
+            params: {
+              command: params.command,
+              filePath: params.filePath,
+              cwd: params.cwd,
+            },
+          });
+
+          if (!routed) {
+            clearTimeout(timeout);
+            pendingRpcRequests.delete(requestId);
+            reject(new Error(`Failed to route RPC request to "${target}"`));
+          }
+        });
+
+        if (!response.ok) {
+          return textResult(`RPC execution failed on "${target}": ${response.error || "unknown error"}`, {
+            error: response.error,
+            to: target,
+          });
+        }
+        return textResult(response.result || "[Success, no output]", { to: target });
+      } catch (err: any) {
+        return textResult(`RPC error with "${target}": ${err.message}`, { error: err.message, to: target });
+      }
+    },
+
+    renderCall(args, theme) {
+      return new Text(
+        theme.fg("toolTitle", theme.bold("link_exec ")) +
+          theme.fg("accent", String(args.to || "")) +
+          theme.fg("dim", ` (${args.action})`),
+        0,
+        0,
+      );
+    },
+
+    renderResult: (result, _options, theme) => renderIconResult(result, theme),
+  });
+
+  pi.registerTool({
+    name: "link_send_file",
+    label: "Link Send File",
+    description:
+      "Out-of-band file transfer: Send a file directly to another terminal across the mesh with SHA-256 verification and optional ephemeral HTTP download link.",
+    promptSnippet: "Transfer a file directly to another terminal across the link",
+    parameters: Type.Object({
+      to: Type.String({ description: "Target terminal name" }),
+      sourcePath: Type.String({ description: "Local path of the file to send" }),
+      destPath: Type.Optional(
+        Type.String({ description: "Destination path on remote terminal (defaults to .omp/transfers/<filename>)" }),
+      ),
+    }),
+
+    async execute(_toolCallId, params) {
+      if (!linkActive || role === "disconnected") return notConnectedResult();
+      const fullSource = path.isAbsolute(params.sourcePath)
+        ? params.sourcePath
+        : path.resolve(currentCwd, params.sourcePath);
+
+      if (!fs.existsSync(fullSource)) {
+        return textResult(`Source file not found: "${params.sourcePath}"`, { error: "file_not_found" });
+      }
+
+      try {
+        const fileBuffer = await fs.promises.readFile(fullSource);
+        const sha256 = crypto.createHash("sha256").update(fileBuffer).digest("hex");
+        const filename = path.basename(fullSource);
+        const transferId = `tf-${Date.now()}-${crypto.randomBytes(4).toString("hex")}`;
+        const startTime = Date.now();
+
+        // Register ephemeral HTTP download route if hub
+        let downloadUrl: string | undefined;
+        if (role === "hub") {
+          ephemeralTransfers.set(transferId, {
+            buffer: fileBuffer,
+            filename,
+            sha256,
+            expires: Date.now() + 600_000,
+          });
+          const net = getNetworkInfo();
+          const hostIp = networkMode === "tailscale" && net.tailscaleIp ? net.tailscaleIp : (net.lanIps[0] || "127.0.0.1");
+          downloadUrl = `http://${hostIp}:${linkPort}/transfer/${transferId}/${encodeURIComponent(filename)}`;
+        }
+
+        const CHUNK_SIZE = 64 * 1024;
+        const totalChunks = Math.ceil(fileBuffer.length / CHUNK_SIZE) || 1;
+
+        const ackPromise = new Promise<FileAckMsg>((resolve, reject) => {
+          const timeout = setTimeout(() => {
+            pendingFileAcks.delete(transferId);
+            reject(new Error(`File transfer to "${params.to}" timed out after 60s`));
+          }, 60_000);
+          pendingFileAcks.set(transferId, { resolve, timeout });
+        });
+
+        // 1. Send offer
+        const offered = routeMessage({
+          type: "file_offer",
+          transferId,
+          from: terminalName,
+          to: params.to,
+          filename,
+          destRelPath: params.destPath,
+          sizeBytes: fileBuffer.length,
+          sha256,
+          totalChunks,
+          downloadUrl,
+        });
+
+        if (!offered) {
+          pendingFileAcks.delete(transferId);
+          return textResult(`Failed to route file transfer offer to "${params.to}"`, { error: "not_routed" });
+        }
+
+        // 2. Stream chunks
+        for (let i = 0; i < totalChunks; i++) {
+          const slice = fileBuffer.subarray(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE);
+          routeMessage({
+            type: "file_chunk",
+            transferId,
+            from: terminalName,
+            to: params.to,
+            chunkIndex: i,
+            totalChunks,
+            data: slice.toString("base64"),
+          });
+        }
+
+        // 3. Wait for ack
+        const ack = await ackPromise;
+        const elapsedMs = Date.now() - startTime;
+        if (!ack.ok) {
+          return textResult(`File transfer failed: ${ack.error || "remote rejected file"}`, { error: ack.error });
+        }
+
+        const speed = (fileBuffer.length / (elapsedMs / 1000) / 1024 / 1024).toFixed(2);
+        return textResult(
+          `✓ Sent "${filename}" (${(fileBuffer.length / 1024).toFixed(1)} KB) to "${params.to}" in ${elapsedMs}ms (${speed} MB/s). Saved at: ${ack.savedPath}${downloadUrl ? `\nEphemeral download URL: ${downloadUrl}` : ""}`,
+          {
+            to: params.to,
+            filename,
+            sizeBytes: fileBuffer.length,
+            sha256,
+            savedPath: ack.savedPath,
+            elapsedMs,
+          },
+        );
+      } catch (err: any) {
+        return textResult(`File transfer error: ${err.message}`, { error: err.message, to: params.to });
+      }
+    },
+
+    renderCall(args, theme) {
+      return new Text(
+        theme.fg("toolTitle", theme.bold("link_send_file ")) +
+          theme.fg("accent", String(args.to || "")) +
+          theme.fg("dim", ` (${path.basename(String(args.sourcePath || ""))})`),
+        0,
+        0,
+      );
+    },
+
+    renderResult: (result, _options, theme) => renderIconResult(result, theme),
+  });
+
   // ── Commands ─────────────────────────────────────────────────────────────
 
   pi.registerCommand("link", {
-    description: "Show link session status, network info, and online peers",
-    handler: async (_args, _ctx) => {
+    description: "Show link session status, network info, and online peers. Usage: /link [on|off]",
+    handler: async (args, _ctx) => {
+      const trimmed = args.trim().toLowerCase();
+      if (trimmed === "off" || trimmed === "stop" || trimmed === "disable") {
+        turnLinkOff(_ctx);
+        return;
+      }
+      if (trimmed === "on" || trimmed === "start" || trimmed === "enable") {
+        await turnLinkOn(_ctx);
+        return;
+      }
       let card = renderStatusCard();
-      if (role === "disconnected" || (role === "hub" && connectedTerminals.length <= 1)) {
+      if (linkActive && (role === "disconnected" || (role === "hub" && connectedTerminals.length <= 1))) {
         const { hubs } = await discoverAllHubs(linkPort, 900, linkSecret);
         const others = hubs.filter(h => h.hubId !== hubInstanceId && !h.endpoints?.includes(`127.0.0.1:${linkPort}`));
         if (others.length > 0) {
@@ -3035,7 +3724,21 @@ export default function (pi: ExtensionAPI) {
           card += `  👉 Join with: /link-join ${others[0].sessionId || "1"}`;
         }
       }
-      _ctx.ui.notify(card, role === "disconnected" ? "warning" : "info");
+      _ctx.ui.notify(card, (!linkActive || role === "disconnected") ? "warning" : "info");
+    },
+  });
+
+  pi.registerCommand("link-off", {
+    description: "Turn link networking completely OFF (halting all sockets, discovery, and retries)",
+    handler: async (_args, _ctx) => {
+      turnLinkOff(_ctx);
+    },
+  });
+
+  pi.registerCommand("link-on", {
+    description: "Turn link networking ON (auto-discovering and connecting to active session)",
+    handler: async (_args, _ctx) => {
+      await turnLinkOn(_ctx);
     },
   });
 
