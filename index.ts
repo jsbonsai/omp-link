@@ -177,16 +177,39 @@ function piVersionSupported(version?: string): boolean {
 
 // ─── Network Helpers ─────────────────────────────────────────────────────────
 
+let cachedTailscaleBin: string | null | undefined = undefined;
+
+function resolveTailscaleBin(): string | null {
+  if (cachedTailscaleBin !== undefined) return cachedTailscaleBin;
+  const candidates = [
+    "tailscale",
+    "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
+    "/usr/local/bin/tailscale",
+    "/opt/homebrew/bin/tailscale",
+  ];
+  for (const c of candidates) {
+    try {
+      execSync(`"${c}" version`, { stdio: "ignore" });
+      cachedTailscaleBin = c;
+      return c;
+    } catch {}
+  }
+  cachedTailscaleBin = null;
+  return null;
+}
+
 interface NetworkInfo {
   hostname: string;
   tailscaleIp: string | null;
   lanIps: string[];
+  broadcastIps: string[];
 }
 
 function getNetworkInfo(): NetworkInfo {
   const hostname = os.hostname();
   let tailscaleIp: string | null = null;
   const lanIps: string[] = [];
+  const broadcastIps: string[] = [];
 
   const interfaces = os.networkInterfaces();
   for (const name of Object.keys(interfaces)) {
@@ -205,10 +228,36 @@ function getNetworkInfo(): NetworkInfo {
         (parts[0] === 192 && parts[1] === 168)
       ) {
         lanIps.push(ip);
+        if (addr.netmask) {
+          try {
+            const maskParts = addr.netmask.split(".").map(Number);
+            const bcastParts = parts.map((p, i) => (p | (~maskParts[i] & 255)));
+            broadcastIps.push(bcastParts.join("."));
+          } catch {}
+        }
       }
     }
   }
-  return { hostname, tailscaleIp, lanIps };
+
+  // Fallback Tailscale detection via CLI if not in networkInterfaces
+  if (!tailscaleIp) {
+    const bin = resolveTailscaleBin();
+    if (bin) {
+      try {
+        const out = execSync(`"${bin}" ip -4`, {
+          encoding: "utf-8",
+          timeout: 1500,
+          stdio: ["ignore", "pipe", "ignore"],
+        }).trim();
+        const firstLine = out.split("\n")[0].trim();
+        if (firstLine.startsWith("100.")) {
+          tailscaleIp = firstLine;
+        }
+      } catch {}
+    }
+  }
+
+  return { hostname, tailscaleIp, lanIps, broadcastIps };
 }
 
 function isTailscaleOrLocalIp(ip?: string): boolean {
@@ -312,22 +361,6 @@ interface DiscoveredHub {
   endpoints?: string[];
 }
 
-function resolveTailscaleBin(): string | null {
-  const candidates = [
-    "tailscale",
-    "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
-    "/usr/local/bin/tailscale",
-    "/opt/homebrew/bin/tailscale",
-  ];
-  for (const c of candidates) {
-    try {
-      execSync(`"${c}" version`, { stdio: "ignore" });
-      return c;
-    } catch {}
-  }
-  return null;
-}
-
 function getTailnetPeers(
   includeSelf = true,
 ): Array<{ host: string; dns?: string; os?: string; ip: string; isSelf?: boolean }> {
@@ -416,13 +449,16 @@ async function discoverTailnetHubs(
 
 function discoverLanHubs(
   port = DEFAULT_PORT,
-  timeoutMs = 400,
+  timeoutMs = 800,
   secret?: string,
 ): Promise<Array<{ host: string; ip: string; port: number }>> {
   return new Promise((resolve) => {
     const found = new Map<string, { host: string; ip: string; port: number }>();
     let socket: dgram.Socket | null = null;
+    let bcastInterval: ReturnType<typeof setInterval> | null = null;
+
     const timer = setTimeout(() => {
+      if (bcastInterval) clearInterval(bcastInterval);
       try { socket?.close(); } catch {}
       resolve(Array.from(found.values()));
     }, timeoutMs);
@@ -437,6 +473,7 @@ function discoverLanHubs(
         }
       });
       socket.on("error", () => {
+        if (bcastInterval) clearInterval(bcastInterval);
         clearTimeout(timer);
         try { socket?.close(); } catch {}
         resolve(Array.from(found.values()));
@@ -445,7 +482,19 @@ function discoverLanHubs(
         try {
           socket?.setBroadcast(true);
           const req = Buffer.from(secret ? `PI_LINK_DISCOVER:${secret}` : "PI_LINK_DISCOVER");
-          socket?.send(req, UDP_DISCOVERY_PORT, "255.255.255.255");
+          const net = getNetworkInfo();
+          const targets = new Set(["255.255.255.255", ...net.broadcastIps]);
+
+          const sendPackets = () => {
+            try {
+              for (const target of targets) {
+                socket?.send(req, UDP_DISCOVERY_PORT, target);
+              }
+            } catch {}
+          };
+
+          sendPackets();
+          bcastInterval = setInterval(sendPackets, 250);
         } catch {}
       });
     } catch {
@@ -457,18 +506,21 @@ function discoverLanHubs(
 
 async function discoverAllHubs(
   port = DEFAULT_PORT,
-  timeoutMs = 900,
+  timeoutMs = 1200,
   secret?: string,
-  mode: "tailscale" | "lan" = "tailscale",
+  mode: "tailscale" | "lan" | "auto" = "auto",
 ): Promise<{ hubs: DiscoveredHub[]; tailnetPeersCount: number }> {
-  let tailnetRes = { peersCount: 0, hubs: [] as DiscoveredHub[] };
-  let lanHubs: Array<{ host: string; ip: string; port: number }> = [];
+  const scanTailscale = mode !== "lan";
+  const scanLan = mode !== "tailscale";
 
-  if (mode === "tailscale") {
-    tailnetRes = await discoverTailnetHubs(port, timeoutMs);
-  } else {
-    lanHubs = await discoverLanHubs(port, Math.min(timeoutMs, 500), secret);
-  }
+  const [tailnetRes, lanHubs] = await Promise.all([
+    scanTailscale
+      ? discoverTailnetHubs(port, timeoutMs)
+      : Promise.resolve({ peersCount: 0, hubs: [] as DiscoveredHub[] }),
+    scanLan
+      ? discoverLanHubs(port, Math.min(timeoutMs, 800), secret)
+      : Promise.resolve([] as Array<{ host: string; ip: string; port: number }>),
+  ]);
 
   const hubMap = new Map<string, DiscoveredHub>();
 
@@ -495,6 +547,11 @@ async function discoverAllHubs(
       if (!existing.endpoints) existing.endpoints = [`${existing.ip}:${existing.port}`];
       if (!existing.endpoints.includes(endpoint)) {
         existing.endpoints.push(endpoint);
+      }
+      // If we found a Tailscale endpoint for this machine, prioritize it as the primary connection IP
+      if (hub.source === "tailscale" && existing.source !== "tailscale") {
+        existing.ip = hub.ip;
+        existing.source = "tailscale";
       }
       return;
     }
@@ -533,12 +590,12 @@ async function discoverAllHubs(
     }
   } catch {}
 
-  if (mode === "lan") {
+  if (lanHubs.length > 0) {
     await Promise.all(
       lanHubs.map(async (lan) => {
         try {
           const res = await fetch(`http://${lan.ip}:${lan.port}/status`, {
-            signal: AbortSignal.timeout(400),
+            signal: AbortSignal.timeout(500),
           });
           if (res.ok) {
             const payload = (await res.json()) as any;
@@ -571,13 +628,16 @@ async function discoverAllHubs(
   };
 }
 
-function discoverLanHub(timeoutMs = 400, secret?: string): Promise<{ host: string; port: number } | null> {
+function discoverLanHub(timeoutMs = 500, secret?: string): Promise<{ host: string; port: number } | null> {
   return new Promise((resolve) => {
     let resolved = false;
     let socket: dgram.Socket | null = null;
+    let bcastInterval: ReturnType<typeof setInterval> | null = null;
+
     const timer = setTimeout(() => {
       if (!resolved) {
         resolved = true;
+        if (bcastInterval) clearInterval(bcastInterval);
         try { socket?.close(); } catch {}
         resolve(null);
       }
@@ -591,6 +651,7 @@ function discoverLanHub(timeoutMs = 400, secret?: string): Promise<{ host: strin
           const port = Number(text.slice("PI_LINK_HUB:".length)) || DEFAULT_PORT;
           if (!resolved) {
             resolved = true;
+            if (bcastInterval) clearInterval(bcastInterval);
             clearTimeout(timer);
             try { socket?.close(); } catch {}
             resolve({ host: rinfo.address, port });
@@ -600,6 +661,7 @@ function discoverLanHub(timeoutMs = 400, secret?: string): Promise<{ host: strin
       socket.on("error", () => {
         if (!resolved) {
           resolved = true;
+          if (bcastInterval) clearInterval(bcastInterval);
           clearTimeout(timer);
           try { socket?.close(); } catch {}
           resolve(null);
@@ -609,7 +671,19 @@ function discoverLanHub(timeoutMs = 400, secret?: string): Promise<{ host: strin
         try {
           socket?.setBroadcast(true);
           const req = Buffer.from(secret ? `PI_LINK_DISCOVER:${secret}` : "PI_LINK_DISCOVER");
-          socket?.send(req, UDP_DISCOVERY_PORT, "255.255.255.255");
+          const net = getNetworkInfo();
+          const targets = new Set(["255.255.255.255", ...net.broadcastIps]);
+
+          const sendPackets = () => {
+            try {
+              for (const target of targets) {
+                socket?.send(req, UDP_DISCOVERY_PORT, target);
+              }
+            } catch {}
+          };
+
+          sendPackets();
+          bcastInterval = setInterval(sendPackets, 200);
         } catch {}
       });
     } catch {
@@ -622,6 +696,11 @@ function discoverLanHub(timeoutMs = 400, secret?: string): Promise<{ host: strin
 // ─── Extension ───────────────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
+  if ((globalThis as any).__omp_link_loaded) {
+    return;
+  }
+  (globalThis as any).__omp_link_loaded = true;
+
   // First statement, so an unsupported host leaves behind no flag, event, tool,
   // command, timer or socket to half-run with. Pi reports a factory that throws as an
   // extension load error naming this message, and keeps running without pi-link.
@@ -1789,14 +1868,14 @@ export default function (pi: ExtensionAPI) {
         connectedTerminals = [terminalName];
         updateStatus();
         const net = getNetworkInfo();
-        const endpoint = networkMode === "tailscale" && net.tailscaleIp
+        const endpoint = net.tailscaleIp
           ? `${net.tailscaleIp}:${linkPort}`
           : (net.lanIps.length > 0 ? `${net.lanIps[0]}:${linkPort}` : `127.0.0.1:${linkPort}`);
         notify(
-          `⚡ Session "${currentSessionId}" hosted on ${networkMode.toUpperCase()} (${endpoint}) as "${terminalName}"`,
+          `⚡ Session "${currentSessionId}" hosted (${endpoint}) as "${terminalName}" [PIN: ${sessionPin}]`,
           "info",
         );
-        if (enableLanDiscovery && networkMode === "lan" && !udpResponder) {
+        if (enableLanDiscovery && !udpResponder) {
           udpResponder = startUdpDiscoveryResponder(linkPort, linkSecret);
         }
         settle(true);
@@ -1812,10 +1891,6 @@ export default function (pi: ExtensionAPI) {
         const clientIp = req.socket.remoteAddress;
         if (isTailscaleOnly && !isTailscaleOrLocalIp(clientIp)) {
           clientWs.close(4003, "Tailscale only");
-          return;
-        }
-        if (networkMode === "tailscale" && !isTailscaleOrLocalIp(clientIp)) {
-          clientWs.close(4003, "Session configured for Tailscale only");
           return;
         }
         const reqToken = req.headers["x-link-token"];
@@ -1984,8 +2059,8 @@ export default function (pi: ExtensionAPI) {
         if (!attemptIsCurrent(attempt)) return;
         const hostOnly = targetHubAddress.split(":")[0];
         if (hostOnly !== "127.0.0.1" && hostOnly !== "localhost") {
-          // Check if session is active on current network mode via discovery
-          const { hubs } = await discoverAllHubs(linkPort, 600, linkSecret, networkMode);
+          // Check if session is active via discovery
+          const { hubs } = await discoverAllHubs(linkPort, 1200, linkSecret);
           if (hubs.length > 0 && attemptIsCurrent(attempt)) {
             const bestHub = hubs.find((h) => h.sessionId === currentSessionId) || hubs[0];
             const discoveredTarget = `${bestHub.ip}:${bestHub.port}`;
@@ -2011,16 +2086,19 @@ export default function (pi: ExtensionAPI) {
         if (await connectAsClient(attempt, `127.0.0.1:${linkPort}`)) return;
         if (!attemptIsCurrent(attempt)) return;
 
-        // Auto-discover active sessions across current network mode (Tailscale OR LAN)
-        const { hubs } = await discoverAllHubs(linkPort, 600, linkSecret, networkMode);
+        // Auto-discover active sessions across network (Tailscale + LAN)
+        const { hubs } = await discoverAllHubs(linkPort, 1200, linkSecret);
         if (hubs.length > 0 && attemptIsCurrent(attempt)) {
-          const matchingHub = hubs.find((h) => h.sessionId === currentSessionId);
-          const bestHub = matchingHub || (hubs.length === 1 ? hubs[0] : null);
+          const remoteHubs = hubs.filter((h) => h.ip !== "127.0.0.1" && h.hubId !== hubInstanceId);
+          const matchingHub = remoteHubs.find((h) => h.sessionId === currentSessionId);
+          const bestHub = matchingHub || (remoteHubs.length === 1 ? remoteHubs[0] : null);
           if (bestHub) {
             const target = `${bestHub.ip}:${bestHub.port}`;
             targetHubAddress = target;
+            currentSessionId = bestHub.sessionId || currentSessionId;
+            if (bestHub.pin) sessionPin = bestHub.pin;
             notify(
-              `Auto-discovered session "${bestHub.sessionId || bestHub.hubName}" on ${bestHub.host} (${target}). Connecting...`,
+              `Auto-discovered session "${currentSessionId}" on ${bestHub.host} (${target}). Connecting...`,
               "info",
             );
             if (await connectAsClient(attempt, target, bestHub.pin, bestHub.sessionId)) return;
@@ -2875,27 +2953,30 @@ export default function (pi: ExtensionAPI) {
           if (isIp) {
             targetHubAddress = params.target;
           } else {
-            const { hubs } = await discoverAllHubs(linkPort, 1000, linkSecret, networkMode);
-            const found = hubs.find((h) => h.sessionId === params.target || h.hubName === params.target);
+            const { hubs } = await discoverAllHubs(linkPort, 1200, linkSecret);
+            const found = hubs.find((h) => (h.sessionId === params.target || h.hubName === params.target) && h.hubId !== hubInstanceId);
             if (found) {
               targetHubAddress = `${found.ip}:${found.port}`;
               currentSessionId = found.sessionId || params.target;
+              if (found.pin) sessionPin = found.pin;
             } else {
               return textResult(
-                `Session "${params.target}" not found on ${networkMode}. Discovered: ${hubs.map((h) => h.sessionId || h.hubName).join(", ") || "none"}`,
+                `Session "${params.target}" not found. Discovered: ${hubs.filter(h => h.hubId !== hubInstanceId).map((h) => h.sessionId || h.hubName).join(", ") || "none"}`,
                 { error: "not_found" },
               );
             }
           }
         } else {
           // Auto-discover
-          const { hubs } = await discoverAllHubs(linkPort, 1000, linkSecret, networkMode);
-          if (hubs.length === 0) {
-            return textResult(`No active sessions discovered on ${networkMode}.`, { error: "no_sessions" });
+          const { hubs } = await discoverAllHubs(linkPort, 1200, linkSecret);
+          const others = hubs.filter(h => h.hubId !== hubInstanceId && !h.endpoints?.includes(`127.0.0.1:${linkPort}`));
+          if (others.length === 0) {
+            return textResult(`No other active sessions discovered on network.`, { error: "no_sessions" });
           }
-          const best = hubs.find((h) => h.sessionId === currentSessionId) || hubs[0];
+          const best = others.find((h) => h.sessionId === currentSessionId) || others[0];
           targetHubAddress = `${best.ip}:${best.port}`;
           if (best.sessionId) currentSessionId = best.sessionId;
+          if (best.pin) sessionPin = best.pin;
         }
 
         disconnect();
@@ -2903,7 +2984,8 @@ export default function (pi: ExtensionAPI) {
         manuallyDisconnected = false;
         pi.appendEntry("link-active", { active: true });
         pi.appendEntry("link-session", { sessionId: currentSessionId });
-        saveLinkConfig({ sessionId: currentSessionId, hub: targetHubAddress });
+        if (sessionPin) pi.appendEntry("link-pin", { pin: sessionPin });
+        saveLinkConfig({ sessionId: currentSessionId, hub: targetHubAddress, pin: sessionPin });
         await initialize();
         return textResult(`Joined session "${currentSessionId}".`, {
           sessionId: currentSessionId,
@@ -2931,7 +3013,20 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("link", {
     description: "Show link session status, network info, and online peers",
     handler: async (_args, _ctx) => {
-      _ctx.ui.notify(renderStatusCard(), role === "disconnected" ? "warning" : "info");
+      let card = renderStatusCard();
+      if (role === "disconnected" || (role === "hub" && connectedTerminals.length <= 1)) {
+        const { hubs } = await discoverAllHubs(linkPort, 900, linkSecret);
+        const others = hubs.filter(h => h.hubId !== hubInstanceId && !h.endpoints?.includes(`127.0.0.1:${linkPort}`));
+        if (others.length > 0) {
+          card += `\n\n  📡 Discovered active session(s) on network:\n`;
+          others.forEach((h, idx) => {
+            const peerCount = h.terminals ? h.terminals.length : 1;
+            card += `    ${idx + 1}. "${h.sessionId || h.hubName}" on ${h.host} (${h.ip}:${h.port}) · ${peerCount} peer(s) [PIN: ${h.pin || "none"}]\n`;
+          });
+          card += `  👉 Join with: /link-join ${others[0].sessionId || "1"}`;
+        }
+      }
+      _ctx.ui.notify(card, role === "disconnected" ? "warning" : "info");
     },
   });
 
@@ -2979,7 +3074,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerCommand("link-join", {
-    description: "Join an active link session. Usage: /link-join [session-id | ip[:port]] [pin]",
+    description: "Join an active link session. Usage: /link-join [session-id | ip[:port] | number] [pin]",
     handler: async (args, _ctx) => {
       const parts = args.trim().split(/\s+/).filter(Boolean);
       const targetArg = parts[0];
@@ -2991,32 +3086,39 @@ export default function (pi: ExtensionAPI) {
         saveLinkConfig({ pin: sessionPin });
       }
 
+      let chosenHub: DiscoveredHub | null = null;
+      let directTarget: string | null = null;
+
       if (!targetArg) {
-        _ctx.ui.notify(`Scanning ${networkMode.toUpperCase()} for active sessions...`, "info");
-        const { hubs } = await discoverAllHubs(linkPort, 1000, linkSecret, networkMode);
-        if (hubs.length === 0) {
+        _ctx.ui.notify(`Scanning network (Tailscale + LAN) for active sessions...`, "info");
+        const { hubs } = await discoverAllHubs(linkPort, 1200, linkSecret);
+        const candidates = hubs.filter(h => h.hubId !== hubInstanceId && !h.endpoints?.includes(`127.0.0.1:${linkPort}`));
+        if (candidates.length === 0) {
           _ctx.ui.notify(
-            `No active sessions found on ${networkMode.toUpperCase()}.\nStart one with: /link-start ${currentSessionId}`,
+            `No other active sessions found on network.\nStart one with: /link-start ${currentSessionId}`,
             "warning",
           );
           return;
         }
-        if (hubs.length === 1) {
-          const h = hubs[0];
-          _ctx.ui.notify(
-            `Found session "${h.sessionId || h.hubName}" on ${h.host} (${h.ip}:${h.port}). Joining...`,
-            "info",
-          );
-          targetHubAddress = `${h.ip}:${h.port}`;
-          if (h.sessionId) currentSessionId = h.sessionId;
-          if (h.pin) sessionPin = h.pin;
+        if (candidates.length === 1) {
+          chosenHub = candidates[0];
         } else {
-          let msg = `Found ${hubs.length} active sessions on ${networkMode.toUpperCase()}:\n`;
-          hubs.forEach((h, idx) => {
+          let msg = `Found ${candidates.length} active sessions on network:\n`;
+          candidates.forEach((h, idx) => {
             msg += `  ${idx + 1}. "${h.sessionId || h.hubName}" on ${h.host} (${h.ip}:${h.port})\n`;
           });
-          msg += `\nSpecify session to join: /link-join <id or ip>`;
+          msg += `\nSpecify session to join: /link-join <1-${candidates.length} or session-id>`;
           _ctx.ui.notify(msg.trim(), "info");
+          return;
+        }
+      } else if (/^\d+$/.test(targetArg) && Number(targetArg) >= 1 && Number(targetArg) <= 20) {
+        const idx = Number(targetArg) - 1;
+        const { hubs } = await discoverAllHubs(linkPort, 1200, linkSecret);
+        const candidates = hubs.filter(h => h.hubId !== hubInstanceId && !h.endpoints?.includes(`127.0.0.1:${linkPort}`));
+        if (candidates[idx]) {
+          chosenHub = candidates[idx];
+        } else {
+          _ctx.ui.notify(`Index ${targetArg} not found among active sessions.`, "warning");
           return;
         }
       } else {
@@ -3025,27 +3127,21 @@ export default function (pi: ExtensionAPI) {
           /^\d+\.\d+\.\d+\.\d+$/.test(targetArg) ||
           targetArg.startsWith("100.");
         if (isIp) {
-          targetHubAddress = targetArg;
+          directTarget = targetArg;
         } else {
           _ctx.ui.notify(
-            `Searching for session "${targetArg}" on ${networkMode.toUpperCase()}...`,
+            `Searching for session "${targetArg}" on network...`,
             "info",
           );
-          const { hubs } = await discoverAllHubs(linkPort, 1000, linkSecret, networkMode);
+          const { hubs } = await discoverAllHubs(linkPort, 1200, linkSecret);
           const found = hubs.find(
-            (h) => h.sessionId === targetArg || h.hubName === targetArg,
+            (h) => (h.sessionId === targetArg || h.hubName === targetArg) && h.hubId !== hubInstanceId,
           );
           if (found) {
-            _ctx.ui.notify(
-              `Found session "${targetArg}" on ${found.host} (${found.ip}:${found.port}). Joining...`,
-              "info",
-            );
-            targetHubAddress = `${found.ip}:${found.port}`;
-            currentSessionId = found.sessionId || targetArg;
-            if (found.pin) sessionPin = found.pin;
+            chosenHub = found;
           } else {
             _ctx.ui.notify(
-              `Session "${targetArg}" not found on ${networkMode.toUpperCase()}. Discovered: ${hubs.map((h) => h.sessionId || h.hubName).join(", ") || "none"}`,
+              `Session "${targetArg}" not found. Active sessions: ${hubs.filter(h => h.hubId !== hubInstanceId).map((h) => h.sessionId || h.hubName).join(", ") || "none"}`,
               "warning",
             );
             return;
@@ -3053,12 +3149,26 @@ export default function (pi: ExtensionAPI) {
         }
       }
 
+      if (chosenHub) {
+        targetHubAddress = `${chosenHub.ip}:${chosenHub.port}`;
+        if (chosenHub.sessionId) currentSessionId = chosenHub.sessionId;
+        if (chosenHub.pin) sessionPin = chosenHub.pin;
+        _ctx.ui.notify(
+          `Joining session "${currentSessionId}" on ${chosenHub.host} (${targetHubAddress})...`,
+          "info",
+        );
+      } else if (directTarget) {
+        targetHubAddress = directTarget;
+        _ctx.ui.notify(`Connecting to hub at ${targetHubAddress}...`, "info");
+      }
+
       disconnect();
       explicitHubMode = false;
       manuallyDisconnected = false;
       pi.appendEntry("link-active", { active: true });
       pi.appendEntry("link-session", { sessionId: currentSessionId });
-      saveLinkConfig({ sessionId: currentSessionId, hub: targetHubAddress });
+      if (sessionPin) pi.appendEntry("link-pin", { pin: sessionPin });
+      saveLinkConfig({ sessionId: currentSessionId, hub: targetHubAddress, pin: sessionPin });
       await initialize();
     },
   });
@@ -3267,24 +3377,26 @@ export default function (pi: ExtensionAPI) {
   });
 
   const handleDiscoverCommand = async (_args: string, _ctx: ExtensionContext) => {
-    _ctx.ui.notify(`Scanning ${networkMode.toUpperCase()} for active sessions...`, "info");
-    const { hubs, tailnetPeersCount } = await discoverAllHubs(linkPort, 1200, linkSecret, networkMode);
-    if (hubs.length === 0) {
+    _ctx.ui.notify("Scanning network (Tailscale + LAN) for active sessions...", "info");
+    const { hubs, tailnetPeersCount } = await discoverAllHubs(linkPort, 1200, linkSecret);
+    const others = hubs.filter(h => h.hubId !== hubInstanceId);
+    if (others.length === 0) {
       _ctx.ui.notify(
-        networkMode === "tailscale" && tailnetPeersCount > 0
-          ? `No active sessions found (${tailnetPeersCount} Tailnet peers scanned).`
-          : `No active sessions found on ${networkMode.toUpperCase()}.`,
+        tailnetPeersCount > 0
+          ? `No other active sessions found (${tailnetPeersCount} Tailnet peers & LAN scanned).`
+          : "No other active sessions found on network.",
         "info",
       );
       return;
     }
 
-    let summary = `⚡ Found ${hubs.length} active session(s) on ${networkMode.toUpperCase()}:\n`;
-    for (const h of hubs) {
+    let summary = `⚡ Found ${others.length} active session(s) on network:\n`;
+    for (let i = 0; i < others.length; i++) {
+      const h = others[i];
       const terms = (h.terminals || [])
         .map((t) => `${t.name}${t.project ? ` (${t.project})` : ""}`)
         .join(", ");
-      summary += `\n• "${h.sessionId || h.hubName}" on ${h.host} (${h.ip}:${h.port}) [PIN: ${h.pin || "none"}]\n  ${h.terminals?.length || 1} online: ${terms}\n  Join: /link-join ${h.sessionId || `${h.ip}:${h.port}`}`;
+      summary += `\n${i + 1}. "${h.sessionId || h.hubName}" on ${h.host} (${h.ip}:${h.port}) [PIN: ${h.pin || "none"}]\n   Peers: ${terms || "1"}\n   Join: /link-join ${i + 1} (or /link-join ${h.sessionId || `${h.ip}:${h.port}`})`;
     }
     _ctx.ui.notify(summary.trim(), "info");
   };

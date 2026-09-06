@@ -18,9 +18,35 @@ if command -v lsof >/dev/null 2>&1; then
   fi
 fi
 
-# Remove legacy extension symlinks (pi-link) to prevent duplicate loading
+# Remove legacy extension symlinks (pi-link) and plugin registrations to prevent duplicate loading
 rm -rf "$HOME/.omp/agent/extensions/pi-link" 2>/dev/null || true
+rm -rf "$HOME/.omp/extensions/pi-link" 2>/dev/null || true
 rm -rf "$HOME/.pi/agent/extensions/pi-link" 2>/dev/null || true
+rm -rf "$HOME/.pi/extensions/pi-link" 2>/dev/null || true
+rm -rf "$HOME/.omp/plugins/node_modules/pi-link" 2>/dev/null || true
+rm -rf "$HOME/.pi/plugins/node_modules/pi-link" 2>/dev/null || true
+
+# Clean legacy pi-link from omp-plugins.lock.json
+node -e '
+const fs = require("fs");
+const path = require("path");
+const os = require("os");
+for (const lockPath of [
+  path.join(os.homedir(), ".omp", "plugins", "omp-plugins.lock.json"),
+  path.join(os.homedir(), ".pi", "plugins", "omp-plugins.lock.json"),
+]) {
+  if (fs.existsSync(lockPath)) {
+    try {
+      const lock = JSON.parse(fs.readFileSync(lockPath, "utf8"));
+      if (lock.plugins && lock.plugins["pi-link"]) {
+        delete lock.plugins["pi-link"];
+        fs.writeFileSync(lockPath, JSON.stringify(lock, null, 2) + "\n");
+        console.log(`  ✓ Removed legacy pi-link plugin registration from ${lockPath}`);
+      }
+    } catch {}
+  }
+}
+' 2>/dev/null || true
 
 # Reset stale hub addresses from ~/.omp/link.json and ~/.pi/link.json
 node -e '
