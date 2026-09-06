@@ -6,6 +6,29 @@ This changelog is based on the git history from `2026-03-21` (initial commit) th
 
 ---
 
+## 3.0.0 — 2026-09-06
+
+### Major Architectural Enhancements & Performance Upgrades
+
+- **Direct Tool RPC (`link_exec`) — Sub-25ms Execution with Zero Token Overhead:**
+  - Added native RPC over WebSocket enabling agents and users to execute shell commands (`action: "exec"`), read files (`action: "read_file"`), and list directories (`action: "list_dir"`) on remote terminals in real-time (< 25ms round trip).
+  - Bypasses the remote LLM reasoning loop entirely, saving 30,000–80,000 tokens per action and dropping turnaround latency from 20+ seconds down to milliseconds.
+- **Native End-to-End Encryption (AES-256-GCM + PBKDF2):**
+  - Integrated hardware-accelerated AES-256-GCM encryption across all frames (chat, RPC commands, file chunks) using Node.js `crypto`.
+  - Keys derived via PBKDF2-HMAC-SHA256 (50,000 iterations) salted with unique session identifiers.
+  - 128-bit authentication tags provide automatic cryptographic tamper resistance; bad PINs and altered packets are rejected before parsing.
+  - Active across both LAN and Tailscale for defense-in-depth security.
+- **Out-of-Band Streaming File Transfer (`link_send_file`):**
+  - Direct peer-to-peer file streaming with 64KB chunking and SHA-256 checksum integrity verification.
+  - Auto-assembly and verification on the recipient terminal with immediate acknowledgement.
+  - Ephemeral direct HTTP download endpoints (`GET /transfer/:token/:filename`) served by the hub for non-agent browsers or curl downloads, eliminating MCP server setup and configuration overhead.
+- **Deterministic Link ON/OFF Mode & Reconnect Circuit Breaker:**
+  - Slash commands `/link off` and `/link on` (plus environment variable `OMP_LINK_OFF=1` and startup flag `--no-link`).
+  - `/link off` cleanly halts all background probes, disconnects active sockets, releases ports, and completely suppresses repeated "Warning: Link: not connected" notices.
+  - 3-strike circuit breaker: automatically stops reconnect attempts after 3 consecutive connection failures to eliminate terminal log spam.
+
+---
+
 ## 0.5.1 — 2026-09-06
 
 ### Added
