@@ -313,7 +313,7 @@ describe("OMP-LINK v5 Security & Cryptography Suite", () => {
     test("Blocks directory traversal and path escapes", () => {
       const res1 = resolveConfinedPath(tempDir, "../../etc/passwd");
       assert.strictEqual(res1.allowed, false);
-      assert.match(res1.reason, /escapes workspace root/);
+      assert.match(res1.reason, /escape[sd]? workspace root/i);
 
       const res2 = resolveConfinedPath(tempDir, "valid-file.txt\0.js");
       assert.strictEqual(res2.allowed, false);

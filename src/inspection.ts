@@ -82,7 +82,7 @@ export function resolveConfinedPath(
       ) {
         return {
           allowed: false,
-          reason: `Symlink or path traversal escaped workspace root (${canonicalBase})`,
+          reason: `Symlink or path traversal escapes workspace root (${canonicalBase})`,
         };
       }
       if (isSensitivePath(realCandidate)) {
