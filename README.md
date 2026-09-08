@@ -45,6 +45,29 @@ I have refactored auth.ts and run the test suite. All 14 tests pass.
 
 ---
 
+## Why omp-link? (Zero-Infrastructure Decentralized Mesh)
+
+Most multi-agent or remote terminal tools require setting up a centralized relay server, deploying Docker containers, managing external brokers (like MQTT), or paying for cloud hosting.
+
+`omp-link` takes an entirely different approach: **zero infrastructure, zero central servers, and zero manual network configuration.**
+
+| Feature | Centralized Relays (e.g. cloud relays, brokers) | `omp-link` |
+|---|---|---|
+| **Infrastructure** | Requires dedicated server, VPS, or cloud relay | **Zero**. Runs 100% inside your local OMP terminal |
+| **Server Management** | Must maintain, monitor, and pay for background daemons | **None**. No daemon processes, no Docker, no external services |
+| **Connection Topology** | Hub-and-spoke routed through a third-party server | **Direct Peer-to-Peer** across Tailscale & local LAN |
+| **Failure Handling** | If the central relay server dies, all terminals disconnect | **P2P Host Migration** (like a multiplayer game lobby) |
+| **Security Architecture** | Central server can inspect or log unencrypted traffic | **Mutual TLS 1.3** with client & server certificate pinning |
+| **Network Reachability** | Manual port-forwarding, static IPs, or relay join tokens | **Autonomous auto-discovery** across Tailnet & LAN |
+
+### The "Game Lobby" Host Migration Model
+Instead of hardcoding fixed client and server roles, every `omp-link` terminal is a symmetric, autonomous peer:
+1. **Auto-Election on Startup**: When you launch OMP, it checks if an active session exists for your project on your Tailnet or local subnet. If yes, it joins immediately. If not, it anchors the session as the host.
+2. **Seamless Host Migration**: If the hosting laptop closes its lid or disconnects, the remaining terminals detect the drop, elect a new host from the swarm, and reconnect automatically without human intervention.
+3. **Link in a Single Command**: You don't manage IP tables, DNS names, or firewall tunnels. Start your terminals and type `/link join` (or let startup auto-discovery handle it) to connect your machines into a unified swarm.
+
+---
+
 ## Consolidated Slash Command Interface
 
 All coordination happens directly inside OMP through the unified `/link` command:
