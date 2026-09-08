@@ -103,6 +103,20 @@ export type NodeRole = "hub" | "client" | "disconnected";
 export class LinkNode {
   public identity: DeviceIdentity;
   public role: NodeRole = "disconnected";
+
+  public get isAuthenticated(): boolean {
+    if (this.role === "hub") return true;
+    return this.clientContext?.phase === "authenticated";
+  }
+
+  public async waitForAuthenticated(timeoutMs = 10_000): Promise<boolean> {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      if (this.isAuthenticated) return true;
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    return this.isAuthenticated;
+  }
   public currentSessionId: string;
   public terminalName: string;
   public port: number;
