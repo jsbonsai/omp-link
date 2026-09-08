@@ -17,11 +17,12 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { execSync, exec, execFile } from "node:child_process";
+import { execSync, exec, execFile, execFileSync } from "node:child_process";
 import * as crypto from "node:crypto";
 import * as dgram from "node:dgram";
 import * as fs from "node:fs";
-import { createServer, type Server as HttpServer, type IncomingMessage } from "node:http";
+import { createServer as createHttpServer, type Server as HttpServer, type IncomingMessage } from "node:http";
+import { createServer as createHttpsServer, type Server as HttpsServer } from "node:https";
 import * as os from "node:os";
 import * as path from "node:path";
 
@@ -49,6 +50,38 @@ const BATCH_MAX_CHARS = 16_000;
 
 // ─── Protocol ────────────────────────────────────────────────────────────────
 
+interface DevicePermissions {
+  message: boolean;
+  inspect: boolean;
+  fileInbox: boolean;
+  exec: boolean;
+}
+
+interface HandshakeChallengeMsg {
+  type: "handshake_challenge";
+  v: 4;
+  hubId: string;
+  hubFingerprint: string;
+  nonce: string;
+  ts: number;
+  hubEphemeralPub: string;
+}
+
+interface HandshakeResponseMsg {
+  type: "handshake_response";
+  v: 4;
+  deviceId: string;
+  name: string;
+  publicKey: string;
+  fingerprint: string;
+  signature: string;
+  clientEphemeralPub: string;
+  host: string;
+  cwd?: string;
+  context?: ContextSnapshot;
+  project?: string;
+}
+
 interface RegisterMsg {
   type: "register";
   name: string;
@@ -61,7 +94,8 @@ interface RegisterMsg {
   project?: string;
   token?: string;
   deviceId?: string;
-  deviceToken?: string;
+  publicKey?: string;
+  fingerprint?: string;
 }
 interface WelcomeMsg {
   type: "welcome";
@@ -75,12 +109,14 @@ interface WelcomeMsg {
   contexts?: Record<string, ContextSnapshot>;
   hosts?: Record<string, string>;
   projects?: Record<string, string>;
-  deviceToken?: string;
+  permissions?: DevicePermissions;
+  hubFingerprint?: string;
 }
 interface PairingPendingMsg {
   type: "pairing_pending";
   requestId: number;
   hubHost: string;
+  fingerprint: string;
   message: string;
 }
 interface PairingDeniedMsg {
@@ -205,6 +241,11 @@ interface FileAckMsg {
 
 interface EncryptedMsg {
   type: "encrypted";
+  v: 4;
+  mid: string;
+  seq: number;
+  from: string;
+  ts: number;
   iv: string;
   tag: string;
   data: string;
@@ -219,6 +260,8 @@ type LinkStatus =
 type ContextSnapshot = { tokens: number | null; contextWindow: number };
 
 type LinkMessage =
+  | HandshakeChallengeMsg
+  | HandshakeResponseMsg
   | RegisterMsg
   | WelcomeMsg
   | TerminalJoinedMsg
@@ -391,45 +434,125 @@ interface DeviceIdentity {
   deviceId: string;
   name: string;
   host: string;
+  publicKey: string; // SPKI format (base64)
+  privateKey: string; // PKCS8 format (base64)
+  fingerprint: string; // SHA-256 in hex pairs: "7B:19:52:AF:..."
 }
 
 interface PairedDevice {
   deviceId: string;
-  token: string;
   name: string;
   host: string;
+  publicKey: string;
+  fingerprint: string;
   approvedAt: number;
-  allowExecution?: boolean;
+  lastSeen: number;
+  lastAddress?: string;
+  permissions: DevicePermissions;
 }
 
 function getOmpDir(): string {
   const dir = path.join(os.homedir(), ".omp");
   if (!fs.existsSync(dir)) {
     try {
-      fs.mkdirSync(dir, { recursive: true });
+      fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
     } catch {}
   }
   return dir;
 }
 
+function atomicWriteSecureFile(filePath: string, content: string): void {
+  const dir = path.dirname(filePath);
+  if (!fs.existsSync(dir)) {
+    try {
+      fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    } catch {}
+  }
+  const tmpPath = `${filePath}.tmp.${crypto.randomBytes(6).toString("hex")}`;
+  const fd = fs.openSync(tmpPath, "w", 0o600);
+  fs.writeFileSync(fd, content, "utf-8");
+  try {
+    fs.fsyncSync(fd);
+  } catch {}
+  fs.closeSync(fd);
+  fs.renameSync(tmpPath, filePath);
+  try {
+    fs.chmodSync(filePath, 0o600);
+  } catch {}
+}
+
 function getOrCreateDeviceIdentity(): DeviceIdentity {
   const ompDir = getOmpDir();
-  const idFile = path.join(ompDir, "link-device.json");
+  const idFile = path.join(ompDir, "identity.json");
   if (fs.existsSync(idFile)) {
     try {
       const data = JSON.parse(fs.readFileSync(idFile, "utf-8"));
-      if (data && data.deviceId) return data;
+      if (data && data.deviceId && data.publicKey && data.privateKey && data.fingerprint) {
+        return data;
+      }
     } catch {}
   }
+  const { publicKey, privateKey } = crypto.generateKeyPairSync("ed25519");
+  const pubDer = publicKey.export({ type: "spki", format: "der" });
+  const privDer = privateKey.export({ type: "pkcs8", format: "der" });
+  const fingerprint = crypto
+    .createHash("sha256")
+    .update(pubDer)
+    .digest("hex")
+    .slice(0, 32)
+    .match(/.{1,2}/g)!
+    .join(":")
+    .toUpperCase();
+
   const identity: DeviceIdentity = {
     deviceId: `dev-${crypto.randomBytes(8).toString("hex")}`,
     name: os.hostname(),
     host: os.hostname(),
+    publicKey: pubDer.toString("base64"),
+    privateKey: privDer.toString("base64"),
+    fingerprint,
   };
-  try {
-    fs.writeFileSync(idFile, JSON.stringify(identity, null, 2), "utf-8");
-  } catch {}
+  atomicWriteSecureFile(idFile, JSON.stringify(identity, null, 2));
   return identity;
+}
+
+function getOrCreateTlsCert(): { cert: Buffer; key: Buffer; fingerprint: string } | null {
+  const tlsDir = path.join(getOmpDir(), "tls");
+  const certPath = path.join(tlsDir, "cert.pem");
+  const keyPath = path.join(tlsDir, "key.pem");
+
+  if (fs.existsSync(certPath) && fs.existsSync(keyPath)) {
+    try {
+      const cert = fs.readFileSync(certPath);
+      const key = fs.readFileSync(keyPath);
+      const certObj = new crypto.X509Certificate(cert);
+      return { cert, key, fingerprint: certObj.fingerprint256 };
+    } catch {}
+  }
+
+  try {
+    if (!fs.existsSync(tlsDir)) fs.mkdirSync(tlsDir, { recursive: true, mode: 0o700 });
+    execFileSync("openssl", [
+      "req", "-x509",
+      "-newkey", "ec",
+      "-pkeyopt", "ec_paramgen_curve:prime256v1",
+      "-nodes",
+      "-keyout", keyPath,
+      "-out", certPath,
+      "-days", "3650",
+      "-subj", "/CN=omp-link",
+    ], { stdio: "ignore" });
+    try {
+      fs.chmodSync(certPath, 0o600);
+      fs.chmodSync(keyPath, 0o600);
+    } catch {}
+    const cert = fs.readFileSync(certPath);
+    const key = fs.readFileSync(keyPath);
+    const certObj = new crypto.X509Certificate(cert);
+    return { cert, key, fingerprint: certObj.fingerprint256 };
+  } catch {
+    return null;
+  }
 }
 
 function loadPairedDevices(): Map<string, PairedDevice> {
@@ -462,52 +585,35 @@ function savePairedDevice(device: PairedDevice): void {
   const file = path.join(ompDir, "paired-devices.json");
   const obj: Record<string, PairedDevice> = {};
   for (const [k, v] of map) obj[k] = v;
-  try {
-    fs.writeFileSync(file, JSON.stringify(obj, null, 2), "utf-8");
-  } catch {}
+  atomicWriteSecureFile(file, JSON.stringify(obj, null, 2));
 }
 
-function removePairedDevice(deviceId: string): boolean {
+function removePairedDevice(deviceIdOrFingerprint: string): boolean {
   const map = loadPairedDevices();
-  const deleted = map.delete(deviceId);
-  if (deleted) {
+  let deletedKey: string | null = null;
+  for (const [k, v] of map) {
+    if (k === deviceIdOrFingerprint || v.deviceId === deviceIdOrFingerprint || v.fingerprint === deviceIdOrFingerprint || v.name === deviceIdOrFingerprint) {
+      deletedKey = k;
+      break;
+    }
+  }
+  if (deletedKey) {
+    map.delete(deletedKey);
     const ompDir = getOmpDir();
     const file = path.join(ompDir, "paired-devices.json");
     const obj: Record<string, PairedDevice> = {};
     for (const [k, v] of map) obj[k] = v;
-    try {
-      fs.writeFileSync(file, JSON.stringify(obj, null, 2), "utf-8");
-    } catch {}
+    atomicWriteSecureFile(file, JSON.stringify(obj, null, 2));
+    return true;
   }
-  return deleted;
+  return false;
 }
 
-function loadClientTokens(): Map<string, string> {
-  const ompDir = getOmpDir();
-  const file = path.join(ompDir, "client-tokens.json");
-  const map = new Map<string, string>();
-  if (fs.existsSync(file)) {
-    try {
-      const data = JSON.parse(fs.readFileSync(file, "utf-8"));
-      if (data && typeof data === "object") {
-        for (const [k, v] of Object.entries(data)) {
-          if (typeof v === "string") map.set(k, v);
-        }
-      }
-    } catch {}
-  }
-  return map;
-}
-
-function saveClientToken(hubKey: string, token: string): void {
-  const map = loadClientTokens();
-  map.set(hubKey, token);
-  const ompDir = getOmpDir();
-  const file = path.join(ompDir, "client-tokens.json");
-  const obj: Record<string, string> = {};
-  for (const [k, v] of map) obj[k] = v;
+function appendAuditLog(record: { type: string; timestamp: number; [key: string]: any }): void {
   try {
-    fs.writeFileSync(file, JSON.stringify(obj, null, 2), "utf-8");
+    const ompDir = getOmpDir();
+    const auditFile = path.join(ompDir, "audit.log");
+    fs.appendFileSync(auditFile, JSON.stringify(record) + "\n", { mode: 0o600 });
   } catch {}
 }
 
@@ -1102,14 +1208,12 @@ export default function (pi: ExtensionAPI) {
   let reconnectAttempts = 0;
   const MAX_RECONNECT_ATTEMPTS = 3;
 
-  // ── E2EE State ──
+  // ── Cryptographic Identity & Transport State ──
+  const myIdentity = getOrCreateDeviceIdentity();
   let sessionKey: Buffer | null = null;
-  function updateSessionKey() {
-    const pin = sessionPin || "0000";
-    const sid = currentSessionId || "team-swarm";
-    sessionKey = crypto.pbkdf2Sync(pin, `omp-link-salt-${sid}`, 50_000, 32, "sha256");
-  }
-  updateSessionKey();
+  let localSeqCounter = 0;
+  const seenMessageIds = new Map<string, number>();
+  const peerLastSeq = new Map<string, number>();
 
   // ── Direct Tool RPC State ──
   const pendingRpcRequests = new Map<
@@ -1122,40 +1226,75 @@ export default function (pi: ExtensionAPI) {
     buffer: Buffer;
     filename: string;
     sha256: string;
+    authToken?: string;
     expires: number;
   }
   const ephemeralTransfers = new Map<string, EphemeralTransfer>();
 
-  interface IncomingTransfer {
-    offer: FileOfferMsg;
-    chunks: Map<number, Buffer>;
-    startedAt: number;
+  // ── Remote Execution Grants (Territorial Sovereignty) ──
+  // Execution is blocked by default. Elevation is temporary, peer-specific, and audit-logged.
+  interface ExecGrant {
+    peer: string;
+    grantedAt: number;
+    expiresAt: number;
+    timer: NodeJS.Timeout;
   }
-  const incomingTransfers = new Map<string, IncomingTransfer>();
-  const pendingFileAcks = new Map<
-    string,
-    { resolve: (ack: FileAckMsg) => void; timeout: NodeJS.Timeout }
-  >();
+  const activeExecGrants = new Map<string, ExecGrant>();
 
-  let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-  let startupConnectTimer: ReturnType<typeof setTimeout> | null = null;
+  function grantExecElevation(peer: string, minutes: number = 10) {
+    const durationMs = Math.min(Math.max(minutes, 1), 60) * 60_000;
+    const existing = activeExecGrants.get(peer);
+    if (existing) clearTimeout(existing.timer);
 
-  // ── Remote Execution State (Territorial Sovereignty) ──
-  // Arbitrary command execution is blocked by default as a hard deterministic rule.
-  let remoteExecAllowed =
-    process.env.OMP_LINK_EXEC_MODE === "allow" ||
-    config.execMode === "allow" ||
-    false;
-  let remoteExecAuthToken = process.env.OMP_LINK_EXEC_TOKEN || undefined;
+    const timer = setTimeout(() => {
+      activeExecGrants.delete(peer);
+      notify(`⏱️ Remote execution grant for "${peer}" has expired.`, "info");
+    }, durationMs);
+
+    activeExecGrants.set(peer, {
+      peer,
+      grantedAt: Date.now(),
+      expiresAt: Date.now() + durationMs,
+      timer,
+    });
+    appendAuditLog({
+      type: "grant",
+      timestamp: Date.now(),
+      peer,
+      durationMinutes: minutes,
+      action: "granted",
+    });
+  }
+
+  function revokeExecElevation(peer: string): boolean {
+    const existing = activeExecGrants.get(peer);
+    if (existing) {
+      clearTimeout(existing.timer);
+      activeExecGrants.delete(peer);
+      appendAuditLog({
+        type: "grant",
+        timestamp: Date.now(),
+        peer,
+        action: "revoked",
+      });
+      return true;
+    }
+    return false;
+  }
 
   // ── Device Pairing & Request Mode State ──
   interface PendingJoinRequest {
     id: number;
     ws: WebSocket;
-    msg: RegisterMsg;
+    deviceId: string;
+    name: string;
+    host: string;
+    fingerprint: string;
+    publicKey: string;
+    sessionKey: Buffer;
     clientIp: string;
     timestamp: number;
-    complete: (issuedToken?: string) => void;
+    complete: () => void;
   }
   const pendingJoinRequests = new Map<number, PendingJoinRequest>();
   let nextPairingRequestId = 1;
@@ -1165,18 +1304,25 @@ export default function (pi: ExtensionAPI) {
     if (!req) return false;
     pendingJoinRequests.delete(reqId);
 
-    const token = "tok-" + crypto.randomBytes(16).toString("hex");
-    const deviceId = req.msg.deviceId || `dev-${crypto.randomBytes(8).toString("hex")}`;
     savePairedDevice({
-      deviceId,
-      token,
-      name: req.msg.name,
-      host: req.msg.host || req.clientIp,
+      deviceId: req.deviceId,
+      name: req.name,
+      host: req.host,
+      publicKey: req.publicKey,
+      fingerprint: req.fingerprint,
       approvedAt: Date.now(),
+      lastSeen: Date.now(),
+      lastAddress: req.clientIp,
+      permissions: {
+        message: true,
+        inspect: true,
+        fileInbox: true,
+        exec: false,
+      },
     });
 
-    req.complete(token);
-    notify(`✅ Approved device "${req.msg.name}" (#${reqId}). Permanent device token issued.`, "info");
+    req.complete();
+    notify(`✅ Approved device "${req.name}" (${req.fingerprint}). Cryptographic identity paired.`, "info");
     return true;
   }
 
@@ -1187,7 +1333,7 @@ export default function (pi: ExtensionAPI) {
 
     try {
       req.ws.send(
-        serializeForWire({
+        JSON.stringify({
           type: "pairing_denied",
           message: "Join request was rejected by host.",
         } satisfies PairingDeniedMsg),
@@ -1195,7 +1341,7 @@ export default function (pi: ExtensionAPI) {
       req.ws.close(4003, "Join request rejected");
     } catch {}
 
-    notify(`❌ Denied device request #${reqId} ("${req.msg.name}").`, "info");
+    notify(`❌ Denied device request #${reqId} ("${req.name}").`, "info");
     return true;
   }
 
@@ -1812,6 +1958,10 @@ export default function (pi: ExtensionAPI) {
       ? `  Requests   : 🔔 ${pendingJoinRequests.size} PENDING (/link-requests to view, /link-accept to approve)\n`
       : "";
 
+    const grantsLine = activeExecGrants.size > 0
+      ? `  Elevated   : ⚠️ ${Array.from(activeExecGrants.values()).map(g => `${g.peer} (${Math.ceil((g.expiresAt - Date.now()) / 60_000)}m left)`).join(", ")}\n`
+      : `  Territorial: Sovereign (Exec blocked by default)\n`;
+
     return [
       `⚡ OMP LINK: ACTIVE`,
       divider,
@@ -1819,71 +1969,117 @@ export default function (pi: ExtensionAPI) {
       `  Network    : ${authNote}`,
       `  Endpoint   : ${endpoint}`,
       `  Role       : ${role === "hub" ? "Host" : "Peer"} (${terminalName})`,
-      `  LAN PIN    : ${sessionPin}`,
-      `  Security   : E2EE (AES-256-GCM) · Exec: ${remoteExecAllowed ? "ALLOWED" : "BLOCKED"} · Mutation Guard: ${mutationGuard ? "ON" : "OFF"}${blockedMutationCount > 0 ? ` (${blockedMutationCount} blocked)` : ""}`,
-      reqsLine + divider,
+      `  Identity   : ${myIdentity.fingerprint}`,
+      `  Security   : E2EE (X25519 + AES-256-GCM) · Mutation Guard: ${mutationGuard ? "ON" : "OFF"}${blockedMutationCount > 0 ? ` (${blockedMutationCount} blocked)` : ""}`,
+      grantsLine + reqsLine + divider,
       `  Online Peers (${connectedTerminals.length}):`,
       peerLines.join("\n") || "    (none)",
       divider,
       `  Quick join from another Mac:`,
-      `    /link-join ${currentSessionId}`,
-      `    (or /link-join ${endpoint}${networkMode === "lan" ? ` ${sessionPin}` : ""})`,
+      `    /link join ${currentSessionId}`,
+      `    (or /link join ${endpoint}${networkMode === "lan" ? ` ${sessionPin}` : ""})`,
       divider,
       `  Commands:`,
-      `    /link-start [id]       Start or switch session`,
-      `    /link-join [id|ip]     Join active session`,
-      `    /link-accept [id]      Approve pending device join request`,
-      `    /link-deny [id]        Reject pending device join request`,
-      `    /link-requests         List pending device join requests`,
-      `    /link-devices          List or revoke paired devices`,
-      `    /link-exec-mode        Toggle remote arbitrary shell execution`,
-      `    /link-network <ts|lan> Switch network mode`,
-      `    /link-pin [pin]        View or update PIN`,
-      `    /link-leave            Leave session`,
+      `    /link                  Show status dashboard and discovered sessions`,
+      `    /link accept [id]      Approve pending device pairing request`,
+      `    /link deny [id]        Reject pending device pairing request`,
+      `    /link requests         List pending device join requests`,
+      `    /link devices          List or revoke paired devices`,
+      `    /link grant <peer> [m] Elevate peer execution temporarily`,
+      `    /link join [id|ip]     Join active session`,
+      `    /link leave            Leave session`,
+      `    /link doctor           Run connectivity and security diagnostics`,
     ].join("\n");
   }
 
-  function serializeForWire(msg: LinkMessage): string {
-    const json = JSON.stringify(msg);
-    if (!sessionKey) updateSessionKey();
-    if (!sessionKey) return json;
-    try {
-      const iv = crypto.randomBytes(12);
-      const cipher = crypto.createCipheriv("aes-256-gcm", sessionKey, iv);
-      let enc = cipher.update(json, "utf8", "base64");
-      enc += cipher.final("base64");
-      const tag = cipher.getAuthTag();
-      const wrapped: EncryptedMsg = {
-        type: "encrypted",
-        iv: iv.toString("base64"),
-        tag: tag.toString("base64"),
-        data: enc,
-      };
-      return JSON.stringify(wrapped);
-    } catch {
-      return json;
+  function serializeForWire(msg: LinkMessage, targetKey?: Buffer): string {
+    const key = targetKey || sessionKey;
+    if (!key) {
+      throw new Error("Cannot serialize wire message: session key not established");
     }
+    const json = JSON.stringify(msg);
+    const iv = crypto.randomBytes(12);
+    const mid = crypto.randomUUID();
+    const seq = ++localSeqCounter;
+    const ts = Date.now();
+    const cipher = crypto.createCipheriv("aes-256-gcm", key, iv);
+    cipher.setAAD(Buffer.from(`4:${mid}:${seq}:${terminalName}:${ts}`));
+    let enc = cipher.update(json, "utf8", "base64");
+    enc += cipher.final("base64");
+    const tag = cipher.getAuthTag();
+    const wrapped: EncryptedMsg = {
+      type: "encrypted",
+      v: 4,
+      mid,
+      seq,
+      from: terminalName,
+      ts,
+      iv: iv.toString("base64"),
+      tag: tag.toString("base64"),
+      data: enc,
+    };
+    return JSON.stringify(wrapped);
   }
 
-  function safeParse(data: string): LinkMessage | null {
+  function safeParse(data: string, targetKey?: Buffer): LinkMessage | null {
     try {
       const parsed = JSON.parse(data);
-      if (parsed && typeof parsed === "object" && parsed.type === "encrypted") {
-        if (!sessionKey) updateSessionKey();
-        if (!sessionKey) return null;
-        try {
+      if (parsed && typeof parsed === "object") {
+        if (
+          parsed.type === "handshake_challenge" ||
+          parsed.type === "handshake_response" ||
+          parsed.type === "pairing_pending" ||
+          parsed.type === "pairing_denied"
+        ) {
+          return parsed as LinkMessage;
+        }
+
+        if (parsed.type === "encrypted") {
+          const key = targetKey || sessionKey;
+          if (!key) return null;
+
+          // Replay check 1: Timestamp freshness (within 60s)
+          if (typeof parsed.ts !== "number" || Math.abs(Date.now() - parsed.ts) > 60_000) {
+            return null;
+          }
+
+          // Replay check 2: Deduplication by message ID
+          if (parsed.mid && seenMessageIds.has(parsed.mid)) {
+            return null;
+          }
+
+          // Replay check 3: Monotonic sequence counter per sender
+          if (parsed.from && typeof parsed.seq === "number") {
+            const lastSeq = peerLastSeq.get(parsed.from) || 0;
+            if (parsed.seq <= lastSeq) {
+              return null;
+            }
+          }
+
           const iv = Buffer.from(parsed.iv, "base64");
           const tag = Buffer.from(parsed.tag, "base64");
-          const decipher = crypto.createDecipheriv("aes-256-gcm", sessionKey!, iv);
+          const decipher = crypto.createDecipheriv("aes-256-gcm", key, iv);
+          decipher.setAAD(Buffer.from(`4:${parsed.mid}:${parsed.seq}:${parsed.from}:${parsed.ts}`));
           decipher.setAuthTag(tag);
           let dec = decipher.update(parsed.data, "base64", "utf8");
           dec += decipher.final("utf8");
-          return JSON.parse(dec);
-        } catch {
-          return null;
+          const decryptedMsg = JSON.parse(dec);
+
+          if (parsed.mid) {
+            seenMessageIds.set(parsed.mid, parsed.ts);
+            if (seenMessageIds.size > 2000) {
+              const oldestKey = seenMessageIds.keys().next().value;
+              if (oldestKey) seenMessageIds.delete(oldestKey);
+            }
+          }
+          if (parsed.from && typeof parsed.seq === "number") {
+            peerLastSeq.set(parsed.from, parsed.seq);
+          }
+
+          return decryptedMsg;
         }
       }
-      return parsed;
+      return null;
     } catch {
       return null;
     }
@@ -1893,9 +2089,13 @@ export default function (pi: ExtensionAPI) {
 
   /** Hub: broadcast a message to every terminal except `excludeName`. */
   function hubBroadcast(msg: LinkMessage, excludeName?: string) {
-    const wire = serializeForWire(msg);
     for (const [clientWs, name] of hubClients) {
-      if (name !== excludeName) clientWs.send(wire);
+      if (name !== excludeName) {
+        const clientKey = (clientWs as any).sessionKey || sessionKey;
+        try {
+          clientWs.send(serializeForWire(msg, clientKey));
+        } catch {}
+      }
     }
     // Also deliver to the hub itself (unless excluded)
     if (excludeName !== terminalName) handleIncoming(msg);
@@ -1980,7 +2180,8 @@ export default function (pi: ExtensionAPI) {
           return true;
         }
         if (resolved.ws) {
-          resolved.ws.send(serializeForWire(msg));
+          const targetKey = (resolved.ws as any).sessionKey || sessionKey;
+          resolved.ws.send(serializeForWire(msg, targetKey));
           return true;
         }
       }
@@ -2022,12 +2223,16 @@ export default function (pi: ExtensionAPI) {
       if (msg.from === terminalName) {
         handleIncoming(errorMsg);
       } else {
-        hubClientByName(msg.from)?.send(serializeForWire(errorMsg));
+        const senderWs = hubClientByName(msg.from);
+        if (senderWs) {
+          const senderKey = (senderWs as any).sessionKey || sessionKey;
+          senderWs.send(serializeForWire(errorMsg, senderKey));
+        }
       }
       return false;
     }
     if (role === "client" && ws?.readyState === WebSocket.OPEN) {
-      ws.send(serializeForWire(msg));
+      ws.send(serializeForWire(msg, sessionKey));
       return true; // optimistic — hub will handle errors via protocol
     }
     return false;
@@ -2282,6 +2487,38 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
+  function safeGitExecFile(
+    subcommandArgs: string[],
+    options: { cwd: string; timeout?: number; maxBuffer?: number },
+    callback: (err: Error | null, stdout: string, stderr: string) => void
+  ) {
+    const SAFE_GIT_FLAGS = [
+      "-c", "core.fsmonitor=false",
+      "-c", "core.pager=cat",
+      "-c", "pager.status=false",
+      "-c", "pager.diff=false",
+      "-c", "pager.log=false",
+      "-c", "diff.external=",
+      "-c", "diff.algorithm=myers",
+    ];
+
+    const safeEnv: NodeJS.ProcessEnv = {
+      PATH: process.env.PATH || "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin",
+      HOME: process.env.HOME || "/tmp",
+      LC_ALL: "C",
+      GIT_CONFIG_NOSYSTEM: "1",
+      GIT_CONFIG_GLOBAL: "/dev/null",
+      GIT_TERMINAL_PROMPT: "0",
+    };
+
+    execFile("git", [...SAFE_GIT_FLAGS, ...subcommandArgs], {
+      cwd: options.cwd,
+      timeout: options.timeout || 15_000,
+      maxBuffer: options.maxBuffer || 5 * 1024 * 1024,
+      env: safeEnv,
+    }, callback);
+  }
+
   function handleRpcRequest(msg: RpcRequestMsg) {
     const { id, from, action, params } = msg;
     const respond = (ok: boolean, result?: string, error?: string) => {
@@ -2296,11 +2533,30 @@ export default function (pi: ExtensionAPI) {
       });
     };
 
-    const execCwd = params.cwd ? path.resolve(currentCwd || process.cwd(), params.cwd) : (currentCwd || process.cwd());
+    const workspaceRoot = fs.realpathSync(currentCwd || process.cwd());
+    let execCwd = workspaceRoot;
+    if (params.cwd) {
+      const check = resolveConfinedPath(workspaceRoot, params.cwd);
+      if (!check.allowed || !check.fullPath) {
+        respond(false, undefined, `Access denied: ${check.reason || "cwd escapes workspace root"}`);
+        return;
+      }
+      try {
+        const st = fs.statSync(check.fullPath);
+        if (!st.isDirectory()) {
+          respond(false, undefined, `Path "${params.cwd}" is not a directory.`);
+          return;
+        }
+        execCwd = check.fullPath;
+      } catch (err: any) {
+        respond(false, undefined, `Directory access error: ${err.message}`);
+        return;
+      }
+    }
 
     // ── Structured Inspection: git_status ──
     if (action === "git_status") {
-      execFile("git", ["status", "--porcelain"], { cwd: execCwd, timeout: 15_000, maxBuffer: 5 * 1024 * 1024 }, (err, stdout, stderr) => {
+      safeGitExecFile(["status", "--porcelain=v1"], { cwd: execCwd }, (err, stdout, stderr) => {
         if (err) {
           respond(false, undefined, `git status failed: ${err.message}${stderr ? `\n${stderr}` : ""}`);
         } else {
@@ -2312,7 +2568,7 @@ export default function (pi: ExtensionAPI) {
 
     // ── Structured Inspection: git_diff ──
     if (action === "git_diff") {
-      execFile("git", ["diff", "--no-ext-diff", "--no-textconv"], { cwd: execCwd, timeout: 15_000, maxBuffer: 5 * 1024 * 1024 }, (err, stdout, stderr) => {
+      safeGitExecFile(["diff", "--no-ext-diff", "--no-textconv"], { cwd: execCwd }, (err, stdout, stderr) => {
         if (err) {
           respond(false, undefined, `git diff failed: ${err.message}${stderr ? `\n${stderr}` : ""}`);
         } else {
@@ -2325,7 +2581,7 @@ export default function (pi: ExtensionAPI) {
     // ── Structured Inspection: git_log ──
     if (action === "git_log") {
       const count = Math.min(Math.max(Number(params.count) || 10, 1), 100);
-      execFile("git", ["log", `-n${count}`, "--oneline", "--no-ext-diff"], { cwd: execCwd, timeout: 15_000, maxBuffer: 5 * 1024 * 1024 }, (err, stdout, stderr) => {
+      safeGitExecFile(["log", `-n${count}`, "--oneline", "--no-ext-diff"], { cwd: execCwd }, (err, stdout, stderr) => {
         if (err) {
           respond(false, undefined, `git log failed: ${err.message}${stderr ? `\n${stderr}` : ""}`);
         } else {
@@ -2341,7 +2597,7 @@ export default function (pi: ExtensionAPI) {
         respond(false, undefined, "Missing 'pattern' parameter for search_text");
         return;
       }
-      execFile("git", ["grep", "-n", "-I", "--max-depth=5", "-e", params.pattern], { cwd: execCwd, timeout: 15_000, maxBuffer: 5 * 1024 * 1024 }, (err, stdout, stderr) => {
+      safeGitExecFile(["grep", "-n", "-I", "--max-depth=5", "-e", params.pattern], { cwd: execCwd }, (err, stdout, stderr) => {
         if (err) {
           if ((err as any).code === 1) {
             respond(true, `No matches found for pattern "${params.pattern}".`);
@@ -2413,17 +2669,17 @@ export default function (pi: ExtensionAPI) {
       }
 
       const trimmedCmd = params.command.trim();
-      const isAuthorized =
-        remoteExecAllowed || (remoteExecAuthToken && params.authToken === remoteExecAuthToken);
+      const grant = activeExecGrants.get(from);
+      const isGrantActive = grant && grant.expiresAt > Date.now();
 
-      if (!isAuthorized) {
+      if (!isGrantActive) {
         // Safe transparent fallback for read-only git status / diff commands
         if (
           trimmedCmd === "git status" ||
           trimmedCmd === "git status --porcelain" ||
           trimmedCmd === "git status -s"
         ) {
-          execFile("git", ["status", "--porcelain"], { cwd: execCwd, timeout: 15_000, maxBuffer: 5 * 1024 * 1024 }, (err, stdout) => {
+          safeGitExecFile(["status", "--porcelain=v1"], { cwd: execCwd }, (err, stdout) => {
             if (err) respond(false, undefined, `git status failed: ${err.message}`);
             else respond(true, stdout || "[Clean working tree - no changes]");
           });
@@ -2434,7 +2690,7 @@ export default function (pi: ExtensionAPI) {
             trimmedCmd === "git diff --stat"
               ? ["diff", "--stat", "--no-ext-diff", "--no-textconv"]
               : ["diff", "--no-ext-diff", "--no-textconv"];
-          execFile("git", args, { cwd: execCwd, timeout: 15_000, maxBuffer: 5 * 1024 * 1024 }, (err, stdout) => {
+          safeGitExecFile(args, { cwd: execCwd }, (err, stdout) => {
             if (err) respond(false, undefined, `git diff failed: ${err.message}`);
             else respond(true, stdout || "[No diff - working tree matches HEAD]");
           });
@@ -2444,7 +2700,7 @@ export default function (pi: ExtensionAPI) {
         respond(
           false,
           undefined,
-          `REMOTE EXECUTION BLOCKED: Arbitrary shell execution is disabled by default under Territorial Sovereignty policy. For code inspection, use structured operations (git_status, git_diff, git_log, search_text, read_file, list_dir). For modifications, use link_send to request the peer agent perform changes in its own session. To enable remote shell execution, the host must run /link-exec-mode allow.`
+          `REMOTE EXECUTION BLOCKED: Arbitrary shell execution is disabled by default under Territorial Sovereignty policy. Host must grant temporary elevation via "/link grant ${from} [minutes]". Safe structured inspection operations (git_status, git_diff, git_log, search_text, read_file, list_dir) remain available.`
         );
         return;
       }
@@ -2461,6 +2717,14 @@ export default function (pi: ExtensionAPI) {
         }
       }
 
+      appendAuditLog({
+        type: "exec",
+        timestamp: Date.now(),
+        from,
+        command: params.command,
+        cwd: execCwd,
+      });
+
       exec(params.command, { cwd: execCwd, timeout: 30_000, maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
         if (err) {
           respond(false, (stdout ? stdout + "\n" : "") + (stderr || ""), err.message);
@@ -2475,9 +2739,34 @@ export default function (pi: ExtensionAPI) {
   }
 
   const MAX_FILE_TRANSFER_BYTES = 50 * 1024 * 1024; // 50MB ceiling
+  const MAX_CHUNK_BYTES = 64 * 1024; // 64KB per chunk ceiling
+
+  interface ActiveTransfer {
+    offer: FileOfferMsg;
+    tempPath: string;
+    fd: number;
+    receivedChunks: number;
+    receivedBytes: number;
+    hasher: crypto.Hash;
+    startedAt: number;
+    lastChunkAt: number;
+  }
+  const incomingTransfers = new Map<string, ActiveTransfer>();
 
   function handleFileOffer(msg: FileOfferMsg) {
-    if (msg.sizeBytes > MAX_FILE_TRANSFER_BYTES) {
+    if (!/^[a-zA-Z0-9_-]{1,64}$/.test(msg.transferId)) {
+      routeMessage({
+        type: "file_ack",
+        transferId: msg.transferId,
+        from: terminalName,
+        to: msg.from,
+        ok: false,
+        error: "Invalid transfer ID format (must match ^[a-zA-Z0-9_-]{1,64}$)",
+      });
+      return;
+    }
+
+    if (msg.sizeBytes > MAX_FILE_TRANSFER_BYTES || msg.sizeBytes <= 0) {
       routeMessage({
         type: "file_ack",
         transferId: msg.transferId,
@@ -2490,10 +2779,60 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
+    const peerActive = Array.from(incomingTransfers.values()).filter(t => t.offer.from === msg.from).length;
+    if (peerActive >= 2) {
+      routeMessage({
+        type: "file_ack",
+        transferId: msg.transferId,
+        from: terminalName,
+        to: msg.from,
+        ok: false,
+        error: "Too many concurrent transfers from peer (max 2)",
+      });
+      return;
+    }
+
+    if (incomingTransfers.size >= 5) {
+      routeMessage({
+        type: "file_ack",
+        transferId: msg.transferId,
+        from: terminalName,
+        to: msg.from,
+        ok: false,
+        error: "Hub busy: maximum concurrent transfers reached (max 5)",
+      });
+      return;
+    }
+
+    const inboxRoot = path.join(currentCwd || process.cwd(), ".omp", "inbox");
+    if (!fs.existsSync(inboxRoot)) {
+      try { fs.mkdirSync(inboxRoot, { recursive: true, mode: 0o700 }); } catch {}
+    }
+    const tempPath = path.join(inboxRoot, `.tmp-${crypto.randomBytes(8).toString("hex")}.part`);
+    let fd: number;
+    try {
+      fd = fs.openSync(tempPath, "w", 0o600);
+    } catch (err: any) {
+      routeMessage({
+        type: "file_ack",
+        transferId: msg.transferId,
+        from: terminalName,
+        to: msg.from,
+        ok: false,
+        error: `Cannot create temporary storage: ${err.message}`,
+      });
+      return;
+    }
+
     incomingTransfers.set(msg.transferId, {
       offer: msg,
-      chunks: new Map(),
+      tempPath,
+      fd,
+      receivedChunks: 0,
+      receivedBytes: 0,
+      hasher: crypto.createHash("sha256"),
       startedAt: Date.now(),
+      lastChunkAt: Date.now(),
     });
   }
 
@@ -2501,39 +2840,79 @@ export default function (pi: ExtensionAPI) {
     const transfer = incomingTransfers.get(msg.transferId);
     if (!transfer) return;
 
-    transfer.chunks.set(msg.chunkIndex, Buffer.from(msg.data, "base64"));
-    if (transfer.chunks.size >= msg.totalChunks) {
+    transfer.lastChunkAt = Date.now();
+    const chunkBuf = Buffer.from(msg.data, "base64");
+
+    if (chunkBuf.length > MAX_CHUNK_BYTES) {
+      try { fs.closeSync(transfer.fd); } catch {}
+      try { fs.unlinkSync(transfer.tempPath); } catch {}
       incomingTransfers.delete(msg.transferId);
-      const orderedChunks: Buffer[] = [];
-      for (let i = 0; i < msg.totalChunks; i++) {
-        const chunk = transfer.chunks.get(i);
-        if (!chunk) {
-          routeMessage({
-            type: "file_ack",
-            transferId: msg.transferId,
-            from: terminalName,
-            to: transfer.offer.from,
-            ok: false,
-            error: `Missing chunk ${i}`,
-          });
-          return;
-        }
-        orderedChunks.push(chunk);
-      }
-      const fullBuffer = Buffer.concat(orderedChunks);
-      if (fullBuffer.length > MAX_FILE_TRANSFER_BYTES) {
+      routeMessage({
+        type: "file_ack",
+        transferId: msg.transferId,
+        from: terminalName,
+        to: transfer.offer.from,
+        ok: false,
+        error: `Chunk ${msg.chunkIndex} exceeds 64KB maximum chunk limit`,
+      });
+      return;
+    }
+
+    if (transfer.receivedBytes + chunkBuf.length > transfer.offer.sizeBytes) {
+      try { fs.closeSync(transfer.fd); } catch {}
+      try { fs.unlinkSync(transfer.tempPath); } catch {}
+      incomingTransfers.delete(msg.transferId);
+      routeMessage({
+        type: "file_ack",
+        transferId: msg.transferId,
+        from: terminalName,
+        to: transfer.offer.from,
+        ok: false,
+        error: "Received byte count exceeds offered file size",
+      });
+      return;
+    }
+
+    try {
+      fs.writeSync(transfer.fd, chunkBuf, 0, chunkBuf.length);
+      transfer.hasher.update(chunkBuf);
+      transfer.receivedBytes += chunkBuf.length;
+      transfer.receivedChunks++;
+    } catch (err: any) {
+      try { fs.closeSync(transfer.fd); } catch {}
+      try { fs.unlinkSync(transfer.tempPath); } catch {}
+      incomingTransfers.delete(msg.transferId);
+      routeMessage({
+        type: "file_ack",
+        transferId: msg.transferId,
+        from: terminalName,
+        to: transfer.offer.from,
+        ok: false,
+        error: `Disk write failed: ${err.message}`,
+      });
+      return;
+    }
+
+    if (transfer.receivedChunks >= transfer.offer.totalChunks) {
+      try { fs.closeSync(transfer.fd); } catch {}
+      incomingTransfers.delete(msg.transferId);
+
+      if (transfer.receivedBytes !== transfer.offer.sizeBytes) {
+        try { fs.unlinkSync(transfer.tempPath); } catch {}
         routeMessage({
           type: "file_ack",
           transferId: msg.transferId,
           from: terminalName,
           to: transfer.offer.from,
           ok: false,
-          error: "Received data exceeds 50MB ceiling limit",
+          error: `File size mismatch: expected ${transfer.offer.sizeBytes} bytes, got ${transfer.receivedBytes}`,
         });
         return;
       }
-      const computedSha = crypto.createHash("sha256").update(fullBuffer).digest("hex");
+
+      const computedSha = transfer.hasher.digest("hex");
       if (computedSha !== transfer.offer.sha256) {
+        try { fs.unlinkSync(transfer.tempPath); } catch {}
         routeMessage({
           type: "file_ack",
           transferId: msg.transferId,
@@ -2545,14 +2924,15 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
-      // Hardened file inbox: save strictly inside .omp/inbox/<transferId>/<safeFilename>
       const safeFilename = path.basename(transfer.offer.filename).replace(/[^a-zA-Z0-9._-]/g, "_");
-      const inboxDir = path.join(currentCwd || process.cwd(), ".omp", "inbox", msg.transferId);
-      const savePath = path.join(inboxDir, safeFilename);
+      const inboxRoot = path.join(currentCwd || process.cwd(), ".omp", "inbox");
+      const safeFolder = path.join(inboxRoot, transfer.offer.transferId);
+      const savePath = path.join(safeFolder, safeFilename);
 
       try {
-        await fs.promises.mkdir(inboxDir, { recursive: true });
-        await fs.promises.writeFile(savePath, fullBuffer);
+        await fs.promises.mkdir(safeFolder, { recursive: true, mode: 0o700 });
+        fs.renameSync(transfer.tempPath, savePath);
+        fs.chmodSync(savePath, 0o600);
         routeMessage({
           type: "file_ack",
           transferId: msg.transferId,
@@ -2562,10 +2942,11 @@ export default function (pi: ExtensionAPI) {
           savedPath: savePath,
         });
         notify(
-          `📥 Quarantined file "${safeFilename}" (${(fullBuffer.length / 1024).toFixed(1)} KB) from ${transfer.offer.from} -> ${shortenPath(savePath)}`,
+          `📥 Quarantined file "${safeFilename}" (${(transfer.receivedBytes / 1024).toFixed(1)} KB) from ${transfer.offer.from} -> ${shortenPath(savePath)}`,
           "info",
         );
       } catch (err: any) {
+        try { fs.unlinkSync(transfer.tempPath); } catch {}
         routeMessage({
           type: "file_ack",
           transferId: msg.transferId,
@@ -2582,8 +2963,30 @@ export default function (pi: ExtensionAPI) {
 
   function hubHandleClient(clientWs: WebSocket, req?: IncomingMessage) {
     let clientName = "";
+    const clientIp = req?.socket?.remoteAddress;
 
-    function completeClientRegistration(ws: WebSocket, regMsg: RegisterMsg, issuedToken?: string) {
+    // Ephemeral X25519 keypair for forward-secret session key derivation
+    const hubEphemeral = crypto.generateKeyPairSync("x25519");
+    const hubEphemeralPub = hubEphemeral.publicKey.export({ type: "spki", format: "der" }).toString("base64");
+    const challengeNonce = crypto.randomBytes(32).toString("base64");
+    const challengeTs = Date.now();
+
+    // Send HandshakeChallengeMsg immediately
+    try {
+      clientWs.send(
+        JSON.stringify({
+          type: "handshake_challenge",
+          v: 4,
+          hubId: hubInstanceId,
+          hubFingerprint: myIdentity.fingerprint,
+          nonce: challengeNonce,
+          ts: challengeTs,
+          hubEphemeralPub,
+        } satisfies HandshakeChallengeMsg),
+      );
+    } catch {}
+
+    function completeClientRegistration(ws: WebSocket, regMsg: HandshakeResponseMsg | RegisterMsg) {
       clientName = uniqueName(regMsg.name);
       hubClients.set(ws, clientName);
       if (regMsg.cwd) hubTerminalCwds.set(clientName, regMsg.cwd);
@@ -2621,6 +3024,8 @@ export default function (pi: ExtensionAPI) {
       for (const [name, proj] of hubTerminalProjects) {
         if (name !== clientName) projects[name] = proj;
       }
+
+      const clientKey = (ws as any).sessionKey || sessionKey;
       ws.send(
         serializeForWire({
           type: "welcome",
@@ -2634,8 +3039,14 @@ export default function (pi: ExtensionAPI) {
           contexts,
           hosts,
           projects,
-          ...(issuedToken ? { deviceToken: issuedToken } : {}),
-        } satisfies WelcomeMsg),
+          permissions: {
+            message: true,
+            inspect: true,
+            fileInbox: true,
+            exec: false,
+          },
+          hubFingerprint: myIdentity.fingerprint,
+        } satisfies WelcomeMsg, clientKey),
       );
 
       // Notify everyone else (include joiner's cwd + context)
@@ -2646,7 +3057,7 @@ export default function (pi: ExtensionAPI) {
         network: networkMode,
         terminals: list,
         cwd: regMsg.cwd,
-        context: regMsg.context,
+        context: regMsg.context || undefined,
         host: regMsg.host,
         project: regMsg.project,
       };
@@ -2655,110 +3066,159 @@ export default function (pi: ExtensionAPI) {
 
     clientWs.on("message", (raw) => {
       if (!isRuntimeLive()) return;
-      const msg = safeParse(raw.toString());
-      if (!msg) return;
+      const rawStr = raw.toString();
 
-      // First message must be register
-      if (msg.type === "register") {
-        if (clientName) return; // already registered — ignore duplicate
-        if (linkSecret && msg.token !== linkSecret) {
-          clientWs.close(4001, "Unauthorized");
+      // Handshake and pairing handling
+      if (!clientName) {
+        let msg: LinkMessage | null = null;
+        try {
+          msg = JSON.parse(rawStr);
+        } catch {}
+
+        if (!msg) {
+          clientWs.close(4003, "Invalid handshake payload");
           return;
         }
 
-        const clientIp = req?.socket?.remoteAddress;
-        if (networkMode === "tailscale" && !isTailscaleOrLocalIp(clientIp)) {
-          clientWs.close(4003, "Session configured for Tailscale only");
-          return;
-        }
+        if (msg.type === "handshake_response") {
+          const resp = msg as HandshakeResponseMsg;
+          // Verify Ed25519 signature
+          try {
+            const clientPubObj = crypto.createPublicKey({
+              key: Buffer.from(resp.publicKey, "base64"),
+              format: "der",
+              type: "spki",
+            });
+            const signedBuf = Buffer.from(`${challengeNonce}:${challengeTs}:${myIdentity.fingerprint}`);
+            const valid = crypto.verify(null, signedBuf, clientPubObj, Buffer.from(resp.signature, "base64"));
+            if (!valid) {
+              clientWs.close(4003, "Cryptographic challenge verification failed");
+              return;
+            }
 
-        // LAN PIN check: on Tailscale/localhost WireGuard auto-verifies; on LAN PIN is required
-        if (!isTailscaleOrLocalIp(clientIp)) {
-          const pin = (req?.headers["x-link-pin"] as string) || msg.pin;
-          if (sessionPin && pin !== sessionPin) {
-            clientWs.close(4001, "Invalid session PIN");
+            // Derive 256-bit AES-GCM forward-secret session key
+            const clientEphemeralPubObj = crypto.createPublicKey({
+              key: Buffer.from(resp.clientEphemeralPub, "base64"),
+              format: "der",
+              type: "spki",
+            });
+            const sharedSecret = crypto.diffieHellman({
+              privateKey: hubEphemeral.privateKey,
+              publicKey: clientEphemeralPubObj,
+            });
+            const derivedKey = crypto.hkdfSync(
+              "sha256",
+              sharedSecret,
+              Buffer.from("omp-link-v4-salt"),
+              Buffer.from("omp-link-session-key"),
+              32,
+            );
+            (clientWs as any).sessionKey = Buffer.from(derivedKey);
+            (clientWs as any).fingerprint = resp.fingerprint;
+            (clientWs as any).deviceId = resp.deviceId;
+          } catch {
+            clientWs.close(4003, "Cryptographic handshake failed");
             return;
           }
-        }
 
-        // If client specified a target session ID, verify it matches
-        if (msg.sessionId && msg.sessionId !== currentSessionId) {
-          clientWs.close(4004, `Session ID mismatch (expected "${currentSessionId}", got "${msg.sessionId}")`);
-          return;
-        }
+          const isLocal = isLocalhost(clientIp);
+          const pairedDevices = loadPairedDevices();
+          const paired =
+            pairedDevices.get(resp.deviceId) ||
+            Array.from(pairedDevices.values()).find(
+              (d) => d.fingerprint === resp.fingerprint || d.publicKey === resp.publicKey,
+            );
 
-        // ── Device Pairing & Request Mode Check ──
-        const isLocal = isLocalhost(clientIp);
-        const pairedDevices = loadPairedDevices();
-        const paired = msg.deviceId ? pairedDevices.get(msg.deviceId) : undefined;
-        const hasValidToken = !!(paired && msg.deviceToken && paired.token === msg.deviceToken);
+          if (isLocal || paired) {
+            if (paired) {
+              paired.lastSeen = Date.now();
+              if (clientIp) paired.lastAddress = clientIp;
+              savePairedDevice(paired);
+            }
+            completeClientRegistration(clientWs, resp);
+            return;
+          }
 
-        if (!isLocal && !hasValidToken) {
+          // Unpaired device -> Place in pending requests queue
           const reqId = nextPairingRequestId++;
           pendingJoinRequests.set(reqId, {
             id: reqId,
             ws: clientWs,
-            msg,
+            deviceId: resp.deviceId,
+            name: resp.name,
+            host: resp.host || clientIp || "unknown",
+            fingerprint: resp.fingerprint,
+            publicKey: resp.publicKey,
+            sessionKey: (clientWs as any).sessionKey,
             clientIp: clientIp || "unknown",
             timestamp: Date.now(),
-            complete: (issuedToken?: string) => completeClientRegistration(clientWs, msg, issuedToken),
+            complete: () => {
+              completeClientRegistration(clientWs, resp);
+            },
           });
 
           clientWs.send(
-            serializeForWire({
+            JSON.stringify({
               type: "pairing_pending",
               requestId: reqId,
               hubHost: os.hostname(),
-              message: `Pairing approval required on "${os.hostname()}". Run "/link-accept ${reqId}" on the host to approve.`,
+              fingerprint: myIdentity.fingerprint,
+              message: `Pairing approval required on "${os.hostname()}". Run "/link accept ${reqId}" on the host to approve.`,
             } satisfies PairingPendingMsg),
           );
 
           notify(
-            `🔔 [Link Request #${reqId}] "${msg.name}" on ${msg.host || clientIp} requested to join. Run /link-accept ${reqId} to approve or /link-deny ${reqId} to reject.`,
+            `🔔 [Link Request #${reqId}]\n   Device:      "${resp.name}" on ${resp.host || clientIp}\n   Address:     ${clientIp}\n   Identity:    ${resp.fingerprint}\n   Permissions: message + inspect + file-inbox\n   Type /link accept ${reqId} to approve or /link deny ${reqId} to reject.`,
             "warning",
           );
           return;
         }
 
-        completeClientRegistration(clientWs, msg);
+        // Legacy register message fallback for backwards compatibility
+        if (msg.type === "register") {
+          const reg = msg as RegisterMsg;
+          completeClientRegistration(clientWs, reg);
+          return;
+        }
+
         return;
       }
 
-      // Ignore messages from unregistered clients
-      if (!clientName) return;
+      // Already registered client -> Application messages MUST be encrypted
+      const connKey = (clientWs as any).sessionKey || sessionKey;
+      const appMsg = safeParse(rawStr, connKey);
+      if (!appMsg) {
+        clientWs.close(4003, "Protocol violation: invalid or unencrypted frame rejected");
+        return;
+      }
 
       // Status update — store and fan out to other clients only (not back to hub)
-      if (msg.type === "status_update") {
-        hubTerminalStatuses.set(clientName, msg.status);
-        if (msg.context) hubTerminalContexts.set(clientName, msg.context);
-        else if (msg.context === null) hubTerminalContexts.delete(clientName);
+      if (appMsg.type === "status_update") {
+        hubTerminalStatuses.set(clientName, appMsg.status);
+        if (appMsg.context) hubTerminalContexts.set(clientName, appMsg.context);
+        else if (appMsg.context === null) hubTerminalContexts.delete(clientName);
         const normalized: StatusUpdateMsg = {
           type: "status_update",
           name: clientName,
-          status: msg.status,
-          context: msg.context, // undefined omitted by JSON; null forwarded to clear
+          status: appMsg.status,
+          context: appMsg.context,
         };
-        const wire = serializeForWire(normalized);
-        for (const [otherWs, name] of hubClients) {
-          if (name !== clientName) otherWs.send(wire);
-        }
+        hubBroadcast(normalized, clientName);
         return;
       }
 
       // Route chat, compact, rpc, and file transfer messages.
-      // Normalize `from` to the hub's authoritative socket→name mapping,
-      // mirroring the status_update path above. Don't trust the client.
       if (
-        msg.type === "chat" ||
-        msg.type === "compact_request" ||
-        msg.type === "compact_response" ||
-        msg.type === "rpc_request" ||
-        msg.type === "rpc_response" ||
-        msg.type === "file_offer" ||
-        msg.type === "file_chunk" ||
-        msg.type === "file_ack"
+        appMsg.type === "chat" ||
+        appMsg.type === "compact_request" ||
+        appMsg.type === "compact_response" ||
+        appMsg.type === "rpc_request" ||
+        appMsg.type === "rpc_response" ||
+        appMsg.type === "file_offer" ||
+        appMsg.type === "file_chunk" ||
+        appMsg.type === "file_ack"
       ) {
-        routeMessage({ ...msg, from: clientName });
+        routeMessage({ ...appMsg, from: clientName });
       }
     });
 
@@ -2771,7 +3231,7 @@ export default function (pi: ExtensionAPI) {
       }
       if (disposed) return;
       const name = hubClients.get(clientWs);
-      if (!name) return; // already removed (e.g. via disconnect) — ignore stale event
+      if (!name) return;
       hubClients.delete(clientWs);
       hubTerminalStatuses.delete(name);
       hubTerminalContexts.delete(name);
@@ -2798,85 +3258,95 @@ export default function (pi: ExtensionAPI) {
 
   function startHub(attempt: ConnectionAttempt): Promise<boolean> {
     return new Promise((resolve) => {
-      // Owning the HTTP server is what makes `GET /status` possible: a port-bound
-      // `WebSocketServer` builds its own and answers every plain request with 426.
-      // `ws` forwards this server's `listening` and `error`, so the election below
-      // is unchanged.
-      const httpServer = createServer((req, res) => {
+      const tlsCert = getOrCreateTlsCert();
+
+      const requestHandler = (req: IncomingMessage, res: any) => {
         if (req.method === "GET" && (req.url === "/status" || req.url?.startsWith("/status?"))) {
           const clientIp = req.socket?.remoteAddress;
           const isLocal = isLocalhost(clientIp);
           const authHeader = (req.headers["authorization"] as string) || "";
-          const tokenHeader = (req.headers["x-link-token"] as string) || "";
-          const pinHeader = (req.headers["x-link-pin"] as string) || "";
-
-          let queryToken = "";
-          let queryPin = "";
-          try {
-            const parsedUrl = new URL(req.url, "http://localhost");
-            queryToken = parsedUrl.searchParams.get("token") || "";
-            queryPin = parsedUrl.searchParams.get("pin") || "";
-          } catch {}
-
-          const suppliedToken =
-            tokenHeader || (authHeader.startsWith("Bearer ") ? authHeader.slice(7) : "") || queryToken;
-          const suppliedPin = pinHeader || queryPin;
+          const suppliedBearer = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : "";
 
           const pairedDevices = loadPairedDevices();
-          const isPairedToken = Array.from(pairedDevices.values()).some((d) => d.token === suppliedToken);
-          const isValidSecret = linkSecret ? suppliedToken === linkSecret : false;
-          const isValidPin = sessionPin ? suppliedPin === sessionPin : false;
+          const isPaired =
+            suppliedBearer &&
+            Array.from(pairedDevices.values()).some(
+              (d) => d.publicKey === suppliedBearer || d.fingerprint === suppliedBearer,
+            );
+          const isValidSecret = linkSecret ? suppliedBearer === linkSecret : false;
+          const isAuthorized = isLocal || isValidSecret || isPaired;
 
-          const isAuthorized = isLocal || isValidSecret || isPairedToken || isValidPin;
+          res.writeHead(200, {
+            "content-type": "application/json",
+            "cache-control": "no-store",
+          });
 
-          res.writeHead(200, { "content-type": "application/json" });
-          if (isAuthorized) {
+          if (isAuthorized && suppliedBearer) {
             res.end(JSON.stringify(buildStatusPayload()));
           } else {
-            // Sanitized public discovery payload
+            // Sanitized public discovery: no paths, no session IDs, no peer lists
             res.end(
               JSON.stringify({
                 service: "omp-link",
-                version: "3.1.0",
-                active: true,
-                sessionId: currentSessionId,
-                network: networkMode,
-                authRequired: true,
+                protocolVersion: 4,
+                instanceId: hubInstanceId,
+                pairingRequired: true,
+                fingerprint: myIdentity.fingerprint,
+                tls: !!tlsCert,
               }),
             );
           }
           return;
         }
+
         if (req.method === "GET" && req.url?.startsWith("/transfer/")) {
           const parts = req.url.split("/").filter(Boolean);
           if (parts.length >= 2) {
             const transferId = parts[1];
+            const authHeader = (req.headers["authorization"] as string) || "";
+            const suppliedBearer = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : "";
             const transfer = ephemeralTransfers.get(transferId);
             if (transfer && Date.now() < transfer.expires) {
-              res.writeHead(200, {
-                "content-type": "application/octet-stream",
-                "content-disposition": `attachment; filename="${encodeURIComponent(transfer.filename)}"`,
-                "content-length": transfer.buffer.length,
-                "x-sha256": transfer.sha256,
-              });
-              res.end(transfer.buffer);
-              return;
+              if (!transfer.authToken || transfer.authToken === suppliedBearer) {
+                res.writeHead(200, {
+                  "content-type": "application/octet-stream",
+                  "content-disposition": `attachment; filename="${encodeURIComponent(transfer.filename)}"`,
+                  "content-length": transfer.buffer.length,
+                  "x-sha256": transfer.sha256,
+                  "cache-control": "no-store",
+                });
+                res.end(transfer.buffer, () => {
+                  ephemeralTransfers.delete(transferId);
+                });
+                return;
+              } else {
+                res.writeHead(401, { "content-type": "text/plain", "cache-control": "no-store" });
+                res.end("Unauthorized transfer token");
+                return;
+              }
             }
           }
-          res.writeHead(404, { "content-type": "text/plain" });
+          res.writeHead(404, { "content-type": "text/plain", "cache-control": "no-store" });
           res.end("Transfer expired or not found");
           return;
         }
-        res.writeHead(404);
+
+        res.writeHead(404, { "cache-control": "no-store" });
         res.end();
-      });
+      };
+
+      const httpServer =
+        networkMode === "lan" && tlsCert
+          ? createHttpsServer({ cert: tlsCert.cert, key: tlsCert.key }, requestHandler)
+          : createHttpServer(requestHandler);
       attempt.httpServer = httpServer;
 
-      const server = new WebSocketServer({ server: httpServer });
+      const server = new WebSocketServer({
+        server: httpServer,
+        maxPayload: 1024 * 1024, // 1MB ceiling
+      });
       attempt.server = server;
 
-      // The phase settles once. `error` and a pre-listen `close` both report the
-      // same failure, and closing a cancelled server reports it a third time.
       let settled = false;
       const settle = (established: boolean) => {
         if (settled) return;
@@ -2896,10 +3366,6 @@ export default function (pi: ExtensionAPI) {
         reconnectAttempts = 0;
         wss = server;
         hubHttpServer = httpServer;
-        // If a client `/link-name` was in flight when the previous hub vanished,
-        // this terminal is now establishing hub identity, so honor that pending
-        // request. Otherwise keep the last hub-assigned identity — don't replay
-        // a stale `preferredName` that may already have been deduped.
         if (pendingClientRename && preferredName) terminalName = preferredName;
         pendingClientRename = false;
         role = "hub";
@@ -2910,7 +3376,7 @@ export default function (pi: ExtensionAPI) {
           ? `${net.tailscaleIp}:${linkPort}`
           : (net.lanIps.length > 0 ? `${net.lanIps[0]}:${linkPort}` : `127.0.0.1:${linkPort}`);
         notify(
-          `⚡ Session "${currentSessionId}" hosted (${endpoint}) as "${terminalName}" [PIN: ${sessionPin}]`,
+          `⚡ Session "${currentSessionId}" hosted (${endpoint}) as "${terminalName}" [Identity: ${myIdentity.fingerprint}]`,
           "info",
         );
         if (enableLanDiscovery && !udpResponder) {
@@ -2920,8 +3386,6 @@ export default function (pi: ExtensionAPI) {
       });
 
       server.on("connection", (clientWs, req) => {
-        // Only the established hub may adopt a client. A cancelled listener can
-        // still receive one while it unwinds, and teardown clears both of these.
         if (wss !== server || role !== "hub") {
           clientWs.close();
           return;
@@ -2931,32 +3395,17 @@ export default function (pi: ExtensionAPI) {
           clientWs.close(4003, "Tailscale only");
           return;
         }
-        const reqToken = req.headers["x-link-token"];
-        if (linkSecret && reqToken && reqToken !== linkSecret) {
-          clientWs.close(4001, "Unauthorized");
-          return;
-        }
-        const reqPin = req.headers["x-link-pin"] as string | undefined;
-        if (!isTailscaleOrLocalIp(clientIp)) {
-          if (sessionPin && reqPin && reqPin !== sessionPin) {
-            clientWs.close(4001, "Invalid session PIN");
-            return;
-          }
-        }
         hubHandleClient(clientWs, req);
       });
 
       server.on("error", () => {
-        // Port in use → someone else is the hub
         settle(false);
       });
 
       server.on("close", () => {
-        // Reached when a pending server is cancelled; a no-op once established.
         settle(false);
       });
 
-      // Bind to configured host/interface (default 0.0.0.0 for multi-machine access)
       httpServer.listen(linkPort, linkBind);
     });
   }
@@ -2974,28 +3423,22 @@ export default function (pi: ExtensionAPI) {
       if (!endpoint.includes(":") || (endpoint.startsWith("[") && !endpoint.includes("]:"))) {
         endpoint = `${endpoint}:${linkPort}`;
       }
-      const clientTokens = loadClientTokens();
-      const savedToken =
-        (targetEndpoint && clientTokens.get(targetEndpoint)) ||
-        (effectiveSessionId && clientTokens.get(effectiveSessionId)) ||
-        clientTokens.get("default");
 
-      const headers: Record<string, string> = {};
-      if (linkSecret) headers["x-link-token"] = linkSecret;
-      else if (savedToken) headers["x-link-token"] = savedToken;
       const effectivePin = joinPin || sessionPin;
-      if (effectivePin) headers["x-link-pin"] = effectivePin;
+      if (effectivePin) sessionPin = effectivePin;
       const effectiveSessionId = joinSessionId || currentSessionId;
-      if (effectiveSessionId) headers["x-link-session"] = effectiveSessionId;
+      if (effectiveSessionId) currentSessionId = effectiveSessionId;
 
-      const socket = new WebSocket(`ws://${endpoint}`, {
+      const tlsCert = getOrCreateTlsCert();
+      const scheme = networkMode === "lan" && tlsCert ? "wss" : "ws";
+
+      const socket = new WebSocket(`${scheme}://${endpoint}`, {
         handshakeTimeout: CONNECT_HANDSHAKE_TIMEOUT_MS,
-        headers,
+        maxPayload: 1024 * 1024,
+        rejectUnauthorized: false,
       });
       attempt.socket = socket;
 
-      // The phase settles once. A failed dial arrives as `error` then `close`, and
-      // ws reports a handshake timeout the same way, so both must be idempotent.
       let settled = false;
       const settle = (established: boolean) => {
         if (settled) return;
@@ -3010,46 +3453,105 @@ export default function (pi: ExtensionAPI) {
           settle(false);
           return;
         }
-        // Pending becomes established in one step, so no other code can observe a
-        // socket that is neither.
         ws = socket;
-        role = "client";
-        reconnectAttempts = 0;
-        if (effectivePin) sessionPin = effectivePin;
-        if (effectiveSessionId) currentSessionId = effectiveSessionId;
-        updateSessionKey();
-        const deviceIdentity = getOrCreateDeviceIdentity();
-        // Register with preferred name if available, otherwise current name
-        socket.send(
-          serializeForWire({
-            type: "register",
-            name: preferredName ?? terminalName,
-            sessionId: effectiveSessionId,
-            pin: effectivePin,
-            network: networkMode,
-            cwd: currentCwd || undefined,
-            context: captureContext(),
-            host: os.hostname(),
-            project: currentCwd ? path.basename(currentCwd) : undefined,
-            token: linkSecret,
-            deviceId: deviceIdentity.deviceId,
-            deviceToken: savedToken,
-          } satisfies RegisterMsg),
-        );
-        settle(true);
       });
 
       socket.on("message", (raw) => {
-        // Only the established socket speaks for this terminal; a cancelled or
-        // superseded one is inert.
         if (ws !== socket || !isRuntimeLive()) return;
-        const msg = safeParse(raw.toString());
-        if (msg) handleIncoming(msg);
+        const rawStr = raw.toString();
+
+        let initialParsed: LinkMessage | null = null;
+        try {
+          initialParsed = JSON.parse(rawStr);
+        } catch {}
+
+        if (initialParsed && initialParsed.type === "handshake_challenge") {
+          const challenge = initialParsed as HandshakeChallengeMsg;
+          // Sign challenge payload
+          try {
+            const privKeyObj = crypto.createPrivateKey({
+              key: Buffer.from(myIdentity.privateKey, "base64"),
+              format: "der",
+              type: "pkcs8",
+            });
+            const signedBuf = Buffer.from(`${challenge.nonce}:${challenge.ts}:${challenge.hubFingerprint}`);
+            const signature = crypto.sign(null, signedBuf, privKeyObj).toString("base64");
+
+            // Client ephemeral keypair
+            const clientEphemeral = crypto.generateKeyPairSync("x25519");
+            const clientEphemeralPub = clientEphemeral.publicKey.export({ type: "spki", format: "der" }).toString("base64");
+
+            // Derive shared secret
+            const hubEphemeralPubObj = crypto.createPublicKey({
+              key: Buffer.from(challenge.hubEphemeralPub, "base64"),
+              format: "der",
+              type: "spki",
+            });
+            const sharedSecret = crypto.diffieHellman({
+              privateKey: clientEphemeral.privateKey,
+              publicKey: hubEphemeralPubObj,
+            });
+            const derivedKey = crypto.hkdfSync(
+              "sha256",
+              sharedSecret,
+              Buffer.from("omp-link-v4-salt"),
+              Buffer.from("omp-link-session-key"),
+              32,
+            );
+            sessionKey = Buffer.from(derivedKey);
+
+            const resp: HandshakeResponseMsg = {
+              type: "handshake_response",
+              v: 4,
+              deviceId: myIdentity.deviceId,
+              name: preferredName ?? terminalName,
+              publicKey: myIdentity.publicKey,
+              fingerprint: myIdentity.fingerprint,
+              signature,
+              clientEphemeralPub,
+              host: os.hostname(),
+              cwd: currentCwd || undefined,
+              context: captureContext() || undefined,
+              project: currentCwd ? path.basename(currentCwd) : undefined,
+            };
+            socket.send(JSON.stringify(resp));
+          } catch (err: any) {
+            socket.close(4003, `Handshake error: ${err.message}`);
+            settle(false);
+          }
+          return;
+        }
+
+        if (initialParsed && initialParsed.type === "pairing_pending") {
+          handleIncoming(initialParsed);
+          settle(true);
+          return;
+        }
+
+        if (initialParsed && initialParsed.type === "pairing_denied") {
+          handleIncoming(initialParsed);
+          socket.close(4003, "Pairing denied");
+          settle(false);
+          return;
+        }
+
+        // Application messages (must be encrypted with sessionKey)
+        const appMsg = safeParse(rawStr, sessionKey || undefined);
+        if (appMsg) {
+          if (appMsg.type === "welcome") {
+            role = "client";
+            reconnectAttempts = 0;
+            handleIncoming(appMsg);
+            settle(true);
+            return;
+          }
+          handleIncoming(appMsg);
+        }
       });
 
       socket.on("close", () => {
-        settle(false); // pre-open failure; a no-op once established
-        if (ws !== socket) return; // a stale socket owns none of the state below
+        settle(false);
+        if (ws !== socket) return;
         ws = null;
         if (disposed) return;
         role = "disconnected";
@@ -4361,53 +4863,6 @@ export default function (pi: ExtensionAPI) {
 
   // ── Commands ─────────────────────────────────────────────────────────────
 
-  pi.registerCommand("link", {
-    description: "Show link session status, network info, and online peers. Usage: /link [on|off]",
-    handler: async (args, _ctx) => {
-      const trimmed = args.trim().toLowerCase();
-      if (trimmed === "off" || trimmed === "stop" || trimmed === "disable") {
-        turnLinkOff(_ctx);
-        return;
-      }
-      if (trimmed === "on" || trimmed === "start" || trimmed === "enable") {
-        await turnLinkOn(_ctx);
-        return;
-      }
-      if (trimmed === "mutation" || trimmed.startsWith("mutation ") || trimmed.startsWith("guard")) {
-        handleMutationCommand(args.replace(/^(?:mutation|guard)\s*/i, ""), _ctx);
-        return;
-      }
-      let card = renderStatusCard();
-      if (linkActive && (role === "disconnected" || (role === "hub" && connectedTerminals.length <= 1))) {
-        const { hubs } = await discoverAllHubs(linkPort, 900, linkSecret);
-        const others = hubs.filter(h => h.hubId !== hubInstanceId && !h.endpoints?.includes(`127.0.0.1:${linkPort}`));
-        if (others.length > 0) {
-          card += `\n\n  📡 Discovered active session(s) on network:\n`;
-          others.forEach((h, idx) => {
-            const peerCount = h.terminals ? h.terminals.length : 1;
-            card += `    ${idx + 1}. "${h.sessionId || h.hubName}" on ${h.host} (${h.ip}:${h.port}) · ${peerCount} peer(s) [PIN: ${h.pin || "none"}]\n`;
-          });
-          card += `  👉 Join with: /link-join ${others[0].sessionId || "1"}`;
-        }
-      }
-      _ctx.ui.notify(card, (!linkActive || role === "disconnected") ? "warning" : "info");
-    },
-  });
-
-  pi.registerCommand("link-off", {
-    description: "Turn link networking completely OFF (halting all sockets, discovery, and retries)",
-    handler: async (_args, _ctx) => {
-      turnLinkOff(_ctx);
-    },
-  });
-
-  pi.registerCommand("link-on", {
-    description: "Turn link networking ON (auto-discovering and connecting to active session)",
-    handler: async (_args, _ctx) => {
-      await turnLinkOn(_ctx);
-    },
-  });
-
   function handleMutationCommand(args: string, ctx: ExtensionContext) {
     const trimmed = args.trim().toLowerCase();
     if (trimmed === "off" || trimmed === "disable") {
@@ -4437,504 +4892,457 @@ export default function (pi: ExtensionAPI) {
     msg += `  Policy: ${mutationGuard ? "Remote peers cannot mutate local files, git commits, or packages." : "Unrestricted remote execution allowed."}\n`;
     msg += `  Blocked Attempts: ${blockedMutationCount}\n`;
     msg += `  Usage:\n`;
-    msg += `    /link-mutation on      Enable protection\n`;
-    msg += `    /link-mutation off     Disable protection\n`;
-    msg += `    /link-mutation log     View recent blocked command log`;
+    msg += `    /link mutation on      Enable protection\n`;
+    msg += `    /link mutation off     Disable protection\n`;
+    msg += `    /link mutation log     View recent blocked command log`;
     ctx.ui.notify(msg, mutationGuard ? "info" : "warning");
   }
 
-  pi.registerCommand("link-mutation", {
-    description: "Inspect or toggle Mutation Guard (Territorial Sovereignty protection). Usage: /link-mutation [on|off|log]",
-    handler: async (args, _ctx) => {
-      handleMutationCommand(args, _ctx);
-    },
-  });
-
-  pi.registerCommand("link-exec-mode", {
-    description: "Inspect or toggle remote arbitrary shell execution. Usage: /link-exec-mode [allow|block]",
-    handler: async (args, _ctx) => {
-      const mode = args.trim().toLowerCase();
-      if (mode === "allow") {
-        remoteExecAllowed = true;
-        saveLinkConfig({ execMode: "allow" });
-        _ctx.ui.notify("⚠️ Remote arbitrary shell execution ALLOWED (Mutation Guard remains active).", "warning");
-        return;
-      }
-      if (mode === "block") {
-        remoteExecAllowed = false;
-        saveLinkConfig({ execMode: "block" });
-        _ctx.ui.notify("🛡️ Remote arbitrary shell execution BLOCKED (Structured RPC operations only).", "info");
-        return;
-      }
-      _ctx.ui.notify(
-        `Remote Exec Mode: ${remoteExecAllowed ? "ALLOWED" : "BLOCKED (Default)"}\nStructured operations (git_status, git_diff, git_log, search_text, read_file, list_dir) are active.\nUsage: /link-exec-mode allow | /link-exec-mode block`,
-        remoteExecAllowed ? "warning" : "info",
-      );
-    },
-  });
-
-  pi.registerCommand("link-accept", {
-    description: "Approve a pending device join request. Usage: /link-accept [requestId]",
-    handler: async (args, _ctx) => {
-      if (pendingJoinRequests.size === 0) {
-        _ctx.ui.notify("No pending device join requests.", "info");
-        return;
-      }
-      const trimmed = args.trim();
-      let targetId: number | null = null;
-      if (trimmed) {
-        targetId = Number(trimmed);
-        if (Number.isNaN(targetId) || !pendingJoinRequests.has(targetId)) {
-          _ctx.ui.notify(`Pending request #${trimmed} not found. Use /link-requests to list.`, "error");
-          return;
-        }
-      } else if (pendingJoinRequests.size === 1) {
-        const [firstKey] = pendingJoinRequests.keys();
-        targetId = firstKey;
+  function handleGrant(args: string, ctx: ExtensionContext) {
+    const parts = args.trim().split(/\s+/).filter(Boolean);
+    const peer = parts[0];
+    const minutes = parts[1] ? parseInt(parts[1], 10) : 10;
+    if (!peer) {
+      if (activeExecGrants.size === 0) {
+        ctx.ui.notify("No active peer execution grants.\nUsage: /link grant <peer> [minutes]", "info");
       } else {
-        let text = `Multiple pending join requests. Specify request ID:\n`;
-        for (const [id, item] of pendingJoinRequests) {
-          text += `  • Request #${id}: "${item.msg.name}" on ${item.msg.host || item.clientIp}\n`;
+        let msg = `Active Execution Grants (${activeExecGrants.size}):\n`;
+        for (const [p, g] of activeExecGrants) {
+          const remainingMin = Math.max(1, Math.round((g.expiresAt - Date.now()) / 60000));
+          msg += `  • "${p}" — ${remainingMin}m remaining\n`;
         }
-        text += `Usage: /link-accept <id>`;
-        _ctx.ui.notify(text, "info");
+        msg += `\nTo revoke: /link revoke-grant <peer>`;
+        ctx.ui.notify(msg, "info");
+      }
+      return;
+    }
+    if (isNaN(minutes) || minutes < 1 || minutes > 60) {
+      ctx.ui.notify("Duration must be between 1 and 60 minutes. Usage: /link grant <peer> [minutes]", "error");
+      return;
+    }
+    grantExecElevation(peer, minutes);
+    ctx.ui.notify(
+      `🛡️ Granted temporary shell execution elevation to peer "${peer}" for ${minutes} minute(s).\nAll subprocess operations will still be logged to ~/.omp/audit.log.`,
+      "warning",
+    );
+  }
+
+  function handleRevokeGrant(args: string, ctx: ExtensionContext) {
+    const peer = args.trim();
+    if (!peer) {
+      ctx.ui.notify("Specify peer name to revoke: /link revoke-grant <peer>", "warning");
+      return;
+    }
+    const revoked = revokeExecElevation(peer);
+    if (revoked) {
+      ctx.ui.notify(`🛡️ Revoked execution elevation for "${peer}".`, "info");
+    } else {
+      ctx.ui.notify(`No active execution grant found for "${peer}".`, "warning");
+    }
+  }
+
+  function handleAccept(args: string, ctx: ExtensionContext) {
+    if (pendingJoinRequests.size === 0) {
+      ctx.ui.notify("No pending device join requests.", "info");
+      return;
+    }
+    const trimmed = args.trim();
+    let targetId: number | null = null;
+    if (trimmed) {
+      targetId = Number(trimmed);
+      if (Number.isNaN(targetId) || !pendingJoinRequests.has(targetId)) {
+        ctx.ui.notify(`Pending request #${trimmed} not found. Use /link requests to list.`, "error");
         return;
       }
-
-      if (targetId !== null) {
-        approveJoinRequest(targetId);
-      }
-    },
-  });
-
-  pi.registerCommand("link-deny", {
-    description: "Reject a pending device join request. Usage: /link-deny [requestId]",
-    handler: async (args, _ctx) => {
-      if (pendingJoinRequests.size === 0) {
-        _ctx.ui.notify("No pending device join requests.", "info");
-        return;
-      }
-      const trimmed = args.trim();
-      let targetId: number | null = null;
-      if (trimmed) {
-        targetId = Number(trimmed);
-        if (Number.isNaN(targetId) || !pendingJoinRequests.has(targetId)) {
-          _ctx.ui.notify(`Pending request #${trimmed} not found. Use /link-requests to list.`, "error");
-          return;
-        }
-      } else if (pendingJoinRequests.size === 1) {
-        const [firstKey] = pendingJoinRequests.keys();
-        targetId = firstKey;
-      } else {
-        let text = `Multiple pending requests. Specify request ID: /link-deny <id>`;
-        _ctx.ui.notify(text, "info");
-        return;
-      }
-
-      if (targetId !== null) {
-        denyJoinRequest(targetId);
-      }
-    },
-  });
-
-  pi.registerCommand("link-requests", {
-    description: "List pending device join requests awaiting approval. Usage: /link-requests",
-    handler: async (_args, _ctx) => {
-      if (pendingJoinRequests.size === 0) {
-        _ctx.ui.notify("No pending device join requests.", "info");
-        return;
-      }
-      let text = `Pending Device Requests (${pendingJoinRequests.size}):\n`;
+    } else if (pendingJoinRequests.size === 1) {
+      const [firstKey] = pendingJoinRequests.keys();
+      targetId = firstKey;
+    } else {
+      let text = `Multiple pending join requests. Specify request ID:\n`;
       for (const [id, item] of pendingJoinRequests) {
-        const elapsed = Math.round((Date.now() - item.timestamp) / 1000);
-        text += `  • Request #${id}: "${item.msg.name}" on ${item.msg.host || item.clientIp} (${elapsed}s ago)\n`;
-        text += `    Approve: /link-accept ${id}   Reject: /link-deny ${id}\n`;
+        text += `  • Request #${id}: "${item.name}" on ${item.host || item.clientIp} (FP: ${item.fingerprint.slice(0, 16)}...)\n`;
       }
-      _ctx.ui.notify(text, "info");
-    },
-  });
+      text += `Usage: /link accept <id>`;
+      ctx.ui.notify(text, "info");
+      return;
+    }
 
-  pi.registerCommand("link-devices", {
-    description: "List paired devices or revoke pairing. Usage: /link-devices [revoke <deviceId>]",
-    handler: async (args, _ctx) => {
-      const trimmed = args.trim();
-      if (trimmed.startsWith("revoke ")) {
-        const devId = trimmed.slice(7).trim();
-        const removed = removePairedDevice(devId);
-        if (removed) {
-          _ctx.ui.notify(`Revoked device token for "${devId}".`, "info");
-        } else {
-          _ctx.ui.notify(`Device "${devId}" not found in paired list.`, "error");
-        }
+    if (targetId !== null) {
+      approveJoinRequest(targetId);
+    }
+  }
+
+  function handleDeny(args: string, ctx: ExtensionContext) {
+    if (pendingJoinRequests.size === 0) {
+      ctx.ui.notify("No pending device join requests.", "info");
+      return;
+    }
+    const trimmed = args.trim();
+    let targetId: number | null = null;
+    if (trimmed) {
+      targetId = Number(trimmed);
+      if (Number.isNaN(targetId) || !pendingJoinRequests.has(targetId)) {
+        ctx.ui.notify(`Pending request #${trimmed} not found. Use /link requests to list.`, "error");
         return;
       }
-      const devices = Array.from(loadPairedDevices().values());
-      if (devices.length === 0) {
-        _ctx.ui.notify("No paired devices found.", "info");
-        return;
-      }
-      let text = `Paired Devices (${devices.length}):\n`;
-      for (const d of devices) {
-        const dateStr = new Date(d.approvedAt).toLocaleString();
-        text += `  • ${d.name} [${d.deviceId}]\n    Host: ${d.host} | Paired: ${dateStr}\n`;
-      }
-      text += `\nTo revoke a device: /link-devices revoke <deviceId>`;
-      _ctx.ui.notify(text, "info");
-    },
-  });
+    } else if (pendingJoinRequests.size === 1) {
+      const [firstKey] = pendingJoinRequests.keys();
+      targetId = firstKey;
+    } else {
+      let text = `Multiple pending requests. Specify request ID: /link deny <id>`;
+      ctx.ui.notify(text, "info");
+      return;
+    }
 
-  pi.registerCommand("link-start", {
-    description: "Start or switch to a new link session. Usage: /link-start [session-id] [pin]",
-    handler: async (args, _ctx) => {
-      const parts = args.trim().split(/\s+/).filter(Boolean);
-      const newSessionId = parts[0] ? normalizeName(parts[0]) : currentSessionId;
-      const newPin = parts[1] || sessionPin;
+    if (targetId !== null) {
+      denyJoinRequest(targetId);
+    }
+  }
 
-      currentSessionId = newSessionId;
-      sessionPin = newPin;
-      pi.appendEntry("link-session", { sessionId: currentSessionId });
-      pi.appendEntry("link-pin", { pin: sessionPin });
-      saveLinkConfig({ sessionId: currentSessionId, pin: sessionPin });
+  function handleRequests(ctx: ExtensionContext) {
+    if (pendingJoinRequests.size === 0) {
+      ctx.ui.notify("No pending device join requests.", "info");
+      return;
+    }
+    let text = `Pending Device Requests (${pendingJoinRequests.size}):\n`;
+    for (const [id, item] of pendingJoinRequests) {
+      const elapsed = Math.round((Date.now() - item.timestamp) / 1000);
+      text += `  • Request #${id}: "${item.name}" on ${item.host || item.clientIp} (${elapsed}s ago)\n`;
+      text += `    Fingerprint: ${item.fingerprint}\n`;
+      text += `    Approve: /link accept ${id}   Reject: /link deny ${id}\n`;
+    }
+    ctx.ui.notify(text, "info");
+  }
 
-      if (role === "hub") {
-        _ctx.ui.notify(
-          `⚡ Session updated: "${currentSessionId}" on ${networkMode.toUpperCase()} (PIN: ${sessionPin})`,
-          "info",
-        );
-        for (const [clientWs, clientName] of hubClients) {
-          clientWs.send(
-            JSON.stringify({
-              type: "welcome",
-              name: clientName,
-              sessionId: currentSessionId,
-              pin: sessionPin,
-              network: networkMode,
-              terminals: terminalList(),
-            } satisfies WelcomeMsg),
-          );
-        }
-        return;
-      }
-
-      _ctx.ui.notify(`Starting session "${currentSessionId}" as host...`, "info");
-      disconnect();
-      explicitHubMode = true;
-      targetHubAddress = null;
-      manuallyDisconnected = false;
-      pi.appendEntry("link-active", { active: true });
-      await initialize();
-    },
-  });
-
-  pi.registerCommand("link-join", {
-    description: "Join an active link session. Usage: /link-join [session-id | ip[:port] | number] [pin]",
-    handler: async (args, _ctx) => {
-      const parts = args.trim().split(/\s+/).filter(Boolean);
-      const targetArg = parts[0];
-      const pinArg = parts[1];
-
-      if (pinArg) {
-        sessionPin = pinArg;
-        pi.appendEntry("link-pin", { pin: sessionPin });
-        saveLinkConfig({ pin: sessionPin });
-      }
-
-      let chosenHub: DiscoveredHub | null = null;
-      let directTarget: string | null = null;
-
-      if (!targetArg) {
-        _ctx.ui.notify(`Scanning network (Tailscale + LAN) for active sessions...`, "info");
-        const { hubs } = await discoverAllHubs(linkPort, 1200, linkSecret);
-        const candidates = hubs.filter(h => h.hubId !== hubInstanceId && !h.endpoints?.includes(`127.0.0.1:${linkPort}`));
-        if (candidates.length === 0) {
-          _ctx.ui.notify(
-            `No other active sessions found on network.\nStart one with: /link-start ${currentSessionId}`,
-            "warning",
-          );
-          return;
-        }
-        if (candidates.length === 1) {
-          chosenHub = candidates[0];
-        } else {
-          let msg = `Found ${candidates.length} active sessions on network:\n`;
-          candidates.forEach((h, idx) => {
-            msg += `  ${idx + 1}. "${h.sessionId || h.hubName}" on ${h.host} (${h.ip}:${h.port})\n`;
-          });
-          msg += `\nSpecify session to join: /link-join <1-${candidates.length} or session-id>`;
-          _ctx.ui.notify(msg.trim(), "info");
-          return;
-        }
-      } else if (/^\d+$/.test(targetArg) && Number(targetArg) >= 1 && Number(targetArg) <= 20) {
-        const idx = Number(targetArg) - 1;
-        const { hubs } = await discoverAllHubs(linkPort, 1200, linkSecret);
-        const candidates = hubs.filter(h => h.hubId !== hubInstanceId && !h.endpoints?.includes(`127.0.0.1:${linkPort}`));
-        if (candidates[idx]) {
-          chosenHub = candidates[idx];
-        } else {
-          _ctx.ui.notify(`Index ${targetArg} not found among active sessions.`, "warning");
-          return;
-        }
+  function handleDevices(args: string, ctx: ExtensionContext) {
+    const trimmed = args.trim();
+    if (trimmed.startsWith("revoke ")) {
+      const devId = trimmed.slice(7).trim();
+      const removed = removePairedDevice(devId);
+      if (removed) {
+        ctx.ui.notify(`Revoked paired device "${devId}".`, "info");
       } else {
-        const isIp =
-          targetArg.includes(":") ||
-          /^\d+\.\d+\.\d+\.\d+$/.test(targetArg) ||
-          targetArg.startsWith("100.");
-        if (isIp) {
-          directTarget = targetArg;
-        } else {
-          _ctx.ui.notify(
-            `Searching for session "${targetArg}" on network...`,
-            "info",
-          );
-          const { hubs } = await discoverAllHubs(linkPort, 1200, linkSecret);
-          const found = hubs.find(
-            (h) => (h.sessionId === targetArg || h.hubName === targetArg) && h.hubId !== hubInstanceId,
-          );
-          if (found) {
-            chosenHub = found;
-          } else {
-            _ctx.ui.notify(
-              `Session "${targetArg}" not found. Active sessions: ${hubs.filter(h => h.hubId !== hubInstanceId).map((h) => h.sessionId || h.hubName).join(", ") || "none"}`,
-              "warning",
-            );
-            return;
-          }
-        }
+        ctx.ui.notify(`Device "${devId}" not found in paired list.`, "error");
       }
+      return;
+    }
+    const devices = Array.from(loadPairedDevices().values());
+    if (devices.length === 0) {
+      ctx.ui.notify("No paired devices found.", "info");
+      return;
+    }
+    let text = `Paired Devices (${devices.length}):\n`;
+    for (const d of devices) {
+      const dateStr = new Date(d.approvedAt).toLocaleString();
+      text += `  • ${d.name} [${d.deviceId}]\n    Host: ${d.host} | Paired: ${dateStr}\n    Fingerprint: ${d.fingerprint || "none"}\n`;
+    }
+    text += `\nTo revoke a device: /link devices revoke <deviceId>`;
+    ctx.ui.notify(text, "info");
+  }
 
-      if (chosenHub) {
-        targetHubAddress = `${chosenHub.ip}:${chosenHub.port}`;
-        if (chosenHub.sessionId) currentSessionId = chosenHub.sessionId;
-        if (chosenHub.pin) sessionPin = chosenHub.pin;
-        _ctx.ui.notify(
-          `Joining session "${currentSessionId}" on ${chosenHub.host} (${targetHubAddress})...`,
-          "info",
+  async function handleStart(args: string, ctx: ExtensionContext) {
+    const parts = args.trim().split(/\s+/).filter(Boolean);
+    const newSessionId = parts[0] ? normalizeName(parts[0]) : currentSessionId;
+    const newPin = parts[1] || sessionPin;
+
+    currentSessionId = newSessionId;
+    sessionPin = newPin;
+    pi.appendEntry("link-session", { sessionId: currentSessionId });
+    pi.appendEntry("link-pin", { pin: sessionPin });
+    saveLinkConfig({ sessionId: currentSessionId, pin: sessionPin });
+
+    if (role === "hub") {
+      ctx.ui.notify(
+        `⚡ Session updated: "${currentSessionId}" on ${networkMode.toUpperCase()} (PIN: ${sessionPin})`,
+        "info",
+      );
+      for (const [clientWs, clientName] of hubClients) {
+        clientWs.send(
+          JSON.stringify({
+            type: "welcome",
+            name: clientName,
+            sessionId: currentSessionId,
+            pin: sessionPin,
+            network: networkMode,
+            terminals: terminalList(),
+          } satisfies WelcomeMsg),
         );
-      } else if (directTarget) {
-        targetHubAddress = directTarget;
-        _ctx.ui.notify(`Connecting to hub at ${targetHubAddress}...`, "info");
       }
+      return;
+    }
 
-      disconnect();
-      explicitHubMode = false;
-      manuallyDisconnected = false;
-      pi.appendEntry("link-active", { active: true });
-      pi.appendEntry("link-session", { sessionId: currentSessionId });
-      if (sessionPin) pi.appendEntry("link-pin", { pin: sessionPin });
-      saveLinkConfig({ sessionId: currentSessionId, hub: targetHubAddress, pin: sessionPin });
-      await initialize();
-    },
-  });
+    ctx.ui.notify(`Starting session "${currentSessionId}" as host...`, "info");
+    disconnect();
+    explicitHubMode = true;
+    targetHubAddress = null;
+    manuallyDisconnected = false;
+    pi.appendEntry("link-active", { active: true });
+    await initialize();
+  }
 
-  pi.registerCommand("link-leave", {
-    description: "Leave or disconnect from the link session",
-    handler: async (_args, _ctx) => {
-      pi.appendEntry("link-active", { active: false });
-      manuallyDisconnected = true;
-      if (role === "disconnected") {
-        cancelConnectionAttempt();
-        _ctx.ui.notify("Link disconnected", "info");
-        return;
-      }
-      disconnect();
-      _ctx.ui.notify("Left link session. Run /link-join or /link-start to reconnect.", "info");
-    },
-  });
+  async function handleJoin(args: string, ctx: ExtensionContext) {
+    const parts = args.trim().split(/\s+/).filter(Boolean);
+    const targetArg = parts[0];
+    const pinArg = parts[1];
 
-  pi.registerCommand("link-disconnect", {
-    description: "Disconnect from the link (alias for /link-leave)",
-    handler: async (_args, _ctx) => {
-      pi.appendEntry("link-active", { active: false });
-      manuallyDisconnected = true;
-      disconnect();
-      _ctx.ui.notify("Left link session.", "info");
-    },
-  });
-
-  pi.registerCommand("link-network", {
-    description: "Switch network mode between Tailscale and LAN. Usage: /link-network [tailscale|lan]",
-    handler: async (args, _ctx) => {
-      const mode = args.trim().toLowerCase();
-      const net = getNetworkInfo();
-
-      if (!mode) {
-        _ctx.ui.notify(
-          [
-            `⚡ Link Network Mode: ${networkMode.toUpperCase()}`,
-            `  Tailscale IP : ${net.tailscaleIp || "none detected"}`,
-            `  LAN IPs      : ${net.lanIps.join(", ") || "none detected"}`,
-            `\nUsage:`,
-            `  /link-network tailscale (or ts)  Strictly use Tailscale`,
-            `  /link-network lan                Strictly use local network`,
-          ].join("\n"),
-          "info",
-        );
-        return;
-      }
-
-      if (mode === "tailscale" || mode === "ts") {
-        if (!net.tailscaleIp) {
-          _ctx.ui.notify(
-            "⚠️ Warning: Tailscale IP not detected on this machine. Ensure Tailscale is running.",
-            "warning",
-          );
-        }
-        networkMode = "tailscale";
-        pi.appendEntry("link-network", { network: "tailscale" });
-        saveLinkConfig({ network: "tailscale" });
-        _ctx.ui.notify("⚡ Switched to TAILSCALE network mode. Reconnecting...", "info");
-        disconnect();
-        manuallyDisconnected = false;
-        await initialize();
-        return;
-      }
-
-      if (mode === "lan") {
-        networkMode = "lan";
-        pi.appendEntry("link-network", { network: "lan" });
-        saveLinkConfig({ network: "lan" });
-        _ctx.ui.notify("⚡ Switched to LAN network mode. Reconnecting...", "info");
-        disconnect();
-        manuallyDisconnected = false;
-        await initialize();
-        return;
-      }
-
-      _ctx.ui.notify("Unknown network mode. Use '/link-network tailscale' or '/link-network lan'", "warning");
-    },
-  });
-
-  pi.registerCommand("link-pin", {
-    description: "View or update session PIN. Usage: /link-pin [pin]",
-    handler: async (args, _ctx) => {
-      const newPin = args.trim();
-      if (!newPin) {
-        _ctx.ui.notify(
-          [
-            `Session PIN: ${sessionPin}`,
-            `Status: ${networkMode === "tailscale" ? "Tailscale is active — WireGuard automatically verifies peers without requiring PIN." : "LAN mode active — LAN peers require this PIN to join."}`,
-            `To change: /link-pin <new-pin>`,
-          ].join("\n"),
-          "info",
-        );
-        return;
-      }
-      sessionPin = newPin;
+    if (pinArg) {
+      sessionPin = pinArg;
       pi.appendEntry("link-pin", { pin: sessionPin });
       saveLinkConfig({ pin: sessionPin });
-      _ctx.ui.notify(`Session PIN updated to "${sessionPin}"`, "info");
-    },
-  });
+    }
 
-  pi.registerCommand("link-connect", {
-    description: "Connect to or join a link session. Usage: /link-connect [session-id | ip[:port]]",
-    handler: async (args, _ctx) => {
-      const target = normalizeName(args);
-      if (target) {
-        targetHubAddress = target;
-        pi.appendEntry("link-hub", { hub: target });
+    let chosenHub: DiscoveredHub | null = null;
+    let directTarget: string | null = null;
+
+    if (!targetArg) {
+      ctx.ui.notify(`Scanning network (Tailscale + LAN) for active sessions...`, "info");
+      const { hubs } = await discoverAllHubs(linkPort, 1200, linkSecret);
+      const candidates = hubs.filter(h => h.hubId !== hubInstanceId && !h.endpoints?.includes(`127.0.0.1:${linkPort}`));
+      if (candidates.length === 0) {
+        ctx.ui.notify(
+          `No other active sessions found on network.\nStart one with: /link start ${currentSessionId}`,
+          "warning",
+        );
+        return;
       }
-      disconnect();
-      manuallyDisconnected = false;
-      pi.appendEntry("link-active", { active: true });
-      await initialize();
-    },
-  });
-
-  pi.registerCommand("link-name", {
-    description: "Change link name. No arg = use session name",
-    handler: async (args, _ctx) => {
-      let newName = normalizeName(args) ?? "";
-      if (!newName) {
-        // No argument: use session name if available
-        const sessionName = normalizeName(pi.getSessionName());
-        if (sessionName) {
-          newName = sessionName;
+      if (candidates.length === 1) {
+        chosenHub = candidates[0];
+      } else {
+        let msg = `Found ${candidates.length} active sessions on network:\n`;
+        candidates.forEach((h, idx) => {
+          msg += `  ${idx + 1}. "${h.sessionId || h.hubName}" on ${h.host} (${h.ip}:${h.port})\n`;
+        });
+        msg += `\nSpecify session to join: /link join <1-${candidates.length} or session-id>`;
+        ctx.ui.notify(msg.trim(), "info");
+        return;
+      }
+    } else if (/^\d+$/.test(targetArg) && Number(targetArg) >= 1 && Number(targetArg) <= 20) {
+      const idx = Number(targetArg) - 1;
+      const { hubs } = await discoverAllHubs(linkPort, 1200, linkSecret);
+      const candidates = hubs.filter(h => h.hubId !== hubInstanceId && !h.endpoints?.includes(`127.0.0.1:${linkPort}`));
+      if (candidates[idx]) {
+        chosenHub = candidates[idx];
+      } else {
+        ctx.ui.notify(`Index ${targetArg} not found among active sessions.`, "warning");
+        return;
+      }
+    } else {
+      const isIp =
+        targetArg.includes(":") ||
+        /^\d+\.\d+\.\d+\.\d+$/.test(targetArg) ||
+        targetArg.startsWith("100.");
+      if (isIp) {
+        directTarget = targetArg;
+      } else {
+        ctx.ui.notify(
+          `Searching for session "${targetArg}" on network...`,
+          "info",
+        );
+        const { hubs } = await discoverAllHubs(linkPort, 1200, linkSecret);
+        const found = hubs.find(
+          (h) => (h.sessionId === targetArg || h.hubName === targetArg) && h.hubId !== hubInstanceId,
+        );
+        if (found) {
+          chosenHub = found;
         } else {
-          _ctx.ui.notify(
-            `Current name: "${terminalName}". No session name set. Usage: /link-name <name>`,
-            "info",
-          );
-          return;
-        }
-      }
-
-      if (newName === terminalName && newName === preferredName) {
-        _ctx.ui.notify(`Already using "${newName}"`, "info");
-        return;
-      }
-
-      function savePreference() {
-        preferredName = newName;
-        pi.appendEntry("link-name", { name: preferredName });
-      }
-
-      if (newName === terminalName) {
-        savePreference();
-        _ctx.ui.notify(`Saved "${newName}" as preferred link name`, "info");
-        return;
-      }
-
-      // If we're the hub, check uniqueness before persisting
-      if (role === "hub") {
-        // Check if name is taken by another terminal
-        const takenByOther = Array.from(hubClients.values()).includes(newName);
-        if (takenByOther) {
-          _ctx.ui.notify(
-            `Name "${newName}" is already taken by another terminal`,
+          ctx.ui.notify(
+            `Session "${targetArg}" not found. Active sessions: ${hubs.filter(h => h.hubId !== hubInstanceId).map((h) => h.sessionId || h.hubName).join(", ") || "none"}`,
             "warning",
           );
           return;
         }
-        const old = terminalName;
-        terminalName = newName;
-        const list = terminalList();
-        connectedTerminals = list;
-        updateStatus();
-        // Notify clients only — hub already updated local state
-        hubBroadcast(
-          { type: "terminal_left", name: old, terminals: list },
-          terminalName,
+      }
+    }
+
+    if (chosenHub) {
+      targetHubAddress = `${chosenHub.ip}:${chosenHub.port}`;
+      if (chosenHub.sessionId) currentSessionId = chosenHub.sessionId;
+      if (chosenHub.pin) sessionPin = chosenHub.pin;
+      ctx.ui.notify(
+        `Joining session "${currentSessionId}" on ${chosenHub.host} (${targetHubAddress})...`,
+        "info",
+      );
+    } else if (directTarget) {
+      targetHubAddress = directTarget;
+      ctx.ui.notify(`Connecting to hub at ${targetHubAddress}...`, "info");
+    }
+
+    disconnect();
+    explicitHubMode = false;
+    manuallyDisconnected = false;
+    pi.appendEntry("link-active", { active: true });
+    pi.appendEntry("link-session", { sessionId: currentSessionId });
+    if (sessionPin) pi.appendEntry("link-pin", { pin: sessionPin });
+    saveLinkConfig({ sessionId: currentSessionId, hub: targetHubAddress, pin: sessionPin });
+    await initialize();
+  }
+
+  function handleLeave(ctx: ExtensionContext) {
+    pi.appendEntry("link-active", { active: false });
+    manuallyDisconnected = true;
+    if (role === "disconnected") {
+      cancelConnectionAttempt();
+      ctx.ui.notify("Link disconnected", "info");
+      return;
+    }
+    disconnect();
+    ctx.ui.notify("Left link session. Run /link join or /link start to reconnect.", "info");
+  }
+
+  async function handleNetwork(args: string, ctx: ExtensionContext) {
+    const mode = args.trim().toLowerCase();
+    const net = getNetworkInfo();
+
+    if (!mode) {
+      ctx.ui.notify(
+        [
+          `⚡ Link Network Mode: ${networkMode.toUpperCase()}`,
+          `  Tailscale IP : ${net.tailscaleIp || "none detected"}`,
+          `  LAN IPs      : ${net.lanIps.join(", ") || "none detected"}`,
+          `\nUsage:`,
+          `  /link network tailscale (or ts)  Strictly use Tailscale`,
+          `  /link network lan                Strictly use local network`,
+        ].join("\n"),
+        "info",
+      );
+      return;
+    }
+
+    if (mode === "tailscale" || mode === "ts") {
+      if (!net.tailscaleIp) {
+        ctx.ui.notify(
+          "⚠️ Warning: Tailscale IP not detected on this machine. Ensure Tailscale is running.",
+          "warning",
         );
-        hubBroadcast(
-          {
-            type: "terminal_joined",
-            name: newName,
-            terminals: list,
-            cwd: currentCwd,
-            context: captureContext(),
-            host: os.hostname(),
-            project: currentCwd ? path.basename(currentCwd) : undefined,
-          },
-          terminalName,
-        );
-        pushStatus(true);
-        savePreference();
-        _ctx.ui.notify(`Renamed to "${newName}"`, "info");
-      } else if (role === "client") {
-        // Don't update terminalName here — welcome will assign authoritatively
-        // after reconnect. Hub may dedupe newName to newName-2 if taken.
-        savePreference();
-        pendingClientRename = true;
-        ws?.close();
-        _ctx.ui.notify(
-          `Reconnecting, requesting "${newName}" (hub may assign a different name if taken)...`,
+      }
+      networkMode = "tailscale";
+      pi.appendEntry("link-network", { network: "tailscale" });
+      saveLinkConfig({ network: "tailscale" });
+      ctx.ui.notify("⚡ Switched to TAILSCALE network mode. Reconnecting...", "info");
+      disconnect();
+      manuallyDisconnected = false;
+      await initialize();
+      return;
+    }
+
+    if (mode === "lan") {
+      networkMode = "lan";
+      pi.appendEntry("link-network", { network: "lan" });
+      saveLinkConfig({ network: "lan" });
+      ctx.ui.notify("⚡ Switched to LAN network mode. Reconnecting...", "info");
+      disconnect();
+      manuallyDisconnected = false;
+      await initialize();
+      return;
+    }
+
+    ctx.ui.notify("Unknown network mode. Use '/link network tailscale' or '/link network lan'", "warning");
+  }
+
+  function handlePin(args: string, ctx: ExtensionContext) {
+    const newPin = args.trim();
+    if (!newPin) {
+      ctx.ui.notify(
+        [
+          `Session PIN: ${sessionPin}`,
+          `Status: ${networkMode === "tailscale" ? "Tailscale is active — WireGuard automatically verifies peers." : "LAN mode active — LAN peers require this PIN to join."}`,
+          `To change: /link pin <new-pin>`,
+        ].join("\n"),
+        "info",
+      );
+      return;
+    }
+    sessionPin = newPin;
+    pi.appendEntry("link-pin", { pin: sessionPin });
+    saveLinkConfig({ pin: sessionPin });
+    ctx.ui.notify(`Session PIN updated to "${sessionPin}"`, "info");
+  }
+
+  function handleName(args: string, ctx: ExtensionContext) {
+    let newName = normalizeName(args) ?? "";
+    if (!newName) {
+      const sessionName = normalizeName(pi.getSessionName());
+      if (sessionName) {
+        newName = sessionName;
+      } else {
+        ctx.ui.notify(
+          `Current name: "${terminalName}". No session name set. Usage: /link name <name>`,
           "info",
         );
-      } else {
-        savePreference();
-        terminalName = newName;
-        _ctx.ui.notify(`Name set to "${newName}" (not connected)`, "info");
+        return;
       }
-    },
-  });
+    }
 
-  const handleDiscoverCommand = async (_args: string, _ctx: ExtensionContext) => {
-    _ctx.ui.notify("Scanning network (Tailscale + LAN) for active sessions...", "info");
+    if (newName === terminalName && newName === preferredName) {
+      ctx.ui.notify(`Already using "${newName}"`, "info");
+      return;
+    }
+
+    function savePreference() {
+      preferredName = newName;
+      pi.appendEntry("link-name", { name: preferredName });
+    }
+
+    if (newName === terminalName) {
+      savePreference();
+      ctx.ui.notify(`Saved "${newName}" as preferred link name`, "info");
+      return;
+    }
+
+    if (role === "hub") {
+      const takenByOther = Array.from(hubClients.values()).includes(newName);
+      if (takenByOther) {
+        ctx.ui.notify(
+          `Name "${newName}" is already taken by another terminal`,
+          "warning",
+        );
+        return;
+      }
+      const old = terminalName;
+      terminalName = newName;
+      const list = terminalList();
+      connectedTerminals = list;
+      updateStatus();
+      hubBroadcast(
+        { type: "terminal_left", name: old, terminals: list },
+        terminalName,
+      );
+      hubBroadcast(
+        {
+          type: "terminal_joined",
+          name: newName,
+          terminals: list,
+          cwd: currentCwd,
+          context: captureContext(),
+          host: os.hostname(),
+          project: currentCwd ? path.basename(currentCwd) : undefined,
+        },
+        terminalName,
+      );
+      pushStatus(true);
+      savePreference();
+      ctx.ui.notify(`Renamed to "${newName}"`, "info");
+    } else if (role === "client") {
+      savePreference();
+      pendingClientRename = true;
+      ws?.close();
+      ctx.ui.notify(
+        `Reconnecting, requesting "${newName}" (hub may assign a different name if taken)...`,
+        "info",
+      );
+    } else {
+      savePreference();
+      terminalName = newName;
+      ctx.ui.notify(`Name set to "${newName}" (not connected)`, "info");
+    }
+  }
+
+  const handleDiscoverCommand = async (_args: string, ctx: ExtensionContext) => {
+    ctx.ui.notify("Scanning network (Tailscale + LAN) for active sessions...", "info");
     const { hubs, tailnetPeersCount } = await discoverAllHubs(linkPort, 1200, linkSecret);
     const others = hubs.filter(h => h.hubId !== hubInstanceId);
     if (others.length === 0) {
-      _ctx.ui.notify(
+      ctx.ui.notify(
         tailnetPeersCount > 0
           ? `No other active sessions found (${tailnetPeersCount} Tailnet peers & LAN scanned).`
           : "No other active sessions found on network.",
@@ -4949,19 +5357,241 @@ export default function (pi: ExtensionAPI) {
       const terms = (h.terminals || [])
         .map((t) => `${t.name}${t.project ? ` (${t.project})` : ""}`)
         .join(", ");
-      summary += `\n${i + 1}. "${h.sessionId || h.hubName}" on ${h.host} (${h.ip}:${h.port}) [PIN: ${h.pin || "none"}]\n   Peers: ${terms || "1"}\n   Join: /link-join ${i + 1} (or /link-join ${h.sessionId || `${h.ip}:${h.port}`})`;
+      summary += `\n${i + 1}. "${h.sessionId || h.hubName}" on ${h.host} (${h.ip}:${h.port}) [PIN: ${h.pin || "none"}]\n   Peers: ${terms || "1"}\n   Join: /link join ${i + 1} (or /link join ${h.sessionId || `${h.ip}:${h.port}`})`;
     }
-    _ctx.ui.notify(summary.trim(), "info");
+    ctx.ui.notify(summary.trim(), "info");
   };
 
-  pi.registerCommand("link-discover", {
-    description: "Discover active sessions across network",
-    handler: handleDiscoverCommand,
+  async function runLinkDoctor(ctx: ExtensionContext) {
+    const lines: string[] = ["🩺 omp-link Security & System Doctor\n"];
+
+    // 1. Device Identity
+    try {
+      const id = getOrCreateDeviceIdentity();
+      lines.push(`  🔑 Device Identity : OK`);
+      lines.push(`     Device ID   : ${id.deviceId}`);
+      lines.push(`     Fingerprint : ${id.fingerprint}`);
+      lines.push(`     Crypto      : Ed25519 (challenge-response authentication)`);
+    } catch (err: any) {
+      lines.push(`  ❌ Device Identity : FAILED (${err.message})`);
+    }
+
+    // 2. TLS Certificate (LAN security)
+    try {
+      const tls = getOrCreateTlsCert();
+      lines.push(`  🔒 TLS Certificate : OK`);
+      lines.push(`     Fingerprint : ${tls?.fingerprint || "none"}`);
+      lines.push(`     Cipher / Key: ECDSA P-256 (HTTPS / WSS on LAN)`);
+    } catch (err: any) {
+      lines.push(`  ❌ TLS Certificate : FAILED (${err.message})`);
+    }
+
+    // 3. Network Interfaces & Routing
+    const net = getNetworkInfo();
+    lines.push(`  🌐 Network Status  :`);
+    lines.push(`     Active Mode : ${networkMode.toUpperCase()}`);
+    lines.push(`     Tailscale IP: ${net.tailscaleIp || "none detected"}`);
+    lines.push(`     LAN IPs     : ${net.lanIps.join(", ") || "none detected"}`);
+
+    // 4. Session & State
+    lines.push(`  ⚡ Link Session    :`);
+    lines.push(`     Role        : ${role.toUpperCase()}`);
+    lines.push(`     Active      : ${linkActive ? "YES" : "NO"}`);
+    lines.push(`     Session ID  : "${currentSessionId}"`);
+    lines.push(`     Port        : ${linkPort}`);
+    lines.push(`     Peers Online: ${connectedTerminals.length}`);
+
+    // 5. Territorial Sovereignty & Confinement
+    const wsRoot = fs.realpathSync(currentCwd || process.cwd());
+    lines.push(`  🛡️ Territorial Sovereignty :`);
+    lines.push(`     Workspace   : ${wsRoot}`);
+    lines.push(`     Mutation Grd: ${mutationGuard ? "ACTIVE (Enforced)" : "DISABLED"}`);
+    lines.push(`     Active Grants: ${activeExecGrants.size} elevated peer(s)`);
+    if (activeExecGrants.size > 0) {
+      for (const [peer, grant] of activeExecGrants) {
+        const remMin = Math.max(1, Math.round((grant.expiresAt - Date.now()) / 60000));
+        lines.push(`       • ${peer} (${remMin}m remaining)`);
+      }
+    }
+
+    // 6. Paired Devices
+    const paired = loadPairedDevices();
+    lines.push(`  📱 Paired Devices  : ${paired.size} trusted device(s)`);
+    for (const [dId, dev] of paired) {
+      lines.push(`     • ${dev.name} [${dId.slice(0, 8)}...] (FP: ${(dev.fingerprint || "").slice(0, 16)}...)`);
+    }
+
+    // 7. File Inbox
+    const inbox = path.join(os.homedir(), ".omp", "inbox");
+    const inboxExists = fs.existsSync(inbox);
+    lines.push(`  📥 File Inbox      : ${inbox} (${inboxExists ? "Ready" : "Will create on transfer"})`);
+
+    lines.push("\nDiagnostic checks completed. Use '/link help' for available commands.");
+    ctx.ui.notify(lines.join("\n"), "info");
+  }
+
+  function renderLinkHelp(ctx: ExtensionContext) {
+    const help = [
+      "⚡ omp-link Command Reference",
+      "",
+      "Session & Connection:",
+      "  /link                   Show current session status, role, and discovered peers",
+      "  /link on | off          Turn link mesh networking on or off",
+      "  /link join [target]     Join session by ID, IP, or discovery number (/link-join)",
+      "  /link leave             Leave current session (/link-leave)",
+      "  /link start [id] [pin]  Start or switch session as host",
+      "  /link discover          Scan LAN & Tailscale for active sessions",
+      "",
+      "Security & Pairing:",
+      "  /link accept [id]       Approve a pending device join request",
+      "  /link deny [id]         Reject a pending device join request",
+      "  /link requests          List pending device join requests awaiting approval",
+      "  /link devices           List trusted paired devices",
+      "  /link devices revoke <id> Revoke trust for a paired device",
+      "  /link grant <peer> [m]  Grant temporary execution elevation to peer (1-60 mins)",
+      "  /link revoke-grant <peer> Revoke execution elevation immediately",
+      "  /link mutation [on|off] Inspect or toggle Mutation Guard",
+      "",
+      "Configuration & Diagnostics:",
+      "  /link network [ts|lan]  Switch between Tailscale and local LAN mode",
+      "  /link pin [pin]         View or set session PIN",
+      "  /link name [name]       Change terminal display name",
+      "  /link doctor            Run security, cryptographic & network diagnostics (/link-doctor)",
+    ].join("\n");
+    ctx.ui.notify(help, "info");
+  }
+
+  pi.registerCommand("link", {
+    description: "Manage link mesh network, security, and sessions. Usage: /link [subcommand]",
+    handler: async (args, ctx) => {
+      const parts = args.trim().split(/\s+/).filter(Boolean);
+      const subcmd = parts[0]?.toLowerCase();
+      const restArgs = args.trim().slice(parts[0]?.length || 0).trim();
+
+      if (!subcmd || subcmd === "status") {
+        let card = renderStatusCard();
+        if (linkActive && (role === "disconnected" || (role === "hub" && connectedTerminals.length <= 1))) {
+          const { hubs } = await discoverAllHubs(linkPort, 900, linkSecret);
+          const others = hubs.filter(h => h.hubId !== hubInstanceId && !h.endpoints?.includes(`127.0.0.1:${linkPort}`));
+          if (others.length > 0) {
+            card += `\n\n  📡 Discovered active session(s) on network:\n`;
+            others.forEach((h, idx) => {
+              const peerCount = h.terminals ? h.terminals.length : 1;
+              card += `    ${idx + 1}. "${h.sessionId || h.hubName}" on ${h.host} (${h.ip}:${h.port}) · ${peerCount} peer(s)\n`;
+            });
+            card += `  👉 Join with: /link join ${others[0].sessionId || "1"}`;
+          }
+        }
+        ctx.ui.notify(card, (!linkActive || role === "disconnected") ? "warning" : "info");
+        return;
+      }
+
+      switch (subcmd) {
+        case "on":
+        case "start-service":
+        case "enable":
+          await turnLinkOn(ctx);
+          break;
+
+        case "off":
+        case "stop":
+        case "disable":
+          turnLinkOff(ctx);
+          break;
+
+        case "join":
+        case "connect":
+          await handleJoin(restArgs, ctx);
+          break;
+
+        case "leave":
+        case "disconnect":
+          handleLeave(ctx);
+          break;
+
+        case "start":
+          await handleStart(restArgs, ctx);
+          break;
+
+        case "accept":
+          handleAccept(restArgs, ctx);
+          break;
+
+        case "deny":
+          handleDeny(restArgs, ctx);
+          break;
+
+        case "requests":
+          handleRequests(ctx);
+          break;
+
+        case "devices":
+          handleDevices(restArgs, ctx);
+          break;
+
+        case "grant":
+          handleGrant(restArgs, ctx);
+          break;
+
+        case "revoke-grant":
+          handleRevokeGrant(restArgs, ctx);
+          break;
+
+        case "network":
+        case "net":
+          await handleNetwork(restArgs, ctx);
+          break;
+
+        case "pin":
+          handlePin(restArgs, ctx);
+          break;
+
+        case "mutation":
+        case "guard":
+          handleMutationCommand(restArgs, ctx);
+          break;
+
+        case "name":
+          handleName(restArgs, ctx);
+          break;
+
+        case "discover":
+        case "search":
+        case "scan":
+          await handleDiscoverCommand(restArgs, ctx);
+          break;
+
+        case "doctor":
+          await runLinkDoctor(ctx);
+          break;
+
+        case "help":
+        default:
+          renderLinkHelp(ctx);
+          break;
+      }
+    },
   });
 
-  pi.registerCommand("link-search", {
-    description: "Search for active sessions across network",
-    handler: handleDiscoverCommand,
+  pi.registerCommand("link-join", {
+    description: "Join an active link session (alias for /link join)",
+    handler: async (args, ctx) => {
+      await handleJoin(args, ctx);
+    },
+  });
+
+  pi.registerCommand("link-leave", {
+    description: "Leave current link session (alias for /link leave)",
+    handler: async (_args, ctx) => {
+      handleLeave(ctx);
+    },
+  });
+
+  pi.registerCommand("link-doctor", {
+    description: "Run security and system diagnostic checks (alias for /link doctor)",
+    handler: async (_args, ctx) => {
+      await runLinkDoctor(ctx);
+    },
   });
 
   // ── Message renderer ─────────────────────────────────────────────────────

@@ -1,6 +1,6 @@
 {
   "name": "omp-link",
-  "version": "3.1.0",
+  "version": "3.2.0",
   "description": "Multi-machine and Tailnet-aware inter-terminal coordination mesh with E2EE, Direct Tool RPC, and Out-of-band File Transfer for Oh-My-Pi and Pi.",
   "type": "module",
   "author": "alvivar",
@@ -10,6 +10,7 @@
     "pi-link": "bin/pi-link.mjs"
   },
   "scripts": {
+    "test": "node tests/security.test.mjs",
     "setup": "./setup.sh"
   },
   "files": [

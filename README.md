@@ -46,33 +46,32 @@ I have refactored auth.ts and run the test suite. All 14 tests pass.
 
 ---
 
-## Core Slash Commands to Memorize
+## Consolidated Slash Command Interface
 
-All coordination happens directly inside OMP via slash commands:
+All coordination happens directly inside OMP through the unified `/link` command:
 
-| Command | Most Common Usage | Description |
+| Command | Usage | Description |
 |---|---|---|
-| **`/link`** | `/link` | **The Dashboard**: Instant status card showing session ID, network mode, PIN, endpoint, encryption, and online peers. |
-| **`/link off`** | `/link off` | **Deterministic Silence**: Instantly disables the link mesh, terminates connections, and guarantees **zero** reconnect spam or disconnected warnings. |
-| **`/link on`** | `/link on` | **Re-enable**: Re-enables the link mesh and re-connects/re-hosts the project session. |
-| **`/link-join`** | `/link-join`<br>`/link-join [id] [pin]` | **Connect**: With no arguments, scans your network and **auto-joins** the active session! Or specify session ID / IP and PIN. |
-| **`/link-start`** | `/link-start [id] [pin]` | **Host**: Start or switch to hosting a session with a custom ID or PIN. |
-| **`/link-accept`** | `/link-accept [id]` | **Approve Pairing**: Approve a new device's join request and issue a permanent token. |
-| **`/link-deny`** | `/link-deny [id]` | **Reject Pairing**: Reject a new device's join request. |
-| **`/link-requests`** | `/link-requests` | **Pairing Queue**: View all pending join requests awaiting host approval. |
-| **`/link-devices`** | `/link-devices`<br>`/link-devices revoke <id>` | **Device Tokens**: List paired devices or revoke a device's permanent token. |
-| **`/link-exec-mode`**| `/link-exec-mode [allow\|block]`| **Exec Mode**: Inspect or toggle remote arbitrary shell command execution. |
-| **`/link-mutation`** | `/link-mutation`<br>`/link-mutation [on\|off\|log]` | **Mutation Guard**: Inspect, toggle, or view the real-time blocked command audit log. |
-| **`/link-leave`** | `/link-leave` | **Disconnect**: Cleanly leave the session and release the network port. |
+| **`/link`** | `/link` | **Dashboard**: Live status card showing session ID, network mode, endpoint, peers, and cryptographic fingerprints. |
+| **`/link on` / `/link off`** | `/link on`<br>`/link off` | **Deterministic Mesh Control**: Enable or cleanly disable the mesh, stopping all background sockets and retries. |
+| **`/link join`** | `/link join`<br>`/link join [id\|ip] [pin]` | **Connect**: With no arguments, auto-discovers active sessions! Or specify session ID / IP and PIN. *(Alias: `/link-join`)* |
+| **`/link leave`** | `/link leave` | **Disconnect**: Cleanly leave the session and release network ports. *(Alias: `/link-leave`)* |
+| **`/link start`** | `/link start [id] [pin]` | **Host**: Start or switch to hosting a session with a custom ID or PIN. |
+| **`/link accept` / `/link deny`** | `/link accept [id]`<br>`/link deny [id]` | **Pairing Governance**: Approve or reject pending device join requests with Ed25519 key verification. |
+| **`/link requests`** | `/link requests` | **Pairing Queue**: View all pending device join requests awaiting host approval. |
+| **`/link devices`** | `/link devices`<br>`/link devices revoke <id>` | **Trusted Devices**: List paired devices and fingerprints or revoke a device's trust. |
+| **`/link grant`** | `/link grant <peer> [min]` | **Territorial Sovereignty Elevation**: Grant temporary (1–60 min) shell execution elevation to a trusted peer. |
+| **`/link revoke-grant`** | `/link revoke-grant <peer>` | **Revoke Elevation**: Immediately cancel active execution elevation for a peer. |
+| **`/link mutation`** | `/link mutation`<br>`/link mutation [on\|off\|log]` | **Mutation Guard**: Inspect, toggle, or view the real-time blocked mutation audit log. |
+| **`/link network`** | `/link network [tailscale\|lan]` | **Interface Selection**: Switch between Tailscale and LAN mode. |
+| **`/link doctor`** | `/link doctor` | **System & Security Diagnostics**: Comprehensive check of Ed25519 identity, TLS certificate, confinement, and ports. *(Alias: `/link-doctor`)* |
+| **`/link pin`** | `/link pin [pin]` | **LAN Security**: View or set session PIN for LAN connections. |
+| **`/link name`** | `/link name [name]` | **Mesh Identity**: Change terminal display name across the swarm. |
+| **`/link discover`** | `/link discover` | **Network Scan**: Scan active network interfaces and list all discovered sessions. |
+| **`/link help`** | `/link help` | **Command Reference**: Print comprehensive summary of all `/link` subcommands. |
 
-### Secondary Slash Commands & Environment Flags
-- `/link-network <tailscale | lan>`: Switch between Tailscale (WireGuard auto-auth) and LAN mode.
-- `/link-discover`: Scan the active network and list all available sessions.
-- `/link-pin [pin]`: Inspect or set a new 4-digit PIN for LAN mode.
-- `/link-name [name]`: Change your terminal's display name on the mesh.
-- `OMP_LINK_OFF=1` or `omp --no-link`: Launch OMP with link completely disabled from startup.
-- `OMP_LINK_EXEC_MODE=allow`: Allow remote arbitrary shell execution by default.
-- `OMP_LINK_ALLOW_MUTATION=1`: Disable the Mutation Guard to allow unrestricted remote shell execution.
+> [!NOTE]
+> To preserve a clean command palette, all operations are consolidated under `/link <subcommand>`, while preserving only 3 essential convenience aliases: `/link-join`, `/link-leave`, and `/link-doctor`.
 
 ---
 
@@ -166,45 +165,47 @@ When you send a message with `link_send` and wait for a reply, the turn takes 15
 
 ---
 
-## Security & End-to-End Encryption (E2EE) Model
+## Security & Cryptographic Architecture
 
-`omp-link` incorporates military-grade, zero-dependency cryptographic security across both local LAN and Tailscale networks:
+`omp-link` provides zero-dependency, defense-in-depth cryptographic security across both local LAN and Tailscale networks:
 
-1. **Native End-to-End Encryption (AES-256-GCM)**:
-   - Every payload on the wire (messages, tool RPC commands, outputs, file chunks) is encrypted using native Node.js hardware-accelerated `aes-256-gcm`.
-   - Keys are derived via **PBKDF2-HMAC-SHA256** (50,000 rounds) using a cryptographically isolated session salt (`omp-link-salt-<sessionId>`).
-   - Encryption takes less than 0.05ms per message and eliminates plaintext eavesdropping on untrusted Wi-Fi or public networks.
-2. **Cryptographic Tamper Resistance (GCM Auth Tag)**:
-   - Each frame carries a 128-bit authentication tag and a fresh 12-byte initialization vector (IV).
-   - Any packet modification or replay attempt causes an immediate GCM authentication failure and is dropped silently before parsing.
-3. **Dual-Tier Network Isolation**:
-   - **Tailscale Mode**: Strict binding to `100.64.0.0/10` with WireGuard kernel-level identity verification. PINs are optional.
-   - **LAN Mode**: Subnet binding with mandatory 4-digit PIN authentication. Non-matching PINs are rejected with `4001: Invalid session PIN`.
-4. **Always-Prompt First-Time Pairing ("Request Mode")**:
-   - Any new or unpaired device connecting across LAN or Tailscale is placed into a host-controlled pairing queue.
-   - The host terminal alerts in real time (`🔔 [Link Request #1] "<name>" requested to join...`) and requires human approval via `/link-accept 1` (or `/link-deny 1`).
-   - Approved devices receive a cryptographically unique permanent device token saved in `~/.omp/paired-devices.json` and client's `~/.omp/client-tokens.json`, allowing instant automatic reconnection for paired nodes without repeated prompts.
-5. **Structured Inspection Operations (No-Shell `execFile`)**:
-   - Direct Tool RPC eliminates shell execution (`exec`) in favor of fixed, deterministic operations: `git_status`, `git_diff` (`--no-ext-diff`, `--no-textconv`), `git_log` (bounded 1–100 commits), `search_text` (`git grep`), `read_file`, and `list_dir`.
-   - Operations execute directly via `execFile`, eliminating shell metacharacter injections, parameter expansion, and pipe tampering.
-6. **Canonical Path Confinement & Traversal Defense**:
-   - `resolveConfinedPath` enforces canonical `fs.realpath` verification against the workspace root.
+1. **Cryptographic Device Identities & Pairing (Ed25519 TOFU)**:
+   - Each terminal generates an Ed25519 identity keypair (`~/.omp/identity.json`) with an authenticable SHA-256 fingerprint.
+   - Private keys and bearer credentials never cross the wire. Authentication uses cryptographic challenge-response nonces signed with Ed25519.
+   - When a new device connects, the host displays its public key fingerprint for verification (`🔔 [Link Request #1] "<name>" (FP: 7B:19:52:AF...)`). Host approves via `/link accept 1`.
+2. **Forward-Secret Wire Encryption (Ephemeral X25519 + HKDF-SHA256)**:
+   - Prior to message exchange, connecting nodes perform an ephemeral **X25519** Diffie-Hellman key agreement.
+   - A forward-secret 256-bit symmetric session key is derived using **HKDF-SHA256**. Compromise of long-term identity keys or past sessions cannot decrypt future or historical traffic.
+   - Enforces strict plaintext frame rejection after handshake: any unencrypted frame received after initialization is dropped immediately without fallback.
+3. **Authenticated Additional Data (AAD) & Replay Defense**:
+   - Every wire frame binds protocol version (`v: 4`), monotonic sequence counter (`seq`), unique message ID (`mid`), sender identity (`from`), and timestamp (`ts`) into the AES-256-GCM Authenticated Additional Data buffer.
+   - Any tampering with header fields, frame ordering, or payload results in immediate GCM authentication tag rejection.
+   - A bounded replay cache (`seenMessageIds`) deterministically drops duplicated or delayed packets.
+4. **Self-Signed ECDSA TLS on LAN (Certificate Pinning)**:
+   - In LAN mode, `omp-link` generates a self-signed ECDSA (P-256) TLS certificate (`~/.omp/tls/`), serving over `https://` and `wss://`.
+   - Protects local network transport against passive network observers, with peer certificate fingerprints verified during pairing.
+5. **Passive & Sanitized Subprocess Execution (`safeGitExecFile`)**:
+   - Structured git operations (`git_status`, `git_diff`, `git_log`, `search_text`) execute via `execFile` (never a shell) using sanitized environments.
+   - Prepend passive flags: `-c core.fsmonitor=false -c core.pager=cat -c pager.status=false -c pager.diff=false -c pager.log=false -c diff.external=`.
+   - Strips dangerous environment variables (`LD_PRELOAD`, `NODE_OPTIONS`, `GIT_DIR`, `GIT_WORK_TREE`, `GIT_CONFIG`, etc.) and sets `GIT_CONFIG_NOSYSTEM=1`, `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_TERMINAL_PROMPT=0`.
+6. **Canonical Path Confinement (`resolveConfinedPath`)**:
+   - Enforces canonical `fs.realpath` verification against the workspace root for both `params.cwd` and file targets.
    - Rejects directory traversal escapes (`../`), symlink bypasses, null bytes, and sensitive files (`.env*`, `.git/*`, `id_rsa`, `id_ed25519`, `*.pem`, `*.key`, credentials, secrets).
-7. **Hardened 50MB Quarantine Inboxes**:
-   - Incoming file transfers save strictly into `.omp/inbox/<transferId>/<safeFilename>`, ensuring peer files can never overwrite or collide with project code.
-   - 50MB transfer ceiling prevents memory exhaustion or buffer overflow.
+7. **Hardened Streaming File Inbox & DoS Protection**:
+   - `transferId` is strictly validated (`^[a-zA-Z0-9_-]{1,64}$`).
+   - Transfers stream in bounded 64KB chunks directly to disk (`.tmp-<id>.part` with mode `0600`), bounding RAM consumption to 64KB regardless of transfer size.
+   - Strict verification of `totalChunks`, byte limits, and SHA-256 integrity before atomically renaming to destination.
 8. **Sanitized Public Discovery (`GET /status`)**:
-   - Unauthenticated network probes receive minimal safe telemetry (`{ service: "omp-link", version: "3.1.0", active: true, authRequired: true }`).
-   - Completely conceals host file paths, working directories, active peers, and session PINs unless authenticated with a paired token or PIN.
-9. **Deterministic Link ON/OFF & Circuit Breaker**:
-   - Run `/link off` to completely detach from the mesh, terminate listeners, and suppress all background reconnect loops.
-   - 3-strike circuit breaker: after 3 consecutive failed reconnection attempts, OMP ceases dialing and stays silent until explicit user activation (`/link on` or `/link-join`).
-10. **Territorial Sovereignty & The Mutation Guard**:
-   - **The Problem**: In multi-machine swarms, an eager agent on Machine A that spots a bug on Machine B might attempt to directly edit, overwrite, or commit code on Machine B, clobbering Machine B's working tree and desynchronizing its LLM context.
+   - Unauthenticated discovery requests receive minimal safe telemetry (`{ service: "omp-link", protocolVersion: 4, instanceId, pairingRequired: true, fingerprint, tls }`).
+   - Fully conceals host paths, working directories, active peers, and tokens. Query-string credential passing is strictly rejected. `Cache-Control: no-store` prevents intermediate caching.
+9. **Territorial Sovereignty & Ephemeral Execution Elevation**:
    - **The Principle**: Every agent is the sole authoritative writer of its own local workspace.
-   - **Deterministic Blocking**: Arbitrary remote command execution (`action: "exec"`) is disabled by default. Common read-only commands like `git status` or `git diff` automatically route to safe structured inspection operations.
-   - **The Guard**: If execution is unlocked via `/link-exec-mode allow`, the **Mutation Guard** continues enforcing read-only sovereignty by blocking mutating commands (`rm`, `sed -i`, `git commit`, `chmod`, `>`/`>>` redirects, and package updates).
-   - **Monitoring & Audit Log**: Blocked attempts are alerted on-screen in real time (`🛡️ [Mutation Guard] BLOCKED...`) and recorded in a live audit log viewable via `/link-mutation log`.
+   - **Deterministic Blocking**: Arbitrary remote command execution (`action: "exec"`) is disabled by default. Read-only commands like `git status` or `git diff` transparently route to safe structured inspection operations.
+   - **Temporary Elevation**: When a remote peer genuinely needs to execute commands, the host can grant temporary elevation via `/link grant <peer> [minutes]`. Grants automatically expire and are logged in `~/.omp/audit.log`.
+   - **Mutation Guard**: Protects working trees by blocking destructive commands (`rm`, `sed -i`, `git commit`, `chmod`, `>`/`>>` redirects, and package installations).
+10. **Deterministic Silence & Diagnostic Doctor**:
+   - Run `/link off` to completely detach from the mesh, terminate listeners, and suppress background reconnect loops.
+   - Run `/link doctor` (or `/link-doctor`) to verify cryptographic key generation, TLS certificates, workspace confinement, and network interfaces.
 
 ---
 

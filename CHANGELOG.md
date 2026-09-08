@@ -4,6 +4,39 @@ All notable changes to pi-link are documented here.
 
 This changelog is based on the git history from `2026-03-21` (initial commit) through the present. Versions correspond to npm publishes.
 
+## 3.2.0 — 2026-09-08
+
+### Cryptographic Identities, Forward-Secret Session Keys & Slash Command Consolidation
+
+- **Ed25519 Challenge-Response Device Identities (TOFU)**:
+  - Eliminated bearer token transmission over the wire.
+  - Every node generates an Ed25519 identity keypair (`~/.omp/identity.json`) with an authenticable SHA-256 fingerprint.
+  - Hub issues 32-byte nonces; joining devices sign challenges with Ed25519.
+  - Host displays public key fingerprints during pairing (`/link accept <id>`).
+- **Forward-Secret Wire Encryption (Ephemeral X25519 + HKDF-SHA256)**:
+  - Ephemeral X25519 Diffie-Hellman key agreement derives 256-bit AES-GCM session keys via HKDF-SHA256 with salt and info binding.
+  - Strict plaintext frame rejection: unencrypted frames after handshake are dropped immediately with zero fallback.
+  - Authenticated Additional Data (AAD) binds protocol version (`v: 4`), monotonic sequence counter (`seq`), unique message ID (`mid`), sender (`from`), and timestamp (`ts`).
+  - Bounded replay cache (`seenMessageIds`) prevents packet replay or injection.
+- **Self-Signed ECDSA TLS on LAN (Certificate Pinning)**:
+  - Generates self-signed ECDSA (P-256) TLS certificate (`~/.omp/tls/`), serving over `https://` and `wss://` in LAN mode to protect traffic against LAN observers.
+- **Passive Subprocess Execution (`safeGitExecFile`)**:
+  - Injected safe flags: `-c core.fsmonitor=false -c core.pager=cat -c pager.status=false -c pager.diff=false -c pager.log=false -c diff.external=`.
+  - Sanitized environment strips `LD_PRELOAD`, `NODE_OPTIONS`, `GIT_DIR`, `GIT_WORK_TREE`, `GIT_CONFIG`, etc., and sets `GIT_CONFIG_NOSYSTEM=1`, `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_TERMINAL_PROMPT=0`.
+- **Hardened Streaming File Inbox**:
+  - Validates `transferId` (`^[a-zA-Z0-9_-]{1,64}$`) and bounds chunks to 64KB.
+  - Streams chunks directly to disk (`.tmp-<id>.part` with mode `0600`) with streaming SHA-256 hash calculation, strictly bounding memory to 64KB.
+  - Enforces concurrent transfer limits (2 per peer, 5 total).
+- **Ephemeral Peer Execution Elevation**:
+  - Removed persistent global `execMode: "allow"`.
+  - Hosts grant temporary (1–60 min) shell elevation via `/link grant <peer> [minutes]`. Grants auto-expire, revoke on disconnect, and log to `~/.omp/audit.log`.
+  - Read-only git commands transparently route to `safeGitExecFile` without requiring elevation.
+- **Consolidated Slash Command Interface**:
+  - Consolidated 15+ disparate slash commands into a single master command `/link [subcommand]` (`on`, `off`, `join`, `leave`, `start`, `accept`, `deny`, `requests`, `devices`, `grant`, `revoke-grant`, `network`, `pin`, `mutation`, `doctor`, `help`).
+  - Kept only 3 convenience aliases: `/link-join`, `/link-leave`, `/link-doctor`.
+- **Automated Security Test Suite**:
+  - Added in-tree `tests/security.test.mjs` running via `npm test` verifying path confinement, sanitized execution, discovery sanitization, Ed25519 signing, forward secrecy, replay defense, streaming inboxes, and ephemeral grants (48/48 tests passing).
+
 ## 3.1.0 — 2026-09-07
 
 ### Security Hardening, Pairing Governance & Structured RPC Operations
