@@ -17,7 +17,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { execSync, exec } from "node:child_process";
+import { execSync, exec, execFile } from "node:child_process";
 import * as crypto from "node:crypto";
 import * as dgram from "node:dgram";
 import * as fs from "node:fs";
@@ -60,6 +60,8 @@ interface RegisterMsg {
   host?: string;
   project?: string;
   token?: string;
+  deviceId?: string;
+  deviceToken?: string;
 }
 interface WelcomeMsg {
   type: "welcome";
@@ -73,6 +75,17 @@ interface WelcomeMsg {
   contexts?: Record<string, ContextSnapshot>;
   hosts?: Record<string, string>;
   projects?: Record<string, string>;
+  deviceToken?: string;
+}
+interface PairingPendingMsg {
+  type: "pairing_pending";
+  requestId: number;
+  hubHost: string;
+  message: string;
+}
+interface PairingDeniedMsg {
+  type: "pairing_denied";
+  message: string;
 }
 interface TerminalJoinedMsg {
   type: "terminal_joined";
@@ -129,11 +142,21 @@ interface RpcRequestMsg {
   id: string;
   from: string;
   to: string;
-  action: "exec" | "read_file" | "list_dir";
+  action:
+    | "exec"
+    | "read_file"
+    | "list_dir"
+    | "git_status"
+    | "git_diff"
+    | "git_log"
+    | "search_text";
   params: {
     command?: string;
     cwd?: string;
     filePath?: string;
+    count?: number;
+    pattern?: string;
+    authToken?: string;
   };
 }
 
@@ -210,7 +233,9 @@ type LinkMessage =
   | FileOfferMsg
   | FileChunkMsg
   | FileAckMsg
-  | EncryptedMsg;
+  | EncryptedMsg
+  | PairingPendingMsg
+  | PairingDeniedMsg;
 
 /**
  * True when Pi is at or above MIN_PI_VERSION. A fixed floor needs an ordered compare
@@ -341,6 +366,12 @@ function isTailscaleOrLocalIp(ip?: string): boolean {
   return false;
 }
 
+function isLocalhost(ip?: string): boolean {
+  if (!ip) return false;
+  const cleanIp = ip.startsWith("::ffff:") ? ip.slice(7) : ip;
+  return cleanIp === "127.0.0.1" || cleanIp === "::1" || cleanIp === "localhost";
+}
+
 interface LinkConfig {
   hub?: string;
   port?: number;
@@ -351,6 +382,218 @@ interface LinkConfig {
   network?: "tailscale" | "lan";
   sessionId?: string;
   pin?: string;
+  execMode?: "allow" | "block";
+}
+
+// ─── Device Identity & Pairing Storage ───────────────────────────────────────
+
+interface DeviceIdentity {
+  deviceId: string;
+  name: string;
+  host: string;
+}
+
+interface PairedDevice {
+  deviceId: string;
+  token: string;
+  name: string;
+  host: string;
+  approvedAt: number;
+  allowExecution?: boolean;
+}
+
+function getOmpDir(): string {
+  const dir = path.join(os.homedir(), ".omp");
+  if (!fs.existsSync(dir)) {
+    try {
+      fs.mkdirSync(dir, { recursive: true });
+    } catch {}
+  }
+  return dir;
+}
+
+function getOrCreateDeviceIdentity(): DeviceIdentity {
+  const ompDir = getOmpDir();
+  const idFile = path.join(ompDir, "link-device.json");
+  if (fs.existsSync(idFile)) {
+    try {
+      const data = JSON.parse(fs.readFileSync(idFile, "utf-8"));
+      if (data && data.deviceId) return data;
+    } catch {}
+  }
+  const identity: DeviceIdentity = {
+    deviceId: `dev-${crypto.randomBytes(8).toString("hex")}`,
+    name: os.hostname(),
+    host: os.hostname(),
+  };
+  try {
+    fs.writeFileSync(idFile, JSON.stringify(identity, null, 2), "utf-8");
+  } catch {}
+  return identity;
+}
+
+function loadPairedDevices(): Map<string, PairedDevice> {
+  const ompDir = getOmpDir();
+  const file = path.join(ompDir, "paired-devices.json");
+  const map = new Map<string, PairedDevice>();
+  if (fs.existsSync(file)) {
+    try {
+      const data = JSON.parse(fs.readFileSync(file, "utf-8"));
+      if (Array.isArray(data)) {
+        for (const item of data) {
+          if (item && item.deviceId) map.set(item.deviceId, item);
+        }
+      } else if (typeof data === "object" && data !== null) {
+        for (const [k, v] of Object.entries(data)) {
+          if (v && typeof v === "object" && (v as PairedDevice).deviceId) {
+            map.set(k, v as PairedDevice);
+          }
+        }
+      }
+    } catch {}
+  }
+  return map;
+}
+
+function savePairedDevice(device: PairedDevice): void {
+  const map = loadPairedDevices();
+  map.set(device.deviceId, device);
+  const ompDir = getOmpDir();
+  const file = path.join(ompDir, "paired-devices.json");
+  const obj: Record<string, PairedDevice> = {};
+  for (const [k, v] of map) obj[k] = v;
+  try {
+    fs.writeFileSync(file, JSON.stringify(obj, null, 2), "utf-8");
+  } catch {}
+}
+
+function removePairedDevice(deviceId: string): boolean {
+  const map = loadPairedDevices();
+  const deleted = map.delete(deviceId);
+  if (deleted) {
+    const ompDir = getOmpDir();
+    const file = path.join(ompDir, "paired-devices.json");
+    const obj: Record<string, PairedDevice> = {};
+    for (const [k, v] of map) obj[k] = v;
+    try {
+      fs.writeFileSync(file, JSON.stringify(obj, null, 2), "utf-8");
+    } catch {}
+  }
+  return deleted;
+}
+
+function loadClientTokens(): Map<string, string> {
+  const ompDir = getOmpDir();
+  const file = path.join(ompDir, "client-tokens.json");
+  const map = new Map<string, string>();
+  if (fs.existsSync(file)) {
+    try {
+      const data = JSON.parse(fs.readFileSync(file, "utf-8"));
+      if (data && typeof data === "object") {
+        for (const [k, v] of Object.entries(data)) {
+          if (typeof v === "string") map.set(k, v);
+        }
+      }
+    } catch {}
+  }
+  return map;
+}
+
+function saveClientToken(hubKey: string, token: string): void {
+  const map = loadClientTokens();
+  map.set(hubKey, token);
+  const ompDir = getOmpDir();
+  const file = path.join(ompDir, "client-tokens.json");
+  const obj: Record<string, string> = {};
+  for (const [k, v] of map) obj[k] = v;
+  try {
+    fs.writeFileSync(file, JSON.stringify(obj, null, 2), "utf-8");
+  } catch {}
+}
+
+// ─── Workspace Canonical Path Confinement ───────────────────────────────────
+
+const SENSITIVE_PATTERNS = [
+  /^\.env(\..+)?$/i,
+  /id_rsa/i,
+  /id_ed25519/i,
+  /\.pem$/i,
+  /\.key$/i,
+  /^\.git([\\/].*)?$/i,
+  /[\\/]\.git([\\/].*)?$/i,
+  /credentials/i,
+  /secrets?(\.json|\.ya?ml)?$/i,
+];
+
+function resolveConfinedPath(
+  baseDir: string,
+  requestedPath: string,
+): { allowed: boolean; fullPath?: string; reason?: string } {
+  if (!requestedPath || typeof requestedPath !== "string") {
+    return { allowed: false, reason: "Missing path parameter" };
+  }
+  if (requestedPath.includes("\0")) {
+    return { allowed: false, reason: "Null bytes forbidden in path" };
+  }
+
+  let canonicalBase: string;
+  try {
+    canonicalBase = fs.realpathSync(baseDir || process.cwd());
+  } catch (err: any) {
+    return { allowed: false, reason: `Base directory invalid: ${err.message}` };
+  }
+
+  const baseName = path.basename(requestedPath);
+  for (const pattern of SENSITIVE_PATTERNS) {
+    if (pattern.test(baseName) || pattern.test(requestedPath)) {
+      return {
+        allowed: false,
+        reason: `Access to sensitive file or pattern "${baseName}" is blocked`,
+      };
+    }
+  }
+
+  const candidate = path.isAbsolute(requestedPath)
+    ? path.resolve(requestedPath)
+    : path.resolve(canonicalBase, requestedPath);
+
+  if (fs.existsSync(candidate)) {
+    try {
+      const realCandidate = fs.realpathSync(candidate);
+      if (
+        realCandidate !== canonicalBase &&
+        !realCandidate.startsWith(canonicalBase + path.sep)
+      ) {
+        return {
+          allowed: false,
+          reason: `Symlink or path traversal escaped workspace root (${canonicalBase})`,
+        };
+      }
+      const realBaseName = path.basename(realCandidate);
+      for (const pattern of SENSITIVE_PATTERNS) {
+        if (pattern.test(realBaseName) || pattern.test(realCandidate)) {
+          return {
+            allowed: false,
+            reason: `Access to sensitive file or pattern "${realBaseName}" is blocked`,
+          };
+        }
+      }
+      return { allowed: true, fullPath: realCandidate };
+    } catch (err: any) {
+      return { allowed: false, reason: `Path resolution error: ${err.message}` };
+    }
+  } else {
+    if (
+      candidate !== canonicalBase &&
+      !candidate.startsWith(canonicalBase + path.sep)
+    ) {
+      return {
+        allowed: false,
+        reason: `Path escapes workspace root (${canonicalBase})`,
+      };
+    }
+    return { allowed: true, fullPath: candidate };
+  }
 }
 
 function loadLinkConfig(): LinkConfig {
@@ -483,27 +726,32 @@ async function discoverTailnetHubs(
 ): Promise<{ peersCount: number; hubs: DiscoveredHub[] }> {
   const peers = getTailnetPeers(true);
   if (peers.length === 0) return { peersCount: 0, hubs: [] };
+  const clientTokens = loadClientTokens();
   const results = await Promise.all(
     peers.map(async (peer) => {
       try {
+        const headers: Record<string, string> = {};
+        const savedTok = clientTokens.get(peer.ip) || clientTokens.get("default");
+        if (savedTok) headers["x-link-token"] = savedTok;
         const res = await fetch(`http://${peer.ip}:${port}/status`, {
+          headers,
           signal: AbortSignal.timeout(timeoutMs),
         });
         if (res.ok) {
           const payload = (await res.json()) as any;
-          if (payload && payload.hub && Array.isArray(payload.terminals)) {
+          if (payload && (payload.hub || payload.service === "omp-link")) {
             return {
-              hubId: payload.hubId,
-              sessionId: payload.sessionId,
+              hubId: payload.hubId || `hub_${peer.ip}_${port}`,
+              sessionId: payload.sessionId || "team-link",
               pin: payload.pin,
-              network: payload.network,
+              network: payload.network || "tailscale",
               host: peer.host,
               ip: peer.ip,
               port,
-              hubName: payload.hub,
+              hubName: payload.hub || peer.host,
               dns: peer.dns,
               os: peer.os,
-              terminals: payload.terminals,
+              terminals: Array.isArray(payload.terminals) ? payload.terminals : [],
               source: "tailscale" as const,
               endpoints: [`${peer.ip}:${port}`],
             };
@@ -639,18 +887,18 @@ async function discoverAllHubs(
     });
     if (res.ok) {
       const payload = (await res.json()) as any;
-      if (payload && payload.hub && Array.isArray(payload.terminals)) {
+      if (payload && (payload.hub || payload.service === "omp-link")) {
         registerHub(
           {
-            hubId: payload.hubId,
-            sessionId: payload.sessionId,
+            hubId: payload.hubId || `hub_127.0.0.1_${port}`,
+            sessionId: payload.sessionId || "team-link",
             pin: payload.pin,
-            network: payload.network,
+            network: payload.network || "local",
             host: payload.host || "localhost",
             ip: "127.0.0.1",
             port,
-            hubName: payload.hub,
-            terminals: payload.terminals,
+            hubName: payload.hub || "localhost",
+            terminals: Array.isArray(payload.terminals) ? payload.terminals : [],
             source: "local" as any,
           },
           payload,
@@ -660,26 +908,32 @@ async function discoverAllHubs(
   } catch {}
 
   if (lanHubs.length > 0) {
+    const clientTokens = loadClientTokens();
     await Promise.all(
       lanHubs.map(async (lan) => {
         try {
+          const headers: Record<string, string> = {};
+          const savedTok = clientTokens.get(lan.ip) || clientTokens.get("default");
+          if (savedTok) headers["x-link-token"] = savedTok;
+          if (secret) headers["x-link-token"] = secret;
           const res = await fetch(`http://${lan.ip}:${lan.port}/status`, {
+            headers,
             signal: AbortSignal.timeout(500),
           });
           if (res.ok) {
             const payload = (await res.json()) as any;
-            if (payload && payload.hub && Array.isArray(payload.terminals)) {
+            if (payload && (payload.hub || payload.service === "omp-link")) {
               registerHub(
                 {
-                  hubId: payload.hubId,
-                  sessionId: payload.sessionId,
+                  hubId: payload.hubId || `hub_${lan.ip}_${lan.port}`,
+                  sessionId: payload.sessionId || "team-link",
                   pin: payload.pin,
-                  network: payload.network,
+                  network: payload.network || "lan",
                   host: payload.host || lan.host,
                   ip: lan.ip,
                   port: lan.port,
-                  hubName: payload.hub,
-                  terminals: payload.terminals,
+                  hubName: payload.hub || lan.host,
+                  terminals: Array.isArray(payload.terminals) ? payload.terminals : [],
                   source: "lan",
                 },
                 payload,
@@ -885,6 +1139,65 @@ export default function (pi: ExtensionAPI) {
 
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   let startupConnectTimer: ReturnType<typeof setTimeout> | null = null;
+
+  // ── Remote Execution State (Territorial Sovereignty) ──
+  // Arbitrary command execution is blocked by default as a hard deterministic rule.
+  let remoteExecAllowed =
+    process.env.OMP_LINK_EXEC_MODE === "allow" ||
+    config.execMode === "allow" ||
+    false;
+  let remoteExecAuthToken = process.env.OMP_LINK_EXEC_TOKEN || undefined;
+
+  // ── Device Pairing & Request Mode State ──
+  interface PendingJoinRequest {
+    id: number;
+    ws: WebSocket;
+    msg: RegisterMsg;
+    clientIp: string;
+    timestamp: number;
+    complete: (issuedToken?: string) => void;
+  }
+  const pendingJoinRequests = new Map<number, PendingJoinRequest>();
+  let nextPairingRequestId = 1;
+
+  function approveJoinRequest(reqId: number): boolean {
+    const req = pendingJoinRequests.get(reqId);
+    if (!req) return false;
+    pendingJoinRequests.delete(reqId);
+
+    const token = "tok-" + crypto.randomBytes(16).toString("hex");
+    const deviceId = req.msg.deviceId || `dev-${crypto.randomBytes(8).toString("hex")}`;
+    savePairedDevice({
+      deviceId,
+      token,
+      name: req.msg.name,
+      host: req.msg.host || req.clientIp,
+      approvedAt: Date.now(),
+    });
+
+    req.complete(token);
+    notify(`✅ Approved device "${req.msg.name}" (#${reqId}). Permanent device token issued.`, "info");
+    return true;
+  }
+
+  function denyJoinRequest(reqId: number): boolean {
+    const req = pendingJoinRequests.get(reqId);
+    if (!req) return false;
+    pendingJoinRequests.delete(reqId);
+
+    try {
+      req.ws.send(
+        serializeForWire({
+          type: "pairing_denied",
+          message: "Join request was rejected by host.",
+        } satisfies PairingDeniedMsg),
+      );
+      req.ws.close(4003, "Join request rejected");
+    } catch {}
+
+    notify(`❌ Denied device request #${reqId} ("${req.msg.name}").`, "info");
+    return true;
+  }
 
   // ── Mutation Guard & Territorial Sovereignty State ──
   let mutationGuard = process.env.OMP_LINK_ALLOW_MUTATION !== "1" && process.env.OMP_LINK_MUTATION_GUARD !== "0";
@@ -1495,6 +1808,10 @@ export default function (pi: ExtensionAPI) {
       return line;
     });
 
+    const reqsLine = pendingJoinRequests.size > 0
+      ? `  Requests   : 🔔 ${pendingJoinRequests.size} PENDING (/link-requests to view, /link-accept to approve)\n`
+      : "";
+
     return [
       `⚡ OMP LINK: ACTIVE`,
       divider,
@@ -1503,8 +1820,8 @@ export default function (pi: ExtensionAPI) {
       `  Endpoint   : ${endpoint}`,
       `  Role       : ${role === "hub" ? "Host" : "Peer"} (${terminalName})`,
       `  LAN PIN    : ${sessionPin}`,
-      `  Security   : E2EE (AES-256-GCM) · Mutation Guard: ${mutationGuard ? "ON" : "OFF"}${blockedMutationCount > 0 ? ` (${blockedMutationCount} blocked)` : ""}`,
-      divider,
+      `  Security   : E2EE (AES-256-GCM) · Exec: ${remoteExecAllowed ? "ALLOWED" : "BLOCKED"} · Mutation Guard: ${mutationGuard ? "ON" : "OFF"}${blockedMutationCount > 0 ? ` (${blockedMutationCount} blocked)` : ""}`,
+      reqsLine + divider,
       `  Online Peers (${connectedTerminals.length}):`,
       peerLines.join("\n") || "    (none)",
       divider,
@@ -1515,6 +1832,11 @@ export default function (pi: ExtensionAPI) {
       `  Commands:`,
       `    /link-start [id]       Start or switch session`,
       `    /link-join [id|ip]     Join active session`,
+      `    /link-accept [id]      Approve pending device join request`,
+      `    /link-deny [id]        Reject pending device join request`,
+      `    /link-requests         List pending device join requests`,
+      `    /link-devices          List or revoke paired devices`,
+      `    /link-exec-mode        Toggle remote arbitrary shell execution`,
       `    /link-network <ts|lan> Switch network mode`,
       `    /link-pin [pin]        View or update PIN`,
       `    /link-leave            Leave session`,
@@ -1751,6 +2073,12 @@ export default function (pi: ExtensionAPI) {
             terminalProjects.set(name, proj);
           }
         }
+        if (msg.deviceToken) {
+          const hubKey = targetHubAddress || currentSessionId || "default";
+          saveClientToken(hubKey, msg.deviceToken);
+          saveClientToken("default", msg.deviceToken);
+          notify(`🔑 Paired with session "${currentSessionId}" (persistent token saved)`, "info");
+        }
         updateStatus();
         notify(
           `⚡ Connected to session "${currentSessionId}" on ${networkMode.toUpperCase()} (${connectedTerminals.length} online)`,
@@ -1906,6 +2234,18 @@ export default function (pi: ExtensionAPI) {
         notify(`Link: ${msg.message}`, "error");
         break;
 
+      // ── Pairing & Request Mode ──
+      case "pairing_pending":
+        notify(
+          `⏳ Pairing request #${msg.requestId} pending host approval on "${msg.hubHost}"...`,
+          "info",
+        );
+        break;
+
+      case "pairing_denied":
+        notify(`❌ Join request was denied by host: ${msg.message}`, "error");
+        break;
+
       // ── Direct Tool RPC ──
       case "rpc_request":
         handleRpcRequest(msg);
@@ -1956,23 +2296,171 @@ export default function (pi: ExtensionAPI) {
       });
     };
 
+    const execCwd = params.cwd ? path.resolve(currentCwd || process.cwd(), params.cwd) : (currentCwd || process.cwd());
+
+    // ── Structured Inspection: git_status ──
+    if (action === "git_status") {
+      execFile("git", ["status", "--porcelain"], { cwd: execCwd, timeout: 15_000, maxBuffer: 5 * 1024 * 1024 }, (err, stdout, stderr) => {
+        if (err) {
+          respond(false, undefined, `git status failed: ${err.message}${stderr ? `\n${stderr}` : ""}`);
+        } else {
+          respond(true, stdout || "[Clean working tree - no changes]");
+        }
+      });
+      return;
+    }
+
+    // ── Structured Inspection: git_diff ──
+    if (action === "git_diff") {
+      execFile("git", ["diff", "--no-ext-diff", "--no-textconv"], { cwd: execCwd, timeout: 15_000, maxBuffer: 5 * 1024 * 1024 }, (err, stdout, stderr) => {
+        if (err) {
+          respond(false, undefined, `git diff failed: ${err.message}${stderr ? `\n${stderr}` : ""}`);
+        } else {
+          respond(true, stdout || "[No diff - working tree matches HEAD]");
+        }
+      });
+      return;
+    }
+
+    // ── Structured Inspection: git_log ──
+    if (action === "git_log") {
+      const count = Math.min(Math.max(Number(params.count) || 10, 1), 100);
+      execFile("git", ["log", `-n${count}`, "--oneline", "--no-ext-diff"], { cwd: execCwd, timeout: 15_000, maxBuffer: 5 * 1024 * 1024 }, (err, stdout, stderr) => {
+        if (err) {
+          respond(false, undefined, `git log failed: ${err.message}${stderr ? `\n${stderr}` : ""}`);
+        } else {
+          respond(true, stdout || "[Empty git log]");
+        }
+      });
+      return;
+    }
+
+    // ── Structured Inspection: search_text (git grep) ──
+    if (action === "search_text") {
+      if (!params.pattern) {
+        respond(false, undefined, "Missing 'pattern' parameter for search_text");
+        return;
+      }
+      execFile("git", ["grep", "-n", "-I", "--max-depth=5", "-e", params.pattern], { cwd: execCwd, timeout: 15_000, maxBuffer: 5 * 1024 * 1024 }, (err, stdout, stderr) => {
+        if (err) {
+          if ((err as any).code === 1) {
+            respond(true, `No matches found for pattern "${params.pattern}".`);
+          } else {
+            respond(false, undefined, `git grep failed: ${err.message}${stderr ? `\n${stderr}` : ""}`);
+          }
+        } else {
+          const lines = (stdout || "").split("\n").filter(Boolean);
+          if (lines.length > 100) {
+            respond(true, lines.slice(0, 100).join("\n") + `\n... [${lines.length - 100} additional matches truncated]`);
+          } else {
+            respond(true, stdout || "No matches found.");
+          }
+        }
+      });
+      return;
+    }
+
+    // ── Workspace-Confined: read_file ──
+    if (action === "read_file") {
+      if (!params.filePath) {
+        respond(false, undefined, "Missing filePath parameter");
+        return;
+      }
+      const check = resolveConfinedPath(execCwd, params.filePath);
+      if (!check.allowed || !check.fullPath) {
+        respond(false, undefined, `Access denied: ${check.reason || "Path outside workspace"}`);
+        return;
+      }
+      fs.promises.readFile(check.fullPath, "utf-8").then(
+        (content) => {
+          if (content.length > 500_000) {
+            respond(true, content.slice(0, 500_000) + "\n... [File truncated at 500KB]");
+          } else {
+            respond(true, content);
+          }
+        },
+        (err) => respond(false, undefined, err.message),
+      );
+      return;
+    }
+
+    // ── Workspace-Confined: list_dir ──
+    if (action === "list_dir") {
+      const targetDir = params.filePath || ".";
+      const check = resolveConfinedPath(execCwd, targetDir);
+      if (!check.allowed || !check.fullPath) {
+        respond(false, undefined, `Access denied: ${check.reason || "Path outside workspace"}`);
+        return;
+      }
+      fs.promises.readdir(check.fullPath, { withFileTypes: true }).then(
+        (entries) => {
+          const list = entries
+            .filter((e) => !e.name.startsWith(".git") && !e.name.startsWith(".env"))
+            .map((e) => `${e.isDirectory() ? "📁" : "📄"} ${e.name}`)
+            .join("\n");
+          respond(true, list || "[Empty directory]");
+        },
+        (err) => respond(false, undefined, err.message),
+      );
+      return;
+    }
+
+    // ── Arbitrary Shell Execution: exec (Blocked by default) ──
     if (action === "exec") {
       if (!params.command) {
         respond(false, undefined, "Missing command parameter");
         return;
       }
+
+      const trimmedCmd = params.command.trim();
+      const isAuthorized =
+        remoteExecAllowed || (remoteExecAuthToken && params.authToken === remoteExecAuthToken);
+
+      if (!isAuthorized) {
+        // Safe transparent fallback for read-only git status / diff commands
+        if (
+          trimmedCmd === "git status" ||
+          trimmedCmd === "git status --porcelain" ||
+          trimmedCmd === "git status -s"
+        ) {
+          execFile("git", ["status", "--porcelain"], { cwd: execCwd, timeout: 15_000, maxBuffer: 5 * 1024 * 1024 }, (err, stdout) => {
+            if (err) respond(false, undefined, `git status failed: ${err.message}`);
+            else respond(true, stdout || "[Clean working tree - no changes]");
+          });
+          return;
+        }
+        if (trimmedCmd === "git diff" || trimmedCmd === "git diff --stat") {
+          const args =
+            trimmedCmd === "git diff --stat"
+              ? ["diff", "--stat", "--no-ext-diff", "--no-textconv"]
+              : ["diff", "--no-ext-diff", "--no-textconv"];
+          execFile("git", args, { cwd: execCwd, timeout: 15_000, maxBuffer: 5 * 1024 * 1024 }, (err, stdout) => {
+            if (err) respond(false, undefined, `git diff failed: ${err.message}`);
+            else respond(true, stdout || "[No diff - working tree matches HEAD]");
+          });
+          return;
+        }
+
+        respond(
+          false,
+          undefined,
+          `REMOTE EXECUTION BLOCKED: Arbitrary shell execution is disabled by default under Territorial Sovereignty policy. For code inspection, use structured operations (git_status, git_diff, git_log, search_text, read_file, list_dir). For modifications, use link_send to request the peer agent perform changes in its own session. To enable remote shell execution, the host must run /link-exec-mode allow.`
+        );
+        return;
+      }
+
       if (mutationGuard) {
         const guardCheck = checkMutationGuard(params.command, from);
         if (guardCheck.blocked) {
           respond(
             false,
             undefined,
-            `MUTATION GUARD BLOCKED: Command "${params.command}" was rejected (${guardCheck.reason}). Territorial Sovereignty Policy: Remote terminals may only execute read-only inspection commands (e.g. git status, git diff, pytest, npm test, cat, ls). If code changes are required, use link_send to request the local agent apply the change in its own session.`,
+            `MUTATION GUARD BLOCKED: Command "${params.command}" was rejected (${guardCheck.reason}). Territorial Sovereignty Policy: Remote terminals may only execute read-only inspection commands. If code changes are required, use link_send to request the local agent apply the change in its own session.`,
           );
           return;
         }
       }
-      const execCwd = params.cwd ? path.resolve(currentCwd, params.cwd) : currentCwd;
+
       exec(params.command, { cwd: execCwd, timeout: 30_000, maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
         if (err) {
           respond(false, (stdout ? stdout + "\n" : "") + (stderr || ""), err.message);
@@ -1983,35 +2471,25 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
-    if (action === "read_file") {
-      if (!params.filePath) {
-        respond(false, undefined, "Missing filePath parameter");
-        return;
-      }
-      const fullPath = path.isAbsolute(params.filePath) ? params.filePath : path.resolve(currentCwd, params.filePath);
-      fs.promises.readFile(fullPath, "utf-8").then(
-        (content) => respond(true, content),
-        (err) => respond(false, undefined, err.message),
-      );
-      return;
-    }
-
-    if (action === "list_dir") {
-      const dirPath = params.filePath ? (path.isAbsolute(params.filePath) ? params.filePath : path.resolve(currentCwd, params.filePath)) : currentCwd;
-      fs.promises.readdir(dirPath, { withFileTypes: true }).then(
-        (entries) => {
-          const list = entries.map((e) => `${e.isDirectory() ? "📁" : "📄"} ${e.name}`).join("\n");
-          respond(true, list);
-        },
-        (err) => respond(false, undefined, err.message),
-      );
-      return;
-    }
-
     respond(false, undefined, `Unsupported action "${action}"`);
   }
 
+  const MAX_FILE_TRANSFER_BYTES = 50 * 1024 * 1024; // 50MB ceiling
+
   function handleFileOffer(msg: FileOfferMsg) {
+    if (msg.sizeBytes > MAX_FILE_TRANSFER_BYTES) {
+      routeMessage({
+        type: "file_ack",
+        transferId: msg.transferId,
+        from: terminalName,
+        to: msg.from,
+        ok: false,
+        error: `File size (${(msg.sizeBytes / (1024 * 1024)).toFixed(1)}MB) exceeds 50MB ceiling limit`,
+      });
+      notify(`⚠️ Rejected file offer "${msg.filename}" from "${msg.from}": exceeds 50MB ceiling`, "warning");
+      return;
+    }
+
     incomingTransfers.set(msg.transferId, {
       offer: msg,
       chunks: new Map(),
@@ -2043,6 +2521,17 @@ export default function (pi: ExtensionAPI) {
         orderedChunks.push(chunk);
       }
       const fullBuffer = Buffer.concat(orderedChunks);
+      if (fullBuffer.length > MAX_FILE_TRANSFER_BYTES) {
+        routeMessage({
+          type: "file_ack",
+          transferId: msg.transferId,
+          from: terminalName,
+          to: transfer.offer.from,
+          ok: false,
+          error: "Received data exceeds 50MB ceiling limit",
+        });
+        return;
+      }
       const computedSha = crypto.createHash("sha256").update(fullBuffer).digest("hex");
       if (computedSha !== transfer.offer.sha256) {
         routeMessage({
@@ -2056,18 +2545,13 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
-      let relPath = transfer.offer.destRelPath || path.join(".omp", "transfers", transfer.offer.filename);
-      if (mutationGuard && transfer.offer.destRelPath && !transfer.offer.destRelPath.startsWith(".omp/transfers")) {
-        const safeName = path.basename(transfer.offer.filename);
-        relPath = path.join(".omp", "transfers", safeName);
-        notify(
-          `🛡️ [Mutation Guard] Isolated file transfer from "${transfer.offer.from}" to ".omp/transfers/${safeName}" to protect local project code.`,
-          "info"
-        );
-      }
-      const savePath = path.isAbsolute(relPath) ? relPath : path.resolve(currentCwd, relPath);
+      // Hardened file inbox: save strictly inside .omp/inbox/<transferId>/<safeFilename>
+      const safeFilename = path.basename(transfer.offer.filename).replace(/[^a-zA-Z0-9._-]/g, "_");
+      const inboxDir = path.join(currentCwd || process.cwd(), ".omp", "inbox", msg.transferId);
+      const savePath = path.join(inboxDir, safeFilename);
+
       try {
-        await fs.promises.mkdir(path.dirname(savePath), { recursive: true });
+        await fs.promises.mkdir(inboxDir, { recursive: true });
         await fs.promises.writeFile(savePath, fullBuffer);
         routeMessage({
           type: "file_ack",
@@ -2077,7 +2561,10 @@ export default function (pi: ExtensionAPI) {
           ok: true,
           savedPath: savePath,
         });
-        notify(`📥 Received file "${transfer.offer.filename}" (${(fullBuffer.length / 1024).toFixed(1)} KB) from ${transfer.offer.from} -> ${shortenPath(savePath)}`, "info");
+        notify(
+          `📥 Quarantined file "${safeFilename}" (${(fullBuffer.length / 1024).toFixed(1)} KB) from ${transfer.offer.from} -> ${shortenPath(savePath)}`,
+          "info",
+        );
       } catch (err: any) {
         routeMessage({
           type: "file_ack",
@@ -2095,6 +2582,76 @@ export default function (pi: ExtensionAPI) {
 
   function hubHandleClient(clientWs: WebSocket, req?: IncomingMessage) {
     let clientName = "";
+
+    function completeClientRegistration(ws: WebSocket, regMsg: RegisterMsg, issuedToken?: string) {
+      clientName = uniqueName(regMsg.name);
+      hubClients.set(ws, clientName);
+      if (regMsg.cwd) hubTerminalCwds.set(clientName, regMsg.cwd);
+      if (regMsg.context) hubTerminalContexts.set(clientName, regMsg.context);
+      if (regMsg.host) hubTerminalHosts.set(clientName, regMsg.host);
+      if (regMsg.project) hubTerminalProjects.set(clientName, regMsg.project);
+      const list = terminalList();
+      connectedTerminals = list;
+      updateStatus();
+
+      // Confirm to the new client (include status + cwd snapshots)
+      const statuses: Record<string, LinkStatus> = {};
+      statuses[terminalName] = deriveStatus(); // hub's own status
+      for (const [name, status] of hubTerminalStatuses) {
+        if (name !== clientName) statuses[name] = status;
+      }
+      const cwds: Record<string, string> = {};
+      if (currentCwd) cwds[terminalName] = currentCwd; // hub's own cwd
+      for (const [name, cwd] of hubTerminalCwds) {
+        if (name !== clientName) cwds[name] = cwd;
+      }
+      const contexts: Record<string, ContextSnapshot> = {};
+      const hubContext = captureContext();
+      if (hubContext) contexts[terminalName] = hubContext; // hub's own context
+      for (const [name, c] of hubTerminalContexts) {
+        if (name !== clientName) contexts[name] = c;
+      }
+      const hosts: Record<string, string> = {};
+      hosts[terminalName] = os.hostname();
+      for (const [name, host] of hubTerminalHosts) {
+        if (name !== clientName) hosts[name] = host;
+      }
+      const projects: Record<string, string> = {};
+      if (currentCwd) projects[terminalName] = path.basename(currentCwd);
+      for (const [name, proj] of hubTerminalProjects) {
+        if (name !== clientName) projects[name] = proj;
+      }
+      ws.send(
+        serializeForWire({
+          type: "welcome",
+          name: clientName,
+          sessionId: currentSessionId,
+          pin: sessionPin,
+          network: networkMode,
+          terminals: list,
+          statuses,
+          cwds,
+          contexts,
+          hosts,
+          projects,
+          ...(issuedToken ? { deviceToken: issuedToken } : {}),
+        } satisfies WelcomeMsg),
+      );
+
+      // Notify everyone else (include joiner's cwd + context)
+      const joined: TerminalJoinedMsg = {
+        type: "terminal_joined",
+        name: clientName,
+        sessionId: currentSessionId,
+        network: networkMode,
+        terminals: list,
+        cwd: regMsg.cwd,
+        context: regMsg.context,
+        host: regMsg.host,
+        project: regMsg.project,
+      };
+      hubBroadcast(joined, clientName);
+    }
 
     clientWs.on("message", (raw) => {
       if (!isRuntimeLive()) return;
@@ -2130,72 +2687,40 @@ export default function (pi: ExtensionAPI) {
           return;
         }
 
-        clientName = uniqueName(msg.name);
-        hubClients.set(clientWs, clientName);
-        if (msg.cwd) hubTerminalCwds.set(clientName, msg.cwd);
-        if (msg.context) hubTerminalContexts.set(clientName, msg.context);
-        if (msg.host) hubTerminalHosts.set(clientName, msg.host);
-        if (msg.project) hubTerminalProjects.set(clientName, msg.project);
-        const list = terminalList();
-        connectedTerminals = list;
-        updateStatus();
+        // ── Device Pairing & Request Mode Check ──
+        const isLocal = isLocalhost(clientIp);
+        const pairedDevices = loadPairedDevices();
+        const paired = msg.deviceId ? pairedDevices.get(msg.deviceId) : undefined;
+        const hasValidToken = !!(paired && msg.deviceToken && paired.token === msg.deviceToken);
 
-        // Confirm to the new client (include status + cwd snapshots)
-        const statuses: Record<string, LinkStatus> = {};
-        statuses[terminalName] = deriveStatus(); // hub's own status
-        for (const [name, status] of hubTerminalStatuses) {
-          if (name !== clientName) statuses[name] = status;
-        }
-        const cwds: Record<string, string> = {};
-        if (currentCwd) cwds[terminalName] = currentCwd; // hub's own cwd
-        for (const [name, cwd] of hubTerminalCwds) {
-          if (name !== clientName) cwds[name] = cwd;
-        }
-        const contexts: Record<string, ContextSnapshot> = {};
-        const hubContext = captureContext();
-        if (hubContext) contexts[terminalName] = hubContext; // hub's own context
-        for (const [name, c] of hubTerminalContexts) {
-          if (name !== clientName) contexts[name] = c;
-        }
-        const hosts: Record<string, string> = {};
-        hosts[terminalName] = os.hostname();
-        for (const [name, host] of hubTerminalHosts) {
-          if (name !== clientName) hosts[name] = host;
-        }
-        const projects: Record<string, string> = {};
-        if (currentCwd) projects[terminalName] = path.basename(currentCwd);
-        for (const [name, proj] of hubTerminalProjects) {
-          if (name !== clientName) projects[name] = proj;
-        }
-        clientWs.send(
-          serializeForWire({
-            type: "welcome",
-            name: clientName,
-            sessionId: currentSessionId,
-            pin: sessionPin,
-            network: networkMode,
-            terminals: list,
-            statuses,
-            cwds,
-            contexts,
-            hosts,
-            projects,
-          } satisfies WelcomeMsg),
-        );
+        if (!isLocal && !hasValidToken) {
+          const reqId = nextPairingRequestId++;
+          pendingJoinRequests.set(reqId, {
+            id: reqId,
+            ws: clientWs,
+            msg,
+            clientIp: clientIp || "unknown",
+            timestamp: Date.now(),
+            complete: (issuedToken?: string) => completeClientRegistration(clientWs, msg, issuedToken),
+          });
 
-        // Notify everyone else (include joiner's cwd + context)
-        const joined: TerminalJoinedMsg = {
-          type: "terminal_joined",
-          name: clientName,
-          sessionId: currentSessionId,
-          network: networkMode,
-          terminals: list,
-          cwd: msg.cwd,
-          context: msg.context,
-          host: msg.host,
-          project: msg.project,
-        };
-        hubBroadcast(joined, clientName);
+          clientWs.send(
+            serializeForWire({
+              type: "pairing_pending",
+              requestId: reqId,
+              hubHost: os.hostname(),
+              message: `Pairing approval required on "${os.hostname()}". Run "/link-accept ${reqId}" on the host to approve.`,
+            } satisfies PairingPendingMsg),
+          );
+
+          notify(
+            `🔔 [Link Request #${reqId}] "${msg.name}" on ${msg.host || clientIp} requested to join. Run /link-accept ${reqId} to approve or /link-deny ${reqId} to reject.`,
+            "warning",
+          );
+          return;
+        }
+
+        completeClientRegistration(clientWs, msg);
         return;
       }
 
@@ -2238,6 +2763,12 @@ export default function (pi: ExtensionAPI) {
     });
 
     clientWs.on("close", () => {
+      for (const [id, reqItem] of pendingJoinRequests) {
+        if (reqItem.ws === clientWs) {
+          pendingJoinRequests.delete(id);
+          break;
+        }
+      }
       if (disposed) return;
       const name = hubClients.get(clientWs);
       if (!name) return; // already removed (e.g. via disconnect) — ignore stale event
@@ -2272,9 +2803,48 @@ export default function (pi: ExtensionAPI) {
       // `ws` forwards this server's `listening` and `error`, so the election below
       // is unchanged.
       const httpServer = createServer((req, res) => {
-        if (req.method === "GET" && req.url === "/status") {
+        if (req.method === "GET" && (req.url === "/status" || req.url?.startsWith("/status?"))) {
+          const clientIp = req.socket?.remoteAddress;
+          const isLocal = isLocalhost(clientIp);
+          const authHeader = (req.headers["authorization"] as string) || "";
+          const tokenHeader = (req.headers["x-link-token"] as string) || "";
+          const pinHeader = (req.headers["x-link-pin"] as string) || "";
+
+          let queryToken = "";
+          let queryPin = "";
+          try {
+            const parsedUrl = new URL(req.url, "http://localhost");
+            queryToken = parsedUrl.searchParams.get("token") || "";
+            queryPin = parsedUrl.searchParams.get("pin") || "";
+          } catch {}
+
+          const suppliedToken =
+            tokenHeader || (authHeader.startsWith("Bearer ") ? authHeader.slice(7) : "") || queryToken;
+          const suppliedPin = pinHeader || queryPin;
+
+          const pairedDevices = loadPairedDevices();
+          const isPairedToken = Array.from(pairedDevices.values()).some((d) => d.token === suppliedToken);
+          const isValidSecret = linkSecret ? suppliedToken === linkSecret : false;
+          const isValidPin = sessionPin ? suppliedPin === sessionPin : false;
+
+          const isAuthorized = isLocal || isValidSecret || isPairedToken || isValidPin;
+
           res.writeHead(200, { "content-type": "application/json" });
-          res.end(JSON.stringify(buildStatusPayload()));
+          if (isAuthorized) {
+            res.end(JSON.stringify(buildStatusPayload()));
+          } else {
+            // Sanitized public discovery payload
+            res.end(
+              JSON.stringify({
+                service: "omp-link",
+                version: "3.1.0",
+                active: true,
+                sessionId: currentSessionId,
+                network: networkMode,
+                authRequired: true,
+              }),
+            );
+          }
           return;
         }
         if (req.method === "GET" && req.url?.startsWith("/transfer/")) {
@@ -2404,8 +2974,15 @@ export default function (pi: ExtensionAPI) {
       if (!endpoint.includes(":") || (endpoint.startsWith("[") && !endpoint.includes("]:"))) {
         endpoint = `${endpoint}:${linkPort}`;
       }
+      const clientTokens = loadClientTokens();
+      const savedToken =
+        (targetEndpoint && clientTokens.get(targetEndpoint)) ||
+        (effectiveSessionId && clientTokens.get(effectiveSessionId)) ||
+        clientTokens.get("default");
+
       const headers: Record<string, string> = {};
       if (linkSecret) headers["x-link-token"] = linkSecret;
+      else if (savedToken) headers["x-link-token"] = savedToken;
       const effectivePin = joinPin || sessionPin;
       if (effectivePin) headers["x-link-pin"] = effectivePin;
       const effectiveSessionId = joinSessionId || currentSessionId;
@@ -2441,6 +3018,7 @@ export default function (pi: ExtensionAPI) {
         if (effectivePin) sessionPin = effectivePin;
         if (effectiveSessionId) currentSessionId = effectiveSessionId;
         updateSessionKey();
+        const deviceIdentity = getOrCreateDeviceIdentity();
         // Register with preferred name if available, otherwise current name
         socket.send(
           serializeForWire({
@@ -2454,6 +3032,8 @@ export default function (pi: ExtensionAPI) {
             host: os.hostname(),
             project: currentCwd ? path.basename(currentCwd) : undefined,
             token: linkSecret,
+            deviceId: deviceIdentity.deviceId,
+            deviceToken: savedToken,
           } satisfies RegisterMsg),
         );
         settle(true);
@@ -3556,26 +4136,39 @@ export default function (pi: ExtensionAPI) {
     name: "link_exec",
     label: "Link Exec",
     description:
-      "Direct Tool RPC: Execute read-only inspection commands (e.g. git status, git diff, pytest, npm test, cat, ls) or inspect files/directories on another terminal across the mesh (< 30ms latency). STRICT PROTOCOL (Territorial Sovereignty): You are strictly FORBIDDEN from running mutating commands (rm, sed -i, git commit, writing files). If remote code needs to be modified, you MUST use link_send to request the peer agent perform the change within its own session. Mutating commands will be rejected by the peer's Mutation Guard.",
-    promptSnippet: "Execute a read-only inspection command or read a file on another terminal across the link",
+      "Direct Tool RPC: Safe structured inspection operations (git_status, git_diff, git_log, search_text, read_file, list_dir) across the mesh (< 30ms latency). Enforces workspace canonical path confinement and blocks access to sensitive files (.env, .git, keys). Arbitrary shell execution ('exec') is blocked by default under Territorial Sovereignty policy. To modify code or run builds on another machine, use link_send to request the peer agent perform the change within its own session.",
+    promptSnippet: "Perform safe structured code inspection (git_status, git_diff, read_file, search_text) on another terminal across the link",
     parameters: Type.Object({
       to: Type.String({ description: "Target terminal name" }),
       action: Type.Union(
         [
-          Type.Literal("exec"),
+          Type.Literal("git_status"),
+          Type.Literal("git_diff"),
+          Type.Literal("git_log"),
+          Type.Literal("search_text"),
           Type.Literal("read_file"),
           Type.Literal("list_dir"),
+          Type.Literal("exec"),
         ],
-        { description: "Action: 'exec' (run shell command), 'read_file' (read file content), or 'list_dir' (list directory files)" },
+        { description: "Inspection action: 'git_status', 'git_diff', 'git_log', 'search_text', 'read_file', 'list_dir', or 'exec' (disabled by default)" },
       ),
       command: Type.Optional(
-        Type.String({ description: "Read-only shell command to run (required if action is 'exec'). Mutating commands (rm, sed -i, git commit, etc.) are blocked by the Mutation Guard." }),
+        Type.String({ description: "Command for 'exec'. Note: Arbitrary shell execution is disabled by default on remote nodes." }),
       ),
       filePath: Type.Optional(
-        Type.String({ description: "File or directory path (required for 'read_file' or 'list_dir')" }),
+        Type.String({ description: "File or directory path for 'read_file' or 'list_dir'" }),
+      ),
+      count: Type.Optional(
+        Type.Number({ description: "Number of commits for 'git_log' (1-100, default 10)" }),
+      ),
+      pattern: Type.Optional(
+        Type.String({ description: "Search query/pattern for 'search_text' (git grep)" }),
       ),
       cwd: Type.Optional(
         Type.String({ description: "Optional working directory relative to remote project root" }),
+      ),
+      authToken: Type.Optional(
+        Type.String({ description: "Optional authorization token to authorize 'exec' if configured by remote host" }),
       ),
     }),
 
@@ -3601,7 +4194,10 @@ export default function (pi: ExtensionAPI) {
             params: {
               command: params.command,
               filePath: params.filePath,
+              count: params.count,
+              pattern: params.pattern,
               cwd: params.cwd,
+              authToken: params.authToken,
             },
           });
 
@@ -3851,6 +4447,139 @@ export default function (pi: ExtensionAPI) {
     description: "Inspect or toggle Mutation Guard (Territorial Sovereignty protection). Usage: /link-mutation [on|off|log]",
     handler: async (args, _ctx) => {
       handleMutationCommand(args, _ctx);
+    },
+  });
+
+  pi.registerCommand("link-exec-mode", {
+    description: "Inspect or toggle remote arbitrary shell execution. Usage: /link-exec-mode [allow|block]",
+    handler: async (args, _ctx) => {
+      const mode = args.trim().toLowerCase();
+      if (mode === "allow") {
+        remoteExecAllowed = true;
+        saveLinkConfig({ execMode: "allow" });
+        _ctx.ui.notify("⚠️ Remote arbitrary shell execution ALLOWED (Mutation Guard remains active).", "warning");
+        return;
+      }
+      if (mode === "block") {
+        remoteExecAllowed = false;
+        saveLinkConfig({ execMode: "block" });
+        _ctx.ui.notify("🛡️ Remote arbitrary shell execution BLOCKED (Structured RPC operations only).", "info");
+        return;
+      }
+      _ctx.ui.notify(
+        `Remote Exec Mode: ${remoteExecAllowed ? "ALLOWED" : "BLOCKED (Default)"}\nStructured operations (git_status, git_diff, git_log, search_text, read_file, list_dir) are active.\nUsage: /link-exec-mode allow | /link-exec-mode block`,
+        remoteExecAllowed ? "warning" : "info",
+      );
+    },
+  });
+
+  pi.registerCommand("link-accept", {
+    description: "Approve a pending device join request. Usage: /link-accept [requestId]",
+    handler: async (args, _ctx) => {
+      if (pendingJoinRequests.size === 0) {
+        _ctx.ui.notify("No pending device join requests.", "info");
+        return;
+      }
+      const trimmed = args.trim();
+      let targetId: number | null = null;
+      if (trimmed) {
+        targetId = Number(trimmed);
+        if (Number.isNaN(targetId) || !pendingJoinRequests.has(targetId)) {
+          _ctx.ui.notify(`Pending request #${trimmed} not found. Use /link-requests to list.`, "error");
+          return;
+        }
+      } else if (pendingJoinRequests.size === 1) {
+        const [firstKey] = pendingJoinRequests.keys();
+        targetId = firstKey;
+      } else {
+        let text = `Multiple pending join requests. Specify request ID:\n`;
+        for (const [id, item] of pendingJoinRequests) {
+          text += `  • Request #${id}: "${item.msg.name}" on ${item.msg.host || item.clientIp}\n`;
+        }
+        text += `Usage: /link-accept <id>`;
+        _ctx.ui.notify(text, "info");
+        return;
+      }
+
+      if (targetId !== null) {
+        approveJoinRequest(targetId);
+      }
+    },
+  });
+
+  pi.registerCommand("link-deny", {
+    description: "Reject a pending device join request. Usage: /link-deny [requestId]",
+    handler: async (args, _ctx) => {
+      if (pendingJoinRequests.size === 0) {
+        _ctx.ui.notify("No pending device join requests.", "info");
+        return;
+      }
+      const trimmed = args.trim();
+      let targetId: number | null = null;
+      if (trimmed) {
+        targetId = Number(trimmed);
+        if (Number.isNaN(targetId) || !pendingJoinRequests.has(targetId)) {
+          _ctx.ui.notify(`Pending request #${trimmed} not found. Use /link-requests to list.`, "error");
+          return;
+        }
+      } else if (pendingJoinRequests.size === 1) {
+        const [firstKey] = pendingJoinRequests.keys();
+        targetId = firstKey;
+      } else {
+        let text = `Multiple pending requests. Specify request ID: /link-deny <id>`;
+        _ctx.ui.notify(text, "info");
+        return;
+      }
+
+      if (targetId !== null) {
+        denyJoinRequest(targetId);
+      }
+    },
+  });
+
+  pi.registerCommand("link-requests", {
+    description: "List pending device join requests awaiting approval. Usage: /link-requests",
+    handler: async (_args, _ctx) => {
+      if (pendingJoinRequests.size === 0) {
+        _ctx.ui.notify("No pending device join requests.", "info");
+        return;
+      }
+      let text = `Pending Device Requests (${pendingJoinRequests.size}):\n`;
+      for (const [id, item] of pendingJoinRequests) {
+        const elapsed = Math.round((Date.now() - item.timestamp) / 1000);
+        text += `  • Request #${id}: "${item.msg.name}" on ${item.msg.host || item.clientIp} (${elapsed}s ago)\n`;
+        text += `    Approve: /link-accept ${id}   Reject: /link-deny ${id}\n`;
+      }
+      _ctx.ui.notify(text, "info");
+    },
+  });
+
+  pi.registerCommand("link-devices", {
+    description: "List paired devices or revoke pairing. Usage: /link-devices [revoke <deviceId>]",
+    handler: async (args, _ctx) => {
+      const trimmed = args.trim();
+      if (trimmed.startsWith("revoke ")) {
+        const devId = trimmed.slice(7).trim();
+        const removed = removePairedDevice(devId);
+        if (removed) {
+          _ctx.ui.notify(`Revoked device token for "${devId}".`, "info");
+        } else {
+          _ctx.ui.notify(`Device "${devId}" not found in paired list.`, "error");
+        }
+        return;
+      }
+      const devices = Array.from(loadPairedDevices().values());
+      if (devices.length === 0) {
+        _ctx.ui.notify("No paired devices found.", "info");
+        return;
+      }
+      let text = `Paired Devices (${devices.length}):\n`;
+      for (const d of devices) {
+        const dateStr = new Date(d.approvedAt).toLocaleString();
+        text += `  • ${d.name} [${d.deviceId}]\n    Host: ${d.host} | Paired: ${dateStr}\n`;
+      }
+      text += `\nTo revoke a device: /link-devices revoke <deviceId>`;
+      _ctx.ui.notify(text, "info");
     },
   });
 

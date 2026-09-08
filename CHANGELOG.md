@@ -4,6 +4,32 @@ All notable changes to pi-link are documented here.
 
 This changelog is based on the git history from `2026-03-21` (initial commit) through the present. Versions correspond to npm publishes.
 
+## 3.1.0 — 2026-09-07
+
+### Security Hardening, Pairing Governance & Structured RPC Operations
+
+- **Always-Prompt First-Time Pairing ("Request Mode")**:
+  - Unpaired devices connecting over either Tailscale or LAN enter a pairing approval queue.
+  - Host terminal displays an explicit notification: `🔔 [Link Request #1] "<name>" on <host> requested to join. Run /link-accept 1 to approve or /link-deny 1 to reject.`
+  - Approving via `/link-accept [id]` issues a persistent, cryptographically secure device token saved in `~/.omp/paired-devices.json` and client's `~/.omp/client-tokens.json`, enabling seamless, automatic reconnects thereafter.
+  - Added slash commands: `/link-accept [id]`, `/link-deny [id]`, `/link-requests`, and `/link-devices [revoke <deviceId>]`.
+- **Structured Inspection Operations (`execFile` with No Shell)**:
+  - Replaced shell execution with safe, structured inspection operations: `git_status`, `git_diff` (`--no-ext-diff`, `--no-textconv`), `git_log` (bounded 1–100), `search_text` (`git grep`), `read_file`, and `list_dir`.
+  - Directly executes binaries via `execFile` without invoking a shell interpreter, neutralizing shell metacharacter injection and parameter tampering.
+- **Deterministic Blocked-by-Default Remote Shell Execution**:
+  - Arbitrary shell commands (`action: "exec"`) are blocked by default as a hard deterministic rule under Territorial Sovereignty governance.
+  - Transparent fallback: remote requests executing `git status` or `git diff` automatically route to safe structured inspection operations without erroring.
+  - Hosts can inspect or toggle execution mode via `/link-exec-mode [allow|block]` or supply authorization tokens.
+- **Canonical Workspace Path Confinement & Traversal Protection**:
+  - Canonical `fs.realpath` verification (`resolveConfinedPath`) guarantees all file and directory reads remain confined strictly within the project workspace.
+  - Symlink escapes, directory traversal (`../`), null bytes, and sensitive patterns (`.env*`, `.git/*`, `id_rsa`, `id_ed25519`, `*.pem`, `*.key`, credentials, secrets) are deterministically rejected.
+- **Hardened 50MB Quarantine File Inboxes**:
+  - Ingested files save strictly inside `.omp/inbox/<transferId>/<safeFilename>`, ensuring incoming transfers can never overwrite local project code.
+  - Enforces a 50MB ceiling limit, rejecting oversized offers prior to memory ingestion.
+- **Sanitized Public Discovery (`GET /status`)**:
+  - Unauthenticated discovery requests receive minimal safe metadata (`{ service: "omp-link", version: "3.1.0", active: true, authRequired: true }`).
+  - Hides all local file paths, working directories, peer lists, and session PINs from unauthenticated callers. Authorized requests (local, paired token, or valid PIN) receive the full status snapshot.
+
 ---
 
 ## 3.0.0 — 2026-09-06

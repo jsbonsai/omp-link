@@ -57,8 +57,13 @@ All coordination happens directly inside OMP via slash commands:
 | **`/link on`** | `/link on` | **Re-enable**: Re-enables the link mesh and re-connects/re-hosts the project session. |
 | **`/link-join`** | `/link-join`<br>`/link-join [id] [pin]` | **Connect**: With no arguments, scans your network and **auto-joins** the active session! Or specify session ID / IP and PIN. |
 | **`/link-start`** | `/link-start [id] [pin]` | **Host**: Start or switch to hosting a session with a custom ID or PIN. |
-| **`/link-leave`** | `/link-leave` | **Disconnect**: Cleanly leave the session and release the network port. |
+| **`/link-accept`** | `/link-accept [id]` | **Approve Pairing**: Approve a new device's join request and issue a permanent token. |
+| **`/link-deny`** | `/link-deny [id]` | **Reject Pairing**: Reject a new device's join request. |
+| **`/link-requests`** | `/link-requests` | **Pairing Queue**: View all pending join requests awaiting host approval. |
+| **`/link-devices`** | `/link-devices`<br>`/link-devices revoke <id>` | **Device Tokens**: List paired devices or revoke a device's permanent token. |
+| **`/link-exec-mode`**| `/link-exec-mode [allow\|block]`| **Exec Mode**: Inspect or toggle remote arbitrary shell command execution. |
 | **`/link-mutation`** | `/link-mutation`<br>`/link-mutation [on\|off\|log]` | **Mutation Guard**: Inspect, toggle, or view the real-time blocked command audit log. |
+| **`/link-leave`** | `/link-leave` | **Disconnect**: Cleanly leave the session and release the network port. |
 
 ### Secondary Slash Commands & Environment Flags
 - `/link-network <tailscale | lan>`: Switch between Tailscale (WireGuard auto-auth) and LAN mode.
@@ -66,6 +71,7 @@ All coordination happens directly inside OMP via slash commands:
 - `/link-pin [pin]`: Inspect or set a new 4-digit PIN for LAN mode.
 - `/link-name [name]`: Change your terminal's display name on the mesh.
 - `OMP_LINK_OFF=1` or `omp --no-link`: Launch OMP with link completely disabled from startup.
+- `OMP_LINK_EXEC_MODE=allow`: Allow remote arbitrary shell execution by default.
 - `OMP_LINK_ALLOW_MUTATION=1`: Disable the Mutation Guard to allow unrestricted remote shell execution.
 
 ---
@@ -74,35 +80,32 @@ All coordination happens directly inside OMP via slash commands:
 
 Agents running inside OMP have access to 7 built-in coordination and execution tools:
 
-### 1. `link_exec` (Direct Tool RPC — < 25ms execution, Zero LLM Tokens)
-Execute fast, read-only inspection commands or read files directly on a remote terminal without waking up the remote agent's LLM reasoning loop!
+### 1. `link_exec` (Direct Tool RPC — Structured Inspection, Zero LLM Tokens)
+Execute fast, safe, structured inspection operations directly on a remote terminal without shell injection risks or waking up the remote agent's LLM reasoning loop!
 ```json
 {
   "to": "linux-workstation",
-  "action": "exec",
-  "command": "git status && pytest tests/"
+  "action": "git_status"
 }
 ```
-Or inspect remote files without turning the remote model:
-```json
-{
-  "to": "linux-workstation",
-  "action": "read_file",
-  "path": "/home/js/backend/src/server.ts"
-}
-```
-*Round trip latency is under 25ms over encrypted WebSocket. By default, mutating commands (`rm`, `sed -i`, `git commit`, file overwrite redirects) are automatically blocked by the remote terminal's **Mutation Guard** to uphold Territorial Sovereignty.*
+Supported structured inspection actions (all executed with **no shell** via `execFile`):
+- `git_status`: Clean, porcelain repository status.
+- `git_diff`: Working tree diff (`--no-ext-diff`, `--no-textconv` prevents arbitrary external filter execution).
+- `git_log`: Recent commit history (bounded between 1 and 100 commits via `count`).
+- `search_text`: Grep repository files using `pattern` (`git grep -n -I`).
+- `read_file`: Confined workspace file reading (canonical `fs.realpath` verification protects against symlink escapes and denies `.env*`, `.git/*`, and keys).
+- `list_dir`: Confined directory listing filtering sensitive directories.
+- `exec`: Blocked by default under Territorial Sovereignty. When disabled, common read commands like `git status` or `git diff` automatically route to safe structured operations. Hosts can unlock arbitrary execution via `/link-exec-mode allow`.
 
-### 2. `link_send_file` (Out-of-Band Streaming File Transfer)
-Stream files directly between machines across LAN or Tailscale with chunked delivery, SHA-256 integrity verification, and zero MCP server overhead:
+### 2. `link_send_file` (Hardened Out-of-Band File Transfer)
+Stream files directly between machines across LAN or Tailscale with chunked delivery, SHA-256 integrity verification, and automatic quarantine into `.omp/inbox/<transferId>/<safeFilename>`:
 ```json
 {
   "to": "linux-workstation",
-  "filePath": "./dist/app.bundle.js",
-  "targetFilename": "app.bundle.js"
+  "sourcePath": "./dist/app.bundle.js"
 }
 ```
-*Files are transmitted in 64KB chunks over the E2EE wire and reassembled with SHA-256 verification. Ephemeral direct HTTP download links (`http://<host>:9900/transfer/<token>/<filename>`) are also generated for non-agent downloads.*
+*Files are transmitted in 64KB chunks over the E2EE wire, verified against a 50MB ceiling, and reassembled with SHA-256 verification. Transferred files are strictly isolated to dedicated transfer directories to guarantee they never overwrite existing project code.*
 
 ### 3. `link_send` (Agent-to-Agent Reasoning Delegation)
 Send a high-level task or prompt to another terminal's LLM across the mesh:
@@ -177,16 +180,31 @@ When you send a message with `link_send` and wait for a reply, the turn takes 15
 3. **Dual-Tier Network Isolation**:
    - **Tailscale Mode**: Strict binding to `100.64.0.0/10` with WireGuard kernel-level identity verification. PINs are optional.
    - **LAN Mode**: Subnet binding with mandatory 4-digit PIN authentication. Non-matching PINs are rejected with `4001: Invalid session PIN`.
-4. **Deterministic Link ON/OFF & Circuit Breaker**:
+4. **Always-Prompt First-Time Pairing ("Request Mode")**:
+   - Any new or unpaired device connecting across LAN or Tailscale is placed into a host-controlled pairing queue.
+   - The host terminal alerts in real time (`🔔 [Link Request #1] "<name>" requested to join...`) and requires human approval via `/link-accept 1` (or `/link-deny 1`).
+   - Approved devices receive a cryptographically unique permanent device token saved in `~/.omp/paired-devices.json` and client's `~/.omp/client-tokens.json`, allowing instant automatic reconnection for paired nodes without repeated prompts.
+5. **Structured Inspection Operations (No-Shell `execFile`)**:
+   - Direct Tool RPC eliminates shell execution (`exec`) in favor of fixed, deterministic operations: `git_status`, `git_diff` (`--no-ext-diff`, `--no-textconv`), `git_log` (bounded 1–100 commits), `search_text` (`git grep`), `read_file`, and `list_dir`.
+   - Operations execute directly via `execFile`, eliminating shell metacharacter injections, parameter expansion, and pipe tampering.
+6. **Canonical Path Confinement & Traversal Defense**:
+   - `resolveConfinedPath` enforces canonical `fs.realpath` verification against the workspace root.
+   - Rejects directory traversal escapes (`../`), symlink bypasses, null bytes, and sensitive files (`.env*`, `.git/*`, `id_rsa`, `id_ed25519`, `*.pem`, `*.key`, credentials, secrets).
+7. **Hardened 50MB Quarantine Inboxes**:
+   - Incoming file transfers save strictly into `.omp/inbox/<transferId>/<safeFilename>`, ensuring peer files can never overwrite or collide with project code.
+   - 50MB transfer ceiling prevents memory exhaustion or buffer overflow.
+8. **Sanitized Public Discovery (`GET /status`)**:
+   - Unauthenticated network probes receive minimal safe telemetry (`{ service: "omp-link", version: "3.1.0", active: true, authRequired: true }`).
+   - Completely conceals host file paths, working directories, active peers, and session PINs unless authenticated with a paired token or PIN.
+9. **Deterministic Link ON/OFF & Circuit Breaker**:
    - Run `/link off` to completely detach from the mesh, terminate listeners, and suppress all background reconnect loops.
    - 3-strike circuit breaker: after 3 consecutive failed reconnection attempts, OMP ceases dialing and stays silent until explicit user activation (`/link on` or `/link-join`).
-5. **Territorial Sovereignty & The Mutation Guard**:
+10. **Territorial Sovereignty & The Mutation Guard**:
    - **The Problem**: In multi-machine swarms, an eager agent on Machine A that spots a bug on Machine B might attempt to directly edit, overwrite, or commit code on Machine B, clobbering Machine B's working tree and desynchronizing its LLM context.
    - **The Principle**: Every agent is the sole authoritative writer of its own local workspace.
-   - **The Defense**: Each terminal runs a local **Mutation Guard** (active by default). If a remote peer attempts a mutating command (`rm`, `sed -i`, `git commit`, `chmod`, `>`/`>>` redirects, or package updates) via `link_exec`, the command is **blocked immediately**.
+   - **Deterministic Blocking**: Arbitrary remote command execution (`action: "exec"`) is disabled by default. Common read-only commands like `git status` or `git diff` automatically route to safe structured inspection operations.
+   - **The Guard**: If execution is unlocked via `/link-exec-mode allow`, the **Mutation Guard** continues enforcing read-only sovereignty by blocking mutating commands (`rm`, `sed -i`, `git commit`, `chmod`, `>`/`>>` redirects, and package updates).
    - **Monitoring & Audit Log**: Blocked attempts are alerted on-screen in real time (`🛡️ [Mutation Guard] BLOCKED...`) and recorded in a live audit log viewable via `/link-mutation log`.
-   - **Workspace Isolation**: Transferred files via `link_send_file` are strictly isolated to `.omp/transfers/` and cannot clobber local project source code.
-   - **Toggling**: Run `/link-mutation off` to allow unrestricted execution, or `/link-mutation on` to re-enable (or launch with `OMP_LINK_ALLOW_MUTATION=1`).
 
 ---
 

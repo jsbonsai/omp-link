@@ -67,6 +67,11 @@ All session control is driven directly inside OMP via slash commands:
 | `/link on` | `/link on` | Re-enables the mesh, reconnects to the network, and resumes peer sync. |
 | `/link-start` | `/link-start [id] [pin]` | Starts or switches to hosting a session with the given ID and PIN. |
 | `/link-join` | `/link-join [id \| ip[:port]] [pin]` | Joins an active session. If no target is given, auto-discovers active sessions on your network mode. |
+| `/link-accept` | `/link-accept [id]` | Approves a pending device join request and issues a persistent device token. |
+| `/link-deny` | `/link-deny [id]` | Rejects a pending device join request. |
+| `/link-requests` | `/link-requests` | Displays all pending join requests awaiting host approval. |
+| `/link-devices` | `/link-devices [revoke <id>]` | Lists paired devices or revokes a device's permanent token. |
+| `/link-exec-mode` | `/link-exec-mode [allow\|block]` | Inspects or toggles remote arbitrary shell execution. |
 | `/link-leave` | `/link-leave` | Disconnects from the current session. (Alias: `/link-disconnect`). |
 | `/link-network` | `/link-network <tailscale \| lan>` | Switches strictly between Tailscale and LAN to prevent duplicate device probing. |
 | `/link-pin` | `/link-pin [pin]` | Displays current PIN or sets a new 4-digit PIN. |
@@ -76,27 +81,31 @@ All session control is driven directly inside OMP via slash commands:
 
 ---
 
-## 5. Security & End-to-End Encryption Model
+## 5. Security & Hardened Architecture Model
 
-`omp-link` enforces a strict **either/or network model** with dual-tier cryptographic security:
+`omp-link` enforces defense-in-depth security across local LAN and Tailscale networks:
 
-1. **Hardware-Accelerated E2EE (AES-256-GCM)**:
-   - All WebSocket frames (chat, direct tool RPC, file chunks) are encrypted via native Node.js `aes-256-gcm`.
-   - Keys are derived via **PBKDF2-HMAC-SHA256** (50,000 rounds) using a cryptographically isolated session salt.
+1. **Always-Prompt First-Time Pairing ("Request Mode")**:
+   - New devices connecting over LAN or Tailscale must be approved on the host terminal via `/link-accept 1`.
+   - Approving issues a persistent cryptographic device token (`~/.omp/paired-devices.json`), enabling automatic reconnects on subsequent sessions without repeated prompts.
+2. **Structured Inspection Operations (No-Shell `execFile`)**:
+   - Replaces shell execution with dedicated structured operations: `git_status`, `git_diff` (`--no-ext-diff`, `--no-textconv`), `git_log`, `search_text` (`git grep`), `read_file`, and `list_dir`.
+   - Executes via `execFile` without invoking a shell interpreter, eliminating shell injection risks.
+3. **Workspace Path Confinement & Traversal Protection**:
+   - Canonical `fs.realpath` verification (`resolveConfinedPath`) guarantees read operations cannot escape the project root.
+   - Denies access to sensitive patterns (`.env*`, `.git/*`, `id_rsa`, `id_ed25519`, `*.pem`, `*.key`, credentials, secrets).
+4. **Hardened 50MB Quarantine Inboxes**:
+   - Ingested files save strictly into `.omp/inbox/<transferId>/<safeFilename>`, ensuring peer files cannot overwrite project files.
+   - Enforces a 50MB transfer ceiling.
+5. **Sanitized Public Discovery (`GET /status`)**:
+   - Unauthenticated discovery requests receive minimal safe metadata (`{ service: "omp-link", version: "3.1.0", active: true, authRequired: true }`).
+   - Completely conceals host paths, working directories, active peers, and PINs.
+6. **Native Hardware-Accelerated E2EE (AES-256-GCM)**:
+   - All WebSocket frames are encrypted via native Node.js `aes-256-gcm` with PBKDF2-HMAC-SHA256 key derivation.
    - 128-bit authentication tags ensure automatic tamper rejection.
-2. **Tailscale Mode (Default when active):**
-   - Connections strictly use the Tailscale network (`100.64.0.0/10`).
-   - Authentication is **automatically verified** via WireGuard cryptographic peer identity (`isTailscaleOrLocalIp`). No PIN entry is needed when linking over Tailscale!
-3. **LAN Mode:**
-   - Connections use the local subnet.
-   - Remote peers **must provide the 4-digit session PIN** to join.
-   - Non-Tailscale connection attempts without a valid PIN are rejected with `4001: Invalid session PIN`.
-4. **Deterministic Link ON/OFF & 3-Strike Circuit Breaker:**
-   - If network is unreachable, reconnect terminates after 3 strikes to avoid log spam.
-   - Running `/link off` cleanly halts all networking until explicit `/link on`.
-5. **Local Mutation Guard (Active by Default)**:
-   - Blocks unauthorized remote peers from executing mutating commands (`rm`, `sed -i`, `git commit`, `chmod`, overwrite redirections).
-   - Enforces workspace isolation: transferred files are saved to `.omp/transfers/` and cannot clobber local project source files.
+7. **Territorial Sovereignty & Mutation Guard**:
+   - Arbitrary remote shell execution is blocked by default. Common read-only commands (`git status`, `git diff`) automatically redirect to safe structured operations.
+   - When remote execution is unlocked (`/link-exec-mode allow`), the **Mutation Guard** blocks mutating commands (`rm`, `sed -i`, `git commit`, `chmod`, `>`/`>>` redirects, package updates).
 
 ---
 
@@ -106,8 +115,8 @@ Agents inside OMP have access to 7 coordination and execution tools:
 
 | Tool | Purpose | Key Parameters | Latency |
 |---|---|---|---|
-| `link_exec` | **Direct Tool RPC (Read-Only)**: Execute inspection commands (`git status`, `git diff`, `pytest`, `cat`, `ls`) or read files on a remote terminal (< 30ms latency). Mutating commands are rejected by the peer node's Mutation Guard. | `{ to: "name", action: "exec" \| "read_file" \| "list_dir", command?: "...", path?: "..." }` | **< 25ms** (Zero Tokens) |
-| `link_send_file` | **Out-of-band File Streaming**: Stream files across machines with 64KB chunking and SHA-256 verification into `.omp/transfers/`. Also generates ephemeral direct HTTP links on `:9900/transfer/:token/:filename`. | `{ to: "name", filePath: "./dist/app.js", targetFilename: "app.js" }` | **< 50ms** |
+| `link_exec` | **Direct Tool RPC (Safe Structured Inspection)**: Execute safe inspection actions (`git_status`, `git_diff`, `git_log`, `search_text`, `read_file`, `list_dir`) across the mesh with canonical path confinement (< 30ms latency). Arbitrary shell execution is blocked by default under Territorial Sovereignty. | `{ to: "name", action: "git_status" \| "git_diff" \| "git_log" \| "search_text" \| "read_file" \| "list_dir" \| "exec", count?: 10, pattern?: "...", filePath?: "..." }` | **< 25ms** (Zero Tokens) |
+| `link_send_file` | **Quarantined Out-of-band File Transfer**: Stream files across machines with 64KB chunking, SHA-256 verification, and automatic quarantine into `.omp/inbox/<transferId>/<safeFilename>`. 50MB ceiling limit. Also generates ephemeral direct HTTP links on `:9900/transfer/:token/:filename`. | `{ to: "name", sourcePath: "./dist/app.js" }` | **< 50ms** |
 | `link_send` | **Agent-to-Agent Reasoning Delegation**: Send tasks or prompts directly into another agent's LLM reasoning loop. Use when code changes or planning are required! | `{ to: "name", message: "..." }` | **15–25s** (LLM turn) |
 | `link_list` | Inspect all connected terminals, their hostnames, projects, status, context window usage, session ID, and network mode. | `{}` | < 5ms |
 | `link_connect` | **Autonomous self-healing**: inspect status, auto-discover & join sessions, start hosting, switch network, or disconnect. | `{ action: "status" \| "join" \| "start" \| "leave", target?: "...", pin?: "...", network?: "tailscale" \| "lan" }` | < 100ms |
