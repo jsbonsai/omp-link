@@ -1,555 +1,612 @@
-import http from "node:http";
+import { test, describe, before, after } from "node:test";
+import assert from "node:assert";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import crypto from "node:crypto";
-import { execFile } from "node:child_process";
 import { WebSocketServer, WebSocket } from "ws";
 
-console.log("=================================================================");
-console.log("🧪 RUNNING OMP-LINK v3.2.0 SECURITY & CRYPTOGRAPHY TEST SUITE");
-console.log("=================================================================\n");
+// Import PRODUCTION modules directly
+import {
+  getOrCreateDeviceIdentity,
+  fingerprintDer,
+  normalizeFingerprint,
+  loadPairedDevices,
+  savePairedDevice,
+  removePairedDevice,
+  derivePairingSas,
+  createInvite,
+  verifyAndConsumeInvite,
+  DEFAULT_PERMISSIONS,
+  FULL_PERMISSIONS,
+} from "../src/identity.js";
 
-let passed = 0;
-let failed = 0;
+import {
+  getServerTlsOptions,
+  getClientTlsOptions,
+  extractPeerCertificate,
+} from "../src/tls.js";
 
-function assert(condition, message) {
-  if (condition) {
-    console.log(`  ✅ PASS: ${message}`);
-    passed++;
-  } else {
-    console.error(`  ❌ FAIL: ${message}`);
-    failed++;
-  }
-}
+import {
+  PROTOCOL_VERSION,
+  parseWireMessage,
+  sanitizeDisplayName,
+} from "../src/protocol-schema.js";
 
-const tempTestDir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-link-test-"));
+import {
+  createConnectionContext,
+  validateMessagePhase,
+  checkMessageDeduplication,
+  setConnectionPhase,
+} from "../src/connection-state.js";
 
-try {
-  // ── TEST 1: Workspace Path Confinement & Traversal Protection ──
-  console.log("Test 1: Workspace Canonical Path Confinement & Traversal Protection");
-  {
-    const workspaceRoot = fs.realpathSync(tempTestDir);
-    const safeFile = path.join(workspaceRoot, "valid-file.txt");
-    fs.writeFileSync(safeFile, "hello world", { mode: 0o600 });
+import {
+  isActionPermitted,
+  bindMessageOrigin,
+  createExecGrant,
+  checkAndConsumeExecGrant,
+  revokeGrantsForPrincipal,
+  revokeAllGrants,
+  getActiveGrants,
+} from "../src/authorization.js";
 
-    const SENSITIVE_PATTERNS = [
-      /^\.env(\..+)?$/i,
-      /id_rsa/i,
-      /id_ed25519/i,
-      /\.pem$/i,
-      /\.key$/i,
-      /^\.git([\\/].*)?$/i,
-      /[\\/]\.git([\\/].*)?$/i,
-      /credentials/i,
-      /secrets?(\.json|\.ya?ml)?$/i,
-    ];
+import {
+  resolveConfinedPath,
+  isSensitivePath,
+  safeGitExecFile,
+  safeGitStatus,
+  safeGitDiff,
+  safeGitGrep,
+  safeReadFile,
+  safeListDir,
+  resolveTrustedGit,
+} from "../src/inspection.js";
 
-    function resolveConfinedPath(baseDir, requestedPath) {
-      if (!requestedPath || typeof requestedPath !== "string") {
-        return { allowed: false, reason: "Missing path parameter" };
-      }
-      if (requestedPath.includes("\0")) {
-        return { allowed: false, reason: "Null bytes forbidden in path" };
-      }
-      let canonicalBase;
-      try {
-        canonicalBase = fs.realpathSync(baseDir || process.cwd());
-      } catch (err) {
-        return { allowed: false, reason: `Base directory invalid: ${err.message}` };
-      }
-      const baseName = path.basename(requestedPath);
-      for (const pattern of SENSITIVE_PATTERNS) {
-        if (pattern.test(baseName) || pattern.test(requestedPath)) {
-          return { allowed: false, reason: `Access to sensitive file or pattern "${baseName}" is blocked` };
-        }
-      }
-      const candidate = path.isAbsolute(requestedPath)
-        ? path.resolve(requestedPath)
-        : path.resolve(canonicalBase, requestedPath);
+import { TransferReceiver, CHUNK_SIZE, MAX_FILE_SIZE } from "../src/transfer-receiver.js";
+import { computeFileHashStreaming, streamFileChunks } from "../src/transfer-sender.js";
+import { LinkNode } from "../src/link-node.js";
+import { appendAuditLog, readAuditLogs, setCustomAuditLogPath } from "../src/audit.js";
 
-      if (fs.existsSync(candidate)) {
-        try {
-          const realCandidate = fs.realpathSync(candidate);
-          if (realCandidate !== canonicalBase && !realCandidate.startsWith(canonicalBase + path.sep)) {
-            return { allowed: false, reason: `Symlink or path traversal escaped workspace root (${canonicalBase})` };
-          }
-          const realBaseName = path.basename(realCandidate);
-          for (const pattern of SENSITIVE_PATTERNS) {
-            if (pattern.test(realBaseName) || pattern.test(realCandidate)) {
-              return { allowed: false, reason: `Access to sensitive file or pattern "${realBaseName}" is blocked` };
-            }
-          }
-          return { allowed: true, fullPath: realCandidate };
-        } catch (err) {
-          return { allowed: false, reason: `Path resolution error: ${err.message}` };
-        }
-      } else {
-        if (candidate !== canonicalBase && !candidate.startsWith(canonicalBase + path.sep)) {
-          return { allowed: false, reason: `Path escapes workspace root (${canonicalBase})` };
-        }
-        return { allowed: true, fullPath: candidate };
-      }
+describe("OMP-LINK v5 Security & Cryptography Suite", () => {
+  let tempDir;
+
+  before(() => {
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-sec-test-"));
+    setCustomAuditLogPath(path.join(tempDir, "test-audit.log"));
+  });
+
+  after(() => {
+    if (tempDir && fs.existsSync(tempDir)) {
+      fs.rmSync(tempDir, { recursive: true, force: true });
     }
+  });
 
-    // 1. Valid workspace file
-    const safeRes = resolveConfinedPath(workspaceRoot, "valid-file.txt");
-    assert(safeRes.allowed === true && safeRes.fullPath === safeFile, "Allowed valid file inside workspace");
+  // ── 1. Device Identity & Pairing ──────────────────────────────────────────
 
-    // 2. Directory traversal attempt (../../etc/passwd)
-    const traversalRes = resolveConfinedPath(workspaceRoot, "../../etc/passwd");
-    assert(traversalRes.allowed === false, `Blocked traversal attempt (../../etc/passwd): ${traversalRes.reason}`);
+  describe("1. Identity & Pairing Security", () => {
+    test("Full SHA-256 SPKI fingerprint is 95 characters long (256-bit)", () => {
+      const id = getOrCreateDeviceIdentity(tempDir);
+      assert.strictEqual(typeof id.fingerprint, "string");
+      assert.strictEqual(id.fingerprint.length, 95); // 32 pairs + 31 colons
+      assert.match(id.fingerprint, /^([0-9A-F]{2}:){31}[0-9A-F]{2}$/);
+      assert.ok(id.principalId.startsWith(`${id.keyType}-sha256:`));
+    });
 
-    // 3. Null byte injection attempt
-    const nullByteRes = resolveConfinedPath(workspaceRoot, "valid-file.txt\0.js");
-    assert(nullByteRes.allowed === false, "Blocked null byte injection attempt");
+    test("Canonical fingerprint normalizes casing and separators", () => {
+      const rawHex = "a0b1c2d3e4f50123456789abcdef0123456789abcdef0123456789abcdef0123";
+      const normalized = normalizeFingerprint(rawHex);
+      assert.strictEqual(normalized.length, 95);
+      assert.strictEqual(normalizeFingerprint(normalized), normalized);
+    });
 
-    // 4. Sensitive file access (.git/config)
-    const gitRes = resolveConfinedPath(workspaceRoot, ".git/config");
-    assert(gitRes.allowed === false, `Blocked sensitive .git access: ${gitRes.reason}`);
+    test("Reject invalid fingerprint length", () => {
+      assert.throws(() => normalizeFingerprint("tooshort"), /Invalid SHA-256 fingerprint length/);
+    });
 
-    // 5. Sensitive file access (.env.production)
-    const envRes = resolveConfinedPath(workspaceRoot, ".env.production");
-    assert(envRes.allowed === false, `Blocked sensitive env file: ${envRes.reason}`);
+    test("Paired devices store and retrieve strictly by canonical fingerprint", () => {
+      const id = getOrCreateDeviceIdentity(tempDir);
+      const pairedDev = {
+        principalId: id.principalId,
+        fingerprint: id.fingerprint,
+        certPem: id.certPem,
+        deviceName: "trusted-node",
+        permissions: DEFAULT_PERMISSIONS,
+        pairedAt: Date.now(),
+      };
+      savePairedDevice(pairedDev, tempDir);
 
-    // 6. Sensitive file access (id_ed25519)
-    const sshRes = resolveConfinedPath(workspaceRoot, "id_ed25519");
-    assert(sshRes.allowed === false, `Blocked sensitive private key: ${sshRes.reason}`);
-  }
+      const loaded = loadPairedDevices(tempDir);
+      const found = loaded.get(normalizeFingerprint(id.fingerprint));
+      assert.ok(found);
+      assert.strictEqual(found.principalId, id.principalId);
+      assert.strictEqual(found.deviceName, "trusted-node");
 
-  // ── TEST 2: Passive & Sanitized Subprocess Execution (safeGitExecFile) ──
-  console.log("\nTest 2: Passive Subprocess Execution (safeGitExecFile Environment & Flags)");
-  await new Promise((resolve) => {
-    const cwd = path.resolve(".");
+      // Removing by principalId succeeds
+      const removed = removePairedDevice(id.principalId, tempDir);
+      assert.strictEqual(removed, true);
+      const afterRemove = loadPairedDevices(tempDir);
+      assert.strictEqual(afterRemove.has(normalizeFingerprint(id.fingerprint)), false);
+    });
 
-    function safeGitExecFile(gitArgs, options, callback) {
-      const safeFlags = [
-        "-c", "core.fsmonitor=false",
-        "-c", "core.pager=cat",
-        "-c", "pager.status=false",
-        "-c", "pager.diff=false",
-        "-c", "pager.log=false",
-        "-c", "diff.external=",
-      ];
+    test("Pairing SAS derivation is deterministic and resists MITM substitution", () => {
+      const cert1 = Buffer.from("dummy-hub-cert-der");
+      const cert2 = Buffer.from("dummy-client-cert-der");
+      const sas1 = derivePairingSas(cert1, cert2, "hub-nonce-1", "cli-nonce-1");
+      const sas2 = derivePairingSas(cert1, cert2, "hub-nonce-1", "cli-nonce-1");
+      assert.strictEqual(sas1, sas2);
 
-      const cleanEnv = { ...process.env };
-      const dangerousVars = [
-        "LD_PRELOAD",
-        "LD_LIBRARY_PATH",
-        "DYLD_INSERT_LIBRARIES",
-        "DYLD_LIBRARY_PATH",
-        "NODE_OPTIONS",
-        "GIT_DIR",
-        "GIT_WORK_TREE",
-        "GIT_CONFIG",
-        "GIT_CONFIG_PARAMETERS",
-        "GIT_EXEC_PATH",
-      ];
-      for (const v of dangerousVars) {
-        delete cleanEnv[v];
-      }
-      cleanEnv.GIT_CONFIG_NOSYSTEM = "1";
-      cleanEnv.GIT_CONFIG_GLOBAL = os.devNull || "/dev/null";
-      cleanEnv.GIT_TERMINAL_PROMPT = "0";
+      // Tampered nonce yields completely different SAS
+      const sasTampered = derivePairingSas(cert1, cert2, "tampered-nonce", "cli-nonce-1");
+      assert.notStrictEqual(sas1, sasTampered);
+    });
 
-      const finalArgs = [...safeFlags, ...gitArgs];
-      execFile("git", finalArgs, {
-        cwd: options.cwd || process.cwd(),
-        env: cleanEnv,
-        maxBuffer: options.maxBuffer || 2 * 1024 * 1024,
-        timeout: options.timeout || 10_000,
-      }, (err, stdout, stderr) => {
-        callback(err, stdout ? stdout.toString() : "", stderr ? stderr.toString() : "", cleanEnv, finalArgs);
-      });
-    }
+    test("One-time pairing invite is consumed and single-use", () => {
+      const id = getOrCreateDeviceIdentity(tempDir);
+      const invite = createInvite(id, { expiresInMs: 60_000 });
+      assert.ok(invite.inviteCode);
+      assert.strictEqual(invite.used, false);
 
-    // Set a dangerous var in process.env to verify sanitization
-    process.env.LD_PRELOAD = "/malicious/lib.so";
-    process.env.NODE_OPTIONS = "--inspect";
+      const firstConsume = verifyAndConsumeInvite(invite.secret);
+      assert.strictEqual(firstConsume.valid, true);
 
-    safeGitExecFile(["status", "--porcelain"], { cwd }, (err, stdout, stderr, sanitizedEnv, finalArgs) => {
-      assert(!err, "safeGitExecFile executes without error");
-      assert(sanitizedEnv.LD_PRELOAD === undefined, "LD_PRELOAD stripped from child process environment");
-      assert(sanitizedEnv.NODE_OPTIONS === undefined, "NODE_OPTIONS stripped from child process environment");
-      assert(sanitizedEnv.GIT_CONFIG_NOSYSTEM === "1", "GIT_CONFIG_NOSYSTEM enforced");
-      assert(sanitizedEnv.GIT_CONFIG_GLOBAL === (os.devNull || "/dev/null"), "GIT_CONFIG_GLOBAL redirected to null device");
-      assert(finalArgs.includes("diff.external="), "diff.external disabled to prevent external binary invocation");
-      assert(finalArgs.includes("core.fsmonitor=false"), "core.fsmonitor disabled to prevent arbitrary IPC commands");
-
-      delete process.env.LD_PRELOAD;
-      delete process.env.NODE_OPTIONS;
-      resolve();
+      // Second attempt rejected
+      const secondConsume = verifyAndConsumeInvite(invite.secret);
+      assert.strictEqual(secondConsume.valid, false);
+      assert.strictEqual(secondConsume.reason, "Invitation not found");
     });
   });
 
-  // ── TEST 3: Status & Discovery Sanitization ──
-  console.log("\nTest 3: Status Endpoint Sanitization (GET /status & Ephemeral Transfers)");
-  await new Promise((resolve) => {
-    const testPort = 19930;
-    const testSecret = "sec-token-1234";
-    const server = http.createServer((req, res) => {
-      if (req.url.startsWith("/status")) {
-        res.writeHead(200, {
-          "content-type": "application/json",
-          "cache-control": "no-store",
+  // ── 2. Protocol State Machine & Schemas ────────────────────────────────────
+
+  describe("2. Protocol v5 State Machine & Schema Guards", () => {
+    test("Strict protocol version 5 enforcement (rejects legacy versions)", () => {
+      const legacyMsg = JSON.stringify({ type: "register", version: 4, name: "legacy-node" });
+      const parsed = parseWireMessage(legacyMsg);
+      assert.strictEqual(parsed.ok, false);
+      assert.strictEqual(parsed.closeCode, 4400);
+      assert.match(parsed.error, /Unsupported protocol version/);
+    });
+
+    test("Rejects malformed JSON and oversized frames", () => {
+      const malformed = parseWireMessage("{bad json");
+      assert.strictEqual(malformed.ok, false);
+      assert.strictEqual(malformed.closeCode, 4400);
+
+      const hugeBuf = Buffer.alloc(3 * 1024 * 1024, "a");
+      const oversized = parseWireMessage(hugeBuf);
+      assert.strictEqual(oversized.ok, false);
+      assert.strictEqual(oversized.closeCode, 4409);
+    });
+
+    test("Sanitizes control characters from display names (anti-ANSI injection)", () => {
+      const maliciousName = "peer\x1B[31m-admin\x00\x07";
+      const cleaned = sanitizeDisplayName(maliciousName);
+      assert.strictEqual(cleaned, "peer-admin");
+      assert.strictEqual(cleaned.includes("\x1B"), false);
+    });
+
+    test("Connection phase: tls-connected permits client_hello only", () => {
+      const ctx = createConnectionContext({ socket: {} });
+      assert.strictEqual(ctx.phase, "tls-connected");
+
+      assert.strictEqual(validateMessagePhase(ctx, "client_hello").allowed, true);
+      assert.strictEqual(validateMessagePhase(ctx, "chat").allowed, false);
+      assert.strictEqual(validateMessagePhase(ctx, "rpc_request").allowed, false);
+
+      // Duplicate hello rejected
+      ctx.helloReceived = true;
+      assert.strictEqual(validateMessagePhase(ctx, "client_hello").allowed, false);
+    });
+
+    test("Connection phase: awaiting-pairing strictly forbids application traffic", () => {
+      const ctx = createConnectionContext({ socket: {} });
+      ctx.phase = "awaiting-pairing";
+
+      assert.strictEqual(validateMessagePhase(ctx, "chat").allowed, false);
+      assert.strictEqual(validateMessagePhase(ctx, "file_offer").allowed, false);
+      assert.strictEqual(validateMessagePhase(ctx, "rpc_request").allowed, false);
+      assert.strictEqual(validateMessagePhase(ctx, "pair_verify").allowed, true);
+    });
+
+    test("Connection phase: authenticated forbids handshake frames", () => {
+      const ctx = createConnectionContext({ socket: {} });
+      setConnectionPhase(ctx, "authenticated");
+
+      assert.strictEqual(validateMessagePhase(ctx, "client_hello").allowed, false);
+      assert.strictEqual(validateMessagePhase(ctx, "pair_request").allowed, false);
+      assert.strictEqual(validateMessagePhase(ctx, "chat").allowed, true);
+      assert.strictEqual(validateMessagePhase(ctx, "rpc_request").allowed, true);
+    });
+
+    test("Per-connection message deduplication cache", () => {
+      const ctx = createConnectionContext({ socket: {} });
+      assert.strictEqual(checkMessageDeduplication(ctx, "msg-001"), true);
+      assert.strictEqual(checkMessageDeduplication(ctx, "msg-001"), false);
+      assert.strictEqual(checkMessageDeduplication(ctx, "msg-002"), true);
+    });
+  });
+
+  // ── 3. Capability Enforcement & Execution Grants ──────────────────────────
+
+  describe("3. Capability Enforcement & Execution Grants", () => {
+    test("Action capability mapping strictly matches security policy", () => {
+      const baseChat = { type: "chat", version: 5, id: "1", text: "hi", ts: Date.now() };
+      assert.strictEqual(isActionPermitted({ ...DEFAULT_PERMISSIONS, message: true }, baseChat).permitted, true);
+      assert.strictEqual(isActionPermitted({ ...DEFAULT_PERMISSIONS, message: false }, baseChat).permitted, false);
+
+      const baseInspect = { type: "rpc_request", version: 5, id: "2", to: "hub", action: "git_status", ts: Date.now() };
+      assert.strictEqual(isActionPermitted({ ...DEFAULT_PERMISSIONS, inspect: false }, baseInspect).permitted, false);
+      assert.strictEqual(isActionPermitted({ ...DEFAULT_PERMISSIONS, inspect: true }, baseInspect).permitted, true);
+
+      const baseExec = { type: "rpc_request", version: 5, id: "3", to: "hub", action: "exec", params: { command: "ls" }, ts: Date.now() };
+      assert.strictEqual(isActionPermitted({ ...DEFAULT_PERMISSIONS, execRequest: false }, baseExec).permitted, false);
+      assert.strictEqual(isActionPermitted({ ...DEFAULT_PERMISSIONS, execRequest: true }, baseExec).permitted, true);
+    });
+
+    test("Authoritative origin derivation ignores claimed sender in wire message", () => {
+      const ctx = createConnectionContext({ socket: {} });
+      ctx.principalId = "ed25519-sha256:AUTHENTICATED_KEY_123";
+      ctx.displayName = "real-node";
+
+      const spoofedMsg = {
+        type: "chat",
+        version: 5,
+        id: "s-1",
+        from: "spoofed-admin",
+        to: "hub",
+        text: "hello",
+        ts: Date.now(),
+      };
+
+      const bound = bindMessageOrigin(spoofedMsg, ctx);
+      assert.strictEqual(bound.from, "real-node");
+      assert.strictEqual(bound.originPrincipalId, "ed25519-sha256:AUTHENTICATED_KEY_123");
+    });
+
+    test("Execution grants are keyed by principalId and expire after single use", () => {
+      const principal = "ed25519-sha256:TEST_DEV_KEY";
+      revokeAllGrants();
+
+      // Blocked before grant
+      assert.strictEqual(checkAndConsumeExecGrant(principal).allowed, false);
+
+      // Create single-use grant
+      const grant = createExecGrant(principal, "test-peer", { maxUses: 1, durationMs: 10_000 });
+      assert.strictEqual(grant.principalId, principal);
+      assert.strictEqual(grant.remainingUses, 1);
+
+      // First use succeeds
+      const check1 = checkAndConsumeExecGrant(principal);
+      assert.strictEqual(check1.allowed, true);
+
+      // Second use fails (single use exhausted)
+      const check2 = checkAndConsumeExecGrant(principal);
+      assert.strictEqual(check2.allowed, false);
+      assert.match(check2.reason, /No active execution grant found/);
+    });
+
+    test("Execution grants revoked immediately on peer disconnect", () => {
+      const principal = "ed25519-sha256:DISCONNECT_TEST";
+      createExecGrant(principal, "peer-disc", { maxUses: 5, durationMs: 60_000 });
+      assert.strictEqual(getActiveGrants().some((g) => g.principalId === principal), true);
+
+      // Revoke on disconnect
+      const revokedCount = revokeGrantsForPrincipal(principal, "Peer disconnected");
+      assert.strictEqual(revokedCount, 1);
+      assert.strictEqual(checkAndConsumeExecGrant(principal).allowed, false);
+    });
+
+    test("A new peer reusing the display name does NOT inherit another device's grant", () => {
+      const oldPrincipal = "ed25519-sha256:OLD_DEVICE";
+      const newPrincipal = "ed25519-sha256:NEW_DEVICE_SAME_NAME";
+      createExecGrant(oldPrincipal, "worker-node", { maxUses: 5 });
+
+      // Check with new principal fails even if display name was identical
+      const check = checkAndConsumeExecGrant(newPrincipal);
+      assert.strictEqual(check.allowed, false);
+    });
+  });
+
+  // ── 4. Workspace Canonical Path Confinement & Inspection ───────────────────
+
+  describe("4. Workspace Path Confinement & Inspection Security", () => {
+    test("Blocks directory traversal and path escapes", () => {
+      const res1 = resolveConfinedPath(tempDir, "../../etc/passwd");
+      assert.strictEqual(res1.allowed, false);
+      assert.match(res1.reason, /escapes workspace root/);
+
+      const res2 = resolveConfinedPath(tempDir, "valid-file.txt\0.js");
+      assert.strictEqual(res2.allowed, false);
+      assert.match(res2.reason, /Null bytes forbidden/);
+    });
+
+    test("Blocks sensitive file patterns (.env, keys, credentials)", () => {
+      const sensitiveList = [
+        ".env",
+        ".env.production",
+        "id_rsa",
+        "id_ed25519",
+        "cert.pem",
+        "server.key",
+        "credentials.json",
+        ".git/config",
+      ];
+      for (const s of sensitiveList) {
+        assert.strictEqual(isSensitivePath(s), true, `Expected sensitive: ${s}`);
+        const res = resolveConfinedPath(tempDir, s);
+        assert.strictEqual(res.allowed, false);
+        assert.match(res.reason, /sensitive file or pattern/);
+      }
+    });
+
+    test("safeGitExecFile sanitizes environment and enforces security flags", async () => {
+      process.env.LD_PRELOAD = "/malicious/preload.so";
+      process.env.NODE_OPTIONS = "--inspect";
+
+      await new Promise((resolve) => {
+        safeGitExecFile(["status", "--porcelain=v1"], { cwd: tempDir }, (err, stdout, stderr, cleanEnv, finalArgs) => {
+          assert.strictEqual(cleanEnv.LD_PRELOAD, undefined);
+          assert.strictEqual(cleanEnv.NODE_OPTIONS, undefined);
+          assert.strictEqual(cleanEnv.GIT_CONFIG_NOSYSTEM, "1");
+          assert.ok(finalArgs.includes("core.fsmonitor=false"));
+          assert.ok(finalArgs.includes("diff.external="));
+          delete process.env.LD_PRELOAD;
+          delete process.env.NODE_OPTIONS;
+          resolve();
         });
-        const authHeader = req.headers["authorization"] || "";
-        const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : "";
-        if (token === testSecret) {
-          res.end(JSON.stringify({
-            service: "omp-link",
-            protocolVersion: 4,
-            instanceId: "inst-abc",
-            pairingRequired: true,
-            authenticated: true,
-            terminals: [{ name: "node-a", cwd: "/Users/secret/path" }],
-          }));
-        } else {
-          // Public sanitized response
-          res.end(JSON.stringify({
-            service: "omp-link",
-            protocolVersion: 4,
-            instanceId: "inst-abc",
-            pairingRequired: true,
-            fingerprint: "AA:BB:CC:DD:EE",
-            tls: true,
-          }));
-        }
-      } else if (req.url.startsWith("/transfer/")) {
-        const authHeader = req.headers["authorization"] || "";
-        if (authHeader !== "Bearer " + testSecret) {
-          res.writeHead(401, { "content-type": "application/json" });
-          res.end(JSON.stringify({ error: "Unauthorized" }));
-          return;
-        }
-        res.writeHead(200, { "content-type": "application/octet-stream" });
-        res.end("file-contents");
-      }
+      });
     });
 
-    server.listen(testPort, async () => {
-      // 1. Unauthenticated discovery request
-      const unauthRes = await fetch(`http://127.0.0.1:${testPort}/status`);
-      const unauthJson = await unauthRes.json();
-      assert(unauthRes.headers.get("cache-control") === "no-store", "Cache-Control: no-store header returned");
-      assert(unauthJson.service === "omp-link", "service identifies as omp-link");
-      assert(unauthJson.protocolVersion === 4, "protocolVersion is 4");
-      assert(unauthJson.pairingRequired === true, "pairingRequired is true");
-      assert(unauthJson.terminals === undefined, "terminals and local paths NOT leaked to unauthenticated caller");
-      assert(unauthJson.pin === undefined, "PIN NOT leaked to unauthenticated caller");
+    test("safeReadFile bounds maximum byte read without allocating entire file", async () => {
+      const testFile = path.join(tempDir, "large-test.txt");
+      fs.writeFileSync(testFile, Buffer.alloc(100 * 1024, "X"));
 
-      // 2. Query parameter token attempt (should NOT authenticate)
-      const queryRes = await fetch(`http://127.0.0.1:${testPort}/status?token=${testSecret}`);
-      const queryJson = await queryRes.json();
-      assert(queryJson.authenticated === undefined, "Query parameter tokens rejected for status authorization");
+      const readRes = await safeReadFile(tempDir, "large-test.txt", 1024);
+      assert.strictEqual(readRes.ok, true);
+      assert.strictEqual(readRes.content.length, 1024);
+      assert.strictEqual(readRes.truncated, true);
+    });
 
-      // 3. Ephemeral file download without Bearer header
-      const transferUnauth = await fetch(`http://127.0.0.1:${testPort}/transfer/tx-999`);
-      assert(transferUnauth.status === 401, "Transfer endpoint rejects unauthenticated access");
-
-      // 4. Ephemeral file download with Bearer header
-      const transferAuth = await fetch(`http://127.0.0.1:${testPort}/transfer/tx-999`, {
-        headers: { authorization: `Bearer ${testSecret}` },
-      });
-      const content = await transferAuth.text();
-      assert(transferAuth.status === 200 && content === "file-contents", "Transfer endpoint allows authenticated download");
-
-      server.close(() => resolve());
+    test("safeGitGrep excludes sensitive files and limits pattern length", async () => {
+      const hugePattern = "a".repeat(600);
+      const longRes = await safeGitGrep(tempDir, hugePattern);
+      assert.strictEqual(longRes.ok, false);
+      assert.match(longRes.error, /exceeds 512 characters/);
     });
   });
 
-  // ── TEST 4: Ed25519 Cryptographic Challenge-Response Authentication ──
-  console.log("\nTest 4: Ed25519 Cryptographic Challenge-Response Device Authentication");
-  {
-    // Generate Ed25519 identity keypair
-    const { publicKey, privateKey } = crypto.generateKeyPairSync("ed25519", {
-      publicKeyEncoding: { type: "spki", format: "pem" },
-      privateKeyEncoding: { type: "pkcs8", format: "pem" },
+  // ── 5. File Transfer Quarantine & Streaming ────────────────────────────────
+
+  describe("5. File Transfer Quarantine & Streaming Hardening", () => {
+    let receiver;
+
+    before(() => {
+      receiver = new TransferReceiver(tempDir);
     });
 
-    const spkiDer = crypto.createPublicKey(publicKey).export({ type: "spki", format: "der" });
-    const fingerprint = crypto.createHash("sha256").update(spkiDer).digest("hex")
-      .toUpperCase().match(/.{1,2}/g).join(":");
+    test("Rejects invalid offer sizes, negative values, and chunk count mismatches", () => {
+      const badSizeOffer = {
+        type: "file_offer",
+        version: 5,
+        id: "1",
+        transferId: "tx-bad-size",
+        from: "peer",
+        to: "hub",
+        filename: "test.bin",
+        sizeBytes: -10,
+        totalChunks: 1,
+        sha256: "a".repeat(64),
+        ts: Date.now(),
+      };
+      assert.strictEqual(receiver.handleOffer(badSizeOffer).ok, false);
 
-    assert(fingerprint.length === 95, `Computed valid SHA-256 fingerprint: ${fingerprint.slice(0, 23)}...`);
-
-    // Hub generates 32-byte nonce
-    const nonce = crypto.randomBytes(32).toString("hex");
-    const timestamp = Date.now();
-    const challengePayload = Buffer.from(`${nonce}:${timestamp}`, "utf-8");
-
-    // Client signs challenge with private key
-    const signature = crypto.sign(null, challengePayload, privateKey).toString("base64");
-
-    // Hub verifies signature
-    const isValid = crypto.verify(
-      null,
-      challengePayload,
-      crypto.createPublicKey(publicKey),
-      Buffer.from(signature, "base64"),
-    );
-    assert(isValid === true, "Valid challenge signature verified successfully with public key");
-
-    // Forgery attempt: client mutates nonce
-    const tamperedPayload = Buffer.from(`tampered-${nonce}:${timestamp}`, "utf-8");
-    const isTamperedValid = crypto.verify(
-      null,
-      tamperedPayload,
-      crypto.createPublicKey(publicKey),
-      Buffer.from(signature, "base64"),
-    );
-    assert(isTamperedValid === false, "Tampered challenge signature strictly rejected");
-
-    // Stale timestamp rejection (> 30s)
-    const staleTimestamp = Date.now() - 35_000;
-    const isTimestampFresh = Math.abs(Date.now() - staleTimestamp) <= 30_000;
-    assert(isTimestampFresh === false, "Challenge responses with stale timestamps (>30s) strictly rejected");
-  }
-
-  // ── TEST 5: Ephemeral X25519 + HKDF-SHA256 Forward-Secret Session Keys & AAD Binding ──
-  console.log("\nTest 5: Ephemeral X25519 + HKDF-SHA256 Session Keys & AAD Protocol v4 Frames");
-  {
-    // Node A (Host / Hub) ephemeral X25519
-    const hubEph = crypto.generateKeyPairSync("x25519");
-    const hubPubDer = hubEph.publicKey.export({ type: "spki", format: "der" });
-
-    // Node B (Client) ephemeral X25519
-    const clientEph = crypto.generateKeyPairSync("x25519");
-    const clientPubDer = clientEph.publicKey.export({ type: "spki", format: "der" });
-
-    // Both parties perform Diffie-Hellman
-    const hubShared = crypto.diffieHellman({
-      privateKey: hubEph.privateKey,
-      publicKey: crypto.createPublicKey({ key: clientPubDer, format: "der", type: "spki" }),
+      const badChunkOffer = {
+        ...badSizeOffer,
+        transferId: "tx-bad-chunks",
+        sizeBytes: 100_000,
+        totalChunks: 999, // mismatch with Math.ceil(100000 / 65536) = 2
+      };
+      assert.strictEqual(receiver.handleOffer(badChunkOffer).ok, false);
     });
 
-    const clientShared = crypto.diffieHellman({
-      privateKey: clientEph.privateKey,
-      publicKey: crypto.createPublicKey({ key: hubPubDer, format: "der", type: "spki" }),
+    test("Enforces sequential chunk order and binds sender to offer", () => {
+      const content = Buffer.from("Hello Secure Mesh Chunk Ordering!");
+      const sha256 = crypto.createHash("sha256").update(content).digest("hex");
+      const offer = {
+        type: "file_offer",
+        version: 5,
+        id: "off-1",
+        transferId: "tx-order-test",
+        from: "sender-a",
+        to: "hub",
+        filename: "data.txt",
+        sizeBytes: content.length,
+        totalChunks: 1,
+        sha256,
+        ts: Date.now(),
+      };
+
+      const offerRes = receiver.handleOffer(offer);
+      assert.strictEqual(offerRes.ok, true);
+
+      // Wrong sender rejected
+      const wrongSenderChunk = {
+        type: "file_chunk",
+        version: 5,
+        id: "c-1",
+        transferId: "tx-order-test",
+        from: "adversary",
+        to: "hub",
+        chunkIndex: 0,
+        totalChunks: 1,
+        data: content.toString("base64"),
+        ts: Date.now(),
+      };
+      const resWrongSender = receiver.handleChunk(wrongSenderChunk);
+      assert.strictEqual(resWrongSender.ok, false);
+      assert.match(resWrongSender.error, /Sender does not match/);
     });
 
-    assert(hubShared.equals(clientShared), "X25519 Diffie-Hellman yields identical shared secret on both peers");
+    test("Atomic move to quarantine outside workspace and verifies SHA-256", () => {
+      const content = Buffer.from("Streaming transfer with direct-to-disk verification");
+      const sha256 = crypto.createHash("sha256").update(content).digest("hex");
+      const transferId = `tx-verify-${Date.now()}`;
 
-    // Derive 256-bit AES-GCM session key via HKDF-SHA256
-    const salt = Buffer.from("omp-link-v4-salt");
-    const info = Buffer.from("omp-link-v4-session");
-    const hubSessionKey = crypto.hkdfSync("sha256", hubShared, salt, info, 32);
-    const clientSessionKey = crypto.hkdfSync("sha256", clientShared, salt, info, 32);
+      const offer = {
+        type: "file_offer",
+        version: 5,
+        id: "off-2",
+        transferId,
+        from: "sender-valid",
+        to: "hub",
+        filename: "verify.txt",
+        sizeBytes: content.length,
+        totalChunks: 1,
+        sha256,
+        ts: Date.now(),
+      };
 
-    assert(Buffer.from(hubSessionKey).equals(Buffer.from(clientSessionKey)), "HKDF-SHA256 derives matching 256-bit forward-secret session key");
+      assert.strictEqual(receiver.handleOffer(offer).ok, true);
 
-    // Encrypt frame with AES-256-GCM and bind AAD (v: 4, mid, seq, from, ts)
-    const mid = "mid-" + crypto.randomUUID();
-    const seq = 1;
-    const from = "node-client";
-    const ts = Date.now();
-    const plaintext = JSON.stringify({ type: "chat", content: "Top secret multi-agent command" });
+      const chunk = {
+        type: "file_chunk",
+        version: 5,
+        id: "c-0",
+        transferId,
+        from: "sender-valid",
+        to: "hub",
+        chunkIndex: 0,
+        totalChunks: 1,
+        data: content.toString("base64"),
+        ts: Date.now(),
+      };
 
-    const iv = crypto.randomBytes(12);
-    const cipher = crypto.createCipheriv("aes-256-gcm", Buffer.from(clientSessionKey), iv);
-    const aad = Buffer.from(`v:4|mid:${mid}|seq:${seq}|from:${from}|ts:${ts}`, "utf-8");
-    cipher.setAAD(aad);
+      const res = receiver.handleChunk(chunk);
+      assert.strictEqual(res.complete, true);
+      assert.strictEqual(res.ok, true);
+      assert.ok(res.finalPath);
+      assert.strictEqual(fs.readFileSync(res.finalPath, "utf8"), content.toString("utf8"));
+      // Quarantine is inside ~/.omp/inbox, NOT inside working tree
+      assert.ok(res.finalPath.includes(path.join(tempDir, "inbox")));
+    });
 
-    let ciphertext = cipher.update(plaintext, "utf-8", "base64");
-    ciphertext += cipher.final("base64");
-    const tag = cipher.getAuthTag().toString("base64");
+    test("Sender computes streaming hash without allocating entire file", async () => {
+      const srcFile = path.join(tempDir, "sender-test.bin");
+      const buf = crypto.randomBytes(128 * 1024);
+      fs.writeFileSync(srcFile, buf);
 
-    const wireFrame = {
-      type: "encrypted",
-      v: 4,
-      mid,
-      seq,
-      from,
-      ts,
-      iv: iv.toString("base64"),
-      ciphertext,
-      tag,
-    };
+      const info = await computeFileHashStreaming(srcFile);
+      const expectedSha = crypto.createHash("sha256").update(buf).digest("hex");
+      assert.strictEqual(info.sha256, expectedSha);
+      assert.strictEqual(info.sizeBytes, 128 * 1024);
+      assert.strictEqual(info.totalChunks, 2);
+    });
+  });
 
-    // Hub decrypts frame
-    function decryptFrame(frame, key) {
-      if (frame.v !== 4) throw new Error("Unsupported protocol version");
-      const decipher = crypto.createDecipheriv(
-        "aes-256-gcm",
-        Buffer.from(key),
-        Buffer.from(frame.iv, "base64"),
-      );
-      const frameAad = Buffer.from(`v:4|mid:${frame.mid}|seq:${frame.seq}|from:${frame.from}|ts:${frame.ts}`, "utf-8");
-      decipher.setAAD(frameAad);
-      decipher.setAuthTag(Buffer.from(frame.tag, "base64"));
-      let decrypted = decipher.update(frame.ciphertext, "base64", "utf-8");
-      decrypted += decipher.final("utf-8");
-      return JSON.parse(decrypted);
-    }
+  // ── 6. Discovery & Status Endpoint Sanitization ───────────────────────────
 
-    const decryptedMsg = decryptFrame(wireFrame, hubSessionKey);
-    assert(decryptedMsg.content === "Top secret multi-agent command", "Decrypted AES-256-GCM message matches original plaintext");
-
-    // Tamper with AAD: adversary modifies 'from' field in wire frame
-    let tamperDetected = false;
-    try {
-      const tamperedFrame = { ...wireFrame, from: "impersonated-node" };
-      decryptFrame(tamperedFrame, hubSessionKey);
-    } catch {
-      tamperDetected = true;
-    }
-    assert(tamperDetected === true, "Adversarial modification of wire headers (from) caught by AES-GCM authentication tag");
-
-    // Replay Attack Test: Duplicate mid rejection
-    const seenMessageIds = new Set();
-    function checkReplay(frameMid) {
-      if (seenMessageIds.has(frameMid)) return false;
-      seenMessageIds.add(frameMid);
-      return true;
-    }
-    assert(checkReplay(wireFrame.mid) === true, "First message with mid accepted");
-    assert(checkReplay(wireFrame.mid) === false, "Replayed message with identical mid rejected");
-  }
-
-  // ── TEST 6: Streaming File Inbox & DoS Protections ──
-  console.log("\nTest 6: Streaming File Inbox (64KB Chunk Limit & Direct-to-Disk Hash Verification)");
-  {
-    const inboxDir = path.join(tempTestDir, "inbox");
-    fs.mkdirSync(inboxDir, { recursive: true, mode: 0o700 });
-
-    // 1. TransferId validation
-    const validTransferId = "tx_valid-123_ABC";
-    const invalidTransferId = "../../evil-id";
-    const transferIdRegex = /^[a-zA-Z0-9_-]{1,64}$/;
-    assert(transferIdRegex.test(validTransferId) === true, "Valid transferId accepted");
-    assert(transferIdRegex.test(invalidTransferId) === false, "Path traversal in transferId rejected");
-
-    // 2. Chunk size limit (64KB = 65536)
-    const validChunk = Buffer.alloc(64 * 1024, "a");
-    const oversizedChunk = Buffer.alloc(64 * 1024 + 1, "b");
-    assert(validChunk.length <= 65536, "64KB chunk within permissible ceiling");
-    assert(oversizedChunk.length > 65536, "Chunk exceeding 64KB flagged as oversized (DoS vector)");
-
-    // 3. Streaming file chunks directly to .tmp-<id>.part
-    const transferId = "tx-stream-test";
-    const targetFilename = "streamed-data.bin";
-    const partPath = path.join(inboxDir, `.tmp-${transferId}.part`);
-    const finalPath = path.join(inboxDir, targetFilename);
-
-    const chunk1 = Buffer.from("CHUNK_DATA_PART_1_");
-    const chunk2 = Buffer.from("CHUNK_DATA_PART_2_");
-    const expectedHash = crypto.createHash("sha256").update(chunk1).update(chunk2).digest("hex");
-
-    // Stream chunk 1
-    const hasher = crypto.createHash("sha256");
-    fs.appendFileSync(partPath, chunk1, { mode: 0o600 });
-    hasher.update(chunk1);
-
-    // Stream chunk 2
-    fs.appendFileSync(partPath, chunk2, { mode: 0o600 });
-    hasher.update(chunk2);
-
-    const computedHash = hasher.digest("hex");
-    assert(computedHash === expectedHash, "Streaming SHA-256 hash matches full data");
-
-    // Atomic move to final destination
-    fs.renameSync(partPath, finalPath);
-    assert(fs.existsSync(finalPath) === true, "File atomically moved to final destination");
-    assert(fs.existsSync(partPath) === false, "Temporary .part file removed after atomic rename");
-    assert(fs.readFileSync(finalPath, "utf-8") === "CHUNK_DATA_PART_1_CHUNK_DATA_PART_2_", "Reconstructed file content verified");
-  }
-
-  // ── TEST 7: Ephemeral Peer Execution Elevation & Territorial Sovereignty ──
-  console.log("\nTest 7: Ephemeral Peer Execution Elevation & Territorial Sovereignty");
-  {
-    const activeExecGrants = new Map();
-    const auditLogs = [];
-
-    function appendAuditLog(entry) {
-      auditLogs.push(entry);
-    }
-
-    function grantExecElevation(peer, minutes = 1) {
-      const durationMs = minutes * 60_000;
-      activeExecGrants.set(peer, {
-        peer,
-        grantedAt: Date.now(),
-        expiresAt: Date.now() + durationMs,
+  describe("6. Discovery & Minimal Public Status", () => {
+    test("Status headers include no-store, CSP none, and nosniff", async () => {
+      const testPort = 19945;
+      const node = new LinkNode({
+        port: testPort,
+        customOmpDir: tempDir,
       });
-      appendAuditLog({ type: "grant", peer, durationMinutes: minutes, action: "granted" });
-    }
 
-    function revokeExecElevation(peer) {
-      if (activeExecGrants.has(peer)) {
-        activeExecGrants.delete(peer);
-        appendAuditLog({ type: "grant", peer, action: "revoked" });
-        return true;
-      }
-      return false;
-    }
+      await node.startHub();
 
-    function handleRpcExecutionRequest(peer, action, command) {
-      if (action === "exec") {
-        const trimmed = (command || "").trim();
-        // Safe transparent redirection for git read-only commands
-        if (trimmed === "git status" || trimmed === "git status --porcelain") {
-          return { ok: true, method: "safeGitExecFile", result: "M file.txt" };
-        }
-        if (trimmed === "git diff") {
-          return { ok: true, method: "safeGitExecFile", result: "diff --git..." };
-        }
+      const https = await import("node:https");
+      const agent = new https.Agent({ rejectUnauthorized: false, minVersion: "TLSv1.3" });
 
-        // Check ephemeral elevation grant
-        const grant = activeExecGrants.get(peer);
-        if (!grant || Date.now() > grant.expiresAt) {
-          activeExecGrants.delete(peer);
-          return {
-            ok: false,
-            error: `REMOTE EXECUTION BLOCKED: Arbitrary shell execution requires temporary host elevation. Host can grant with: /link grant ${peer} [minutes]`,
-          };
-        }
+      const res = await new Promise((resolve, reject) => {
+        https.get(`https://127.0.0.1:${testPort}/status`, { agent }, (resp) => {
+          let data = "";
+          resp.on("data", (chunk) => data += chunk);
+          resp.on("end", () => resolve({ headers: resp.headers, body: JSON.parse(data) }));
+          resp.on("error", reject);
+        });
+      });
 
-        appendAuditLog({ type: "exec", peer, command, elevated: true });
-        return { ok: true, method: "execFile", result: `Executed: ${command}` };
-      }
-      return { ok: false, error: "Unknown action" };
-    }
+      assert.strictEqual(res.headers["cache-control"], "no-store");
+      assert.strictEqual(res.headers["content-security-policy"], "default-src 'none'");
+      assert.strictEqual(res.headers["x-content-type-options"], "nosniff");
 
-    // 1. Un-elevated peer attempts arbitrary command
-    const res1 = handleRpcExecutionRequest("remote-node-1", "exec", "npm test");
-    assert(res1.ok === false && res1.error.includes("REMOTE EXECUTION BLOCKED"), "Arbitrary execution blocked by default for un-elevated peer");
+      // Payload is minimal & public
+      assert.strictEqual(res.body.service, "omp-link");
+      assert.strictEqual(res.body.protocolVersion, 5);
+      assert.strictEqual(res.body.pairingAvailable, true);
+      assert.strictEqual(res.body.transport, "wss");
+      assert.strictEqual(typeof res.body.certificateFingerprint, "string");
 
-    // 2. Read-only git status transparently executes via safeGitExecFile without elevation
-    const res2 = handleRpcExecutionRequest("remote-node-1", "exec", "git status");
-    assert(res2.ok === true && res2.method === "safeGitExecFile", "git status transparently routed to safeGitExecFile without elevation");
+      // NO terminals, NO cwds, NO paths, NO secrets leaked
+      assert.strictEqual(res.body.terminals, undefined);
+      assert.strictEqual(res.body.cwd, undefined);
+      assert.strictEqual(res.body.pin, undefined);
 
-    // 3. Host grants temporary elevation
-    grantExecElevation("remote-node-1", 5);
-    assert(activeExecGrants.has("remote-node-1"), "Execution grant active in activeExecGrants map");
+      await node.stop();
+    });
+  });
 
-    // 4. Elevated peer attempts arbitrary command
-    const res3 = handleRpcExecutionRequest("remote-node-1", "exec", "npm test");
-    assert(res3.ok === true && res3.method === "execFile", "Arbitrary command succeeds while elevation grant is active");
+  // ── 7. Mutual TLS Loopback Integration ────────────────────────────────────
 
-    // 5. Host revokes elevation
-    revokeExecElevation("remote-node-1");
-    const res4 = handleRpcExecutionRequest("remote-node-1", "exec", "npm test");
-    assert(res4.ok === false && res4.error.includes("REMOTE EXECUTION BLOCKED"), "Arbitrary command immediately blocked after elevation revoked");
+  describe("7. Mutual TLS 1.3 Loopback Integration", () => {
+    test("Hub and client perform full mutual TLS 1.3 handshake and exchange authenticated frames", async () => {
+      const testPort = 19946;
+      const hubDir = fs.mkdtempSync(path.join(os.tmpdir(), "hub-dir-"));
+      const clientDir = fs.mkdtempSync(path.join(os.tmpdir(), "client-dir-"));
 
-    // 6. Verify audit logs
-    assert(auditLogs.some(l => l.action === "granted"), "Elevation grant logged to audit log");
-    assert(auditLogs.some(l => l.type === "exec" && l.command === "npm test"), "Elevated execution logged to audit log");
-    assert(auditLogs.some(l => l.action === "revoked"), "Elevation revocation logged to audit log");
-  }
+      const hub = new LinkNode({
+        port: testPort,
+        customOmpDir: hubDir,
+        terminalName: "hub-node",
+      });
 
-} finally {
-  // Clean up temporary test directory
-  try {
-    fs.rmSync(tempTestDir, { recursive: true, force: true });
-  } catch {}
-}
+      const client = new LinkNode({
+        port: 0,
+        customOmpDir: clientDir,
+        terminalName: "client-node",
+      });
 
-console.log("\n=================================================================");
-console.log(`TEST RESULTS: ${passed} PASSED, ${failed} FAILED`);
-console.log("=================================================================");
+      await hub.startHub();
 
-if (failed > 0) {
-  process.exit(1);
-} else {
-  process.exit(0);
-}
+      // Pre-pair client on hub to allow immediate authentication
+      const clientIdentity = client.identity;
+      const pairedClient = {
+        principalId: clientIdentity.principalId,
+        fingerprint: clientIdentity.fingerprint,
+        certPem: clientIdentity.certPem,
+        deviceName: "client-node",
+        permissions: FULL_PERMISSIONS,
+        pairedAt: Date.now(),
+      };
+      savePairedDevice(pairedClient, hubDir);
+
+      let receivedOnHub = null;
+      hub.onMessage = (msg) => {
+        receivedOnHub = msg;
+      };
+
+      await client.connectToHub(`wss://127.0.0.1:${testPort}`, hub.identity.fingerprint);
+
+      // Wait for authentication
+      await new Promise((r) => setTimeout(r, 200));
+
+      // Client sends authenticated message to hub
+      const sent = client.sendMessage("hub-node", "Hello from Mutual TLS client!");
+      assert.strictEqual(sent, true);
+
+      // Wait for receipt
+      await new Promise((r) => setTimeout(r, 300));
+      assert.ok(receivedOnHub);
+      assert.strictEqual(receivedOnHub.text, "Hello from Mutual TLS client!");
+      assert.strictEqual(receivedOnHub.from, "client-node");
+      assert.strictEqual(receivedOnHub.originPrincipalId, clientIdentity.principalId);
+
+      // Clean up
+      await client.stop();
+      await hub.stop();
+      fs.rmSync(hubDir, { recursive: true, force: true });
+      fs.rmSync(clientDir, { recursive: true, force: true });
+    });
+  });
+});

@@ -10,25 +10,24 @@
 When `omp-link` is running, type `/link` inside OMP to see your live mesh dashboard:
 
 ```text
-⚡ OMP LINK: ACTIVE (E2EE: AES-256-GCM)
+⚡ OMP LINK STATUS (v5)
 ────────────────────────────────────────────────────────────
-  Session ID : team-swarm
-  Network    : LAN (PIN: 4821)  [or TAILSCALE: auto-verified via WireGuard]
-  Endpoint   : 192.168.1.50:9900
-  Encryption : Hardware-accelerated AES-256-GCM (Zero plaintext wire leakage)
-  Role       : Host (macbook-pro)
+  Mesh State  : ACTIVE
+  Node Role   : Host (macbook-pro)
+  Session     : "team-swarm" [TAILSCALE / LAN]
+  Principal   : ed25519-sha256:FA:3B:5C:FE:... (256-bit SHA-256)
+  Transport   : Mutual TLS 1.3 + SPKI Pinning (wss://)
 ────────────────────────────────────────────────────────────
   Online Peers (3):
     • macbook-pro       (you) [host: mac-1   · project: web-app] (idle)
     • linux-workstation       [host: linux-2 · project: backend] (idle)
     • cloud-vm                [host: vm-3    · project: ai-models] (idle)
 ────────────────────────────────────────────────────────────
-  Direct RPC  : < 25ms execution round-trip (link_exec)
-  File Xfer   : Out-of-band streaming + ephemeral HTTP (:9900/transfer/...)
+  Direct RPC  : < 25ms structured inspection (link_exec)
+  File Xfer   : Streamed quarantine transfer (~/.omp/inbox/)
 ────────────────────────────────────────────────────────────
-  Quick join from another machine:
-    /link-join team-swarm 4821
-    (or /link-join 192.168.1.50:9900 4821)
+  Join from another machine:
+    /link join 192.168.1.50:9900
 ```
 
 ### Live Peer Joining & Message Stream
@@ -165,47 +164,41 @@ When you send a message with `link_send` and wait for a reply, the turn takes 15
 
 ---
 
-## Security & Cryptographic Architecture
+## Security & Cryptographic Architecture (Protocol v5)
 
-`omp-link` provides zero-dependency, defense-in-depth cryptographic security across both local LAN and Tailscale networks:
+`omp-link` v5 provides standard TLS 1.3 mutual certificate authentication, strict capability governance, and defense-in-depth path confinement:
 
-1. **Cryptographic Device Identities & Pairing (Ed25519 TOFU)**:
-   - Each terminal generates an Ed25519 identity keypair (`~/.omp/identity.json`) with an authenticable SHA-256 fingerprint.
-   - Private keys and bearer credentials never cross the wire. Authentication uses cryptographic challenge-response nonces signed with Ed25519.
-   - When a new device connects, the host displays its public key fingerprint for verification (`🔔 [Link Request #1] "<name>" (FP: 7B:19:52:AF...)`). Host approves via `/link accept 1`.
-2. **Forward-Secret Wire Encryption (Ephemeral X25519 + HKDF-SHA256)**:
-   - Prior to message exchange, connecting nodes perform an ephemeral **X25519** Diffie-Hellman key agreement.
-   - A forward-secret 256-bit symmetric session key is derived using **HKDF-SHA256**. Compromise of long-term identity keys or past sessions cannot decrypt future or historical traffic.
-   - Enforces strict plaintext frame rejection after handshake: any unencrypted frame received after initialization is dropped immediately without fallback.
-3. **Authenticated Additional Data (AAD) & Replay Defense**:
-   - Every wire frame binds protocol version (`v: 4`), monotonic sequence counter (`seq`), unique message ID (`mid`), sender identity (`from`), and timestamp (`ts`) into the AES-256-GCM Authenticated Additional Data buffer.
-   - Any tampering with header fields, frame ordering, or payload results in immediate GCM authentication tag rejection.
-   - A bounded replay cache (`seenMessageIds`) deterministically drops duplicated or delayed packets.
-4. **Self-Signed ECDSA TLS on LAN (Certificate Pinning)**:
-   - In LAN mode, `omp-link` generates a self-signed ECDSA (P-256) TLS certificate (`~/.omp/tls/`), serving over `https://` and `wss://`.
-   - Protects local network transport against passive network observers, with peer certificate fingerprints verified during pairing.
-5. **Passive & Sanitized Subprocess Execution (`safeGitExecFile`)**:
-   - Structured git operations (`git_status`, `git_diff`, `git_log`, `search_text`) execute via `execFile` (never a shell) using sanitized environments.
-   - Prepend passive flags: `-c core.fsmonitor=false -c core.pager=cat -c pager.status=false -c pager.diff=false -c pager.log=false -c diff.external=`.
-   - Strips dangerous environment variables (`LD_PRELOAD`, `NODE_OPTIONS`, `GIT_DIR`, `GIT_WORK_TREE`, `GIT_CONFIG`, etc.) and sets `GIT_CONFIG_NOSYSTEM=1`, `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_TERMINAL_PROMPT=0`.
-6. **Canonical Path Confinement (`resolveConfinedPath`)**:
-   - Enforces canonical `fs.realpath` verification against the workspace root for both `params.cwd` and file targets.
-   - Rejects directory traversal escapes (`../`), symlink bypasses, null bytes, and sensitive files (`.env*`, `.git/*`, `id_rsa`, `id_ed25519`, `*.pem`, `*.key`, credentials, secrets).
-7. **Hardened Streaming File Inbox & DoS Protection**:
-   - `transferId` is strictly validated (`^[a-zA-Z0-9_-]{1,64}$`).
-   - Transfers stream in bounded 64KB chunks directly to disk (`.tmp-<id>.part` with mode `0600`), bounding RAM consumption to 64KB regardless of transfer size.
-   - Strict verification of `totalChunks`, byte limits, and SHA-256 integrity before atomically renaming to destination.
-8. **Sanitized Public Discovery (`GET /status`)**:
-   - Unauthenticated discovery requests receive minimal safe telemetry (`{ service: "omp-link", protocolVersion: 4, instanceId, pairingRequired: true, fingerprint, tls }`).
-   - Fully conceals host paths, working directories, active peers, and tokens. Query-string credential passing is strictly rejected. `Cache-Control: no-store` prevents intermediate caching.
-9. **Territorial Sovereignty & Ephemeral Execution Elevation**:
-   - **The Principle**: Every agent is the sole authoritative writer of its own local workspace.
-   - **Deterministic Blocking**: Arbitrary remote command execution (`action: "exec"`) is disabled by default. Read-only commands like `git status` or `git diff` transparently route to safe structured inspection operations.
-   - **Temporary Elevation**: When a remote peer genuinely needs to execute commands, the host can grant temporary elevation via `/link grant <peer> [minutes]`. Grants automatically expire and are logged in `~/.omp/audit.log`.
-   - **Mutation Guard**: Protects working trees by blocking destructive commands (`rm`, `sed -i`, `git commit`, `chmod`, `>`/`>>` redirects, and package installations).
-10. **Deterministic Silence & Diagnostic Doctor**:
-   - Run `/link off` to completely detach from the mesh, terminate listeners, and suppress background reconnect loops.
-   - Run `/link doctor` (or `/link-doctor`) to verify cryptographic key generation, TLS certificates, workspace confinement, and network interfaces.
+1. **Persistent Device Identity & Principals (TLS 1.3 Self-Signed Certificates)**:
+   - Each node generates a persistent self-signed device certificate and private key (`~/.omp/identity/device-cert.pem`, `device-key.pem`).
+   - Device principals are derived exclusively from the canonical SHA-256 fingerprint of the certificate/SPKI: `ed25519-sha256:<full-256-bit-fingerprint>`.
+   - Node names, hostnames, and device IDs are untrusted mutable metadata. Only the cryptographic principal is authoritative.
+2. **Mutual TLS 1.3 Transport with SPKI Pinning (Authenticated Encrypted Transport)**:
+   - All connections across LAN and Tailscale require TLS 1.3 mutual certificate exchange (`minVersion: "TLSv1.3"`).
+   - Ephemeral key exchange in TLS 1.3 provides forward secrecy, directional traffic keys, and tamper protection.
+   - The TLS handshake's `CertificateVerify` proves possession of the presented device private key.
+   - Previously paired devices pin the remote certificate fingerprint. If a certificate changes, the connection is rejected immediately.
+3. **Deterministic Connection Phase State Machine**:
+   - Every connection progresses through strictly enforced phases: `tls-connected` $\rightarrow$ `awaiting-pairing` $\rightarrow$ `authenticated`.
+   - Application messages received prior to pairing approval are rejected and close the socket. Handshake frames received after authentication are rejected.
+   - Handshake timeouts (10s) and pairing request expiries (60s) prevent orphaned or hanging connections.
+4. **Capability Authorization & Authoritative Origin Binding**:
+   - Inbound actions are evaluated against fine-grained stored permissions: `observe`, `message`, `compact`, `inspect`, `fileInbox`, `execRequest`.
+   - The hub derives the origin strictly from the authenticated TLS socket context, overwriting any claimed sender name or ID in the payload.
+5. **Single-Use Device-Principal Keyed Execution Grants**:
+   - Arbitrary remote command execution (`action: "exec"`) is disabled by default under Territorial Sovereignty policy.
+   - Hosts can grant temporary execution elevation via `/link grant <device> exec`.
+   - Grants are keyed by the peer's cryptographic `principalId` (never mutable terminal names), default to single-use (1 execution), auto-expire (10m), and are revoked immediately upon peer disconnection or mesh shutdown.
+   - *Advisory Warning*: Mutation Guard acts as an accident-prevention warning layer and does not provide containerization sandbox boundaries. Treat elevated peers as having local-user access.
+6. **Hardened File Transfer & Receiver Quarantine**:
+   - Files are transferred in 64KB chunks directly into an external quarantine directory (`~/.omp/inbox/<workspace>/<receiver-generated-id>/`) using exclusive creation (`openSync` with `wx` flag).
+   - Sender streams chunks with backpressure awareness without allocating the full file into memory.
+   - Strict validation binds chunk indices (`chunkIndex === nextExpectedChunk`), sender, and recipient to the accepted offer with streaming SHA-256 integrity verification.
+7. **Sanitized Public Discovery (`GET /status`)**:
+   - Discovery status over HTTPS returns minimal public metadata with strict security headers (`Cache-Control: no-store`, `Content-Security-Policy: default-src 'none'`, `X-Content-Type-Options: nosniff`).
+   - Host paths, active peers, and internal configurations are never exposed over HTTP. Public keys and fingerprints are never accepted as bearer authorization. Detailed status is available exclusively over authenticated WebSocket RPC.
+8. **Short Authentication String (SAS) & Single-Use Pairing Invites**:
+   - First-time pairing derives a Short Authentication String (SAS) from both certificate DERs and nonces (`/link accept <id> [code]`).
+   - Headless workflows can generate single-use, 5-minute pairing invitations via `/link invite`.
 
 ---
 
