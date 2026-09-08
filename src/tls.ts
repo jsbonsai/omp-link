@@ -32,14 +32,16 @@ export function getClientTlsOptions(
   identity: DeviceIdentity,
   options: {
     pinnedFingerprint?: string;
+    caCertPem?: string;
     allowUnpaired?: boolean;
   } = {},
 ): WsClientOptions {
-  return {
+  const isPairedPinned = Boolean(options.pinnedFingerprint && options.caCertPem && !options.allowUnpaired);
+  const opts: WsClientOptions = {
     key: identity.keyPem,
     cert: identity.certPem,
     minVersion: "TLSv1.3",
-    rejectUnauthorized: false,
+    rejectUnauthorized: isPairedPinned,
     checkServerIdentity: (_host: string, cert: any) => {
       let rawDer: Buffer | null = null;
       if (cert.raw && Buffer.isBuffer(cert.raw)) {
@@ -66,7 +68,7 @@ export function getClientTlsOptions(
             `Server certificate pinning mismatch! Expected ${canonicalPinned}, received ${serverFp}`,
           );
         }
-        return true;
+        return undefined as any;
       }
 
       if (!options.allowUnpaired) {
@@ -75,9 +77,15 @@ export function getClientTlsOptions(
         );
       }
 
-      return true;
+      return undefined as any;
     },
   };
+
+  if (options.caCertPem) {
+    (opts as any).ca = [options.caCertPem];
+  }
+
+  return opts;
 }
 
 export function extractPeerCertificate(socket: any): PeerCertificateInfo | null {

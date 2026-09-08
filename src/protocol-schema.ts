@@ -270,6 +270,13 @@ export function parseWireMessage(
     return { ok: false, error: `Unknown message type: "${msgType}"`, closeCode: 4400 };
   }
 
+  // Application messages must have a valid non-empty id
+  if (isApp) {
+    if (!obj.id || typeof obj.id !== "string" || obj.id.length > 128) {
+      return { ok: false, error: "Application message missing valid 'id' attribute (1-128 chars)", closeCode: 4400 };
+    }
+  }
+
   // Type-specific field validations
   if (msgType === "client_hello") {
     if (!obj.clientNonce || typeof obj.clientNonce !== "string") {
@@ -322,8 +329,20 @@ export function parseWireMessage(
     if (!Number.isSafeInteger(obj.chunkIndex) || obj.chunkIndex < 0) {
       return { ok: false, error: "Invalid chunkIndex", closeCode: 4400 };
     }
-    if (typeof obj.data !== "string") {
-      return { ok: false, error: "Invalid chunk data", closeCode: 4400 };
+    if (typeof obj.data !== "string" || obj.data.length === 0) {
+      return { ok: false, error: "Invalid chunk data: payload must be non-empty string", closeCode: 4400 };
+    }
+  } else if (msgType === "file_ack") {
+    if (!obj.transferId || typeof obj.transferId !== "string" || typeof obj.ok !== "boolean") {
+      return { ok: false, error: "file_ack missing valid transferId or ok attribute", closeCode: 4400 };
+    }
+  } else if (msgType === "rpc_request") {
+    if (!obj.action || typeof obj.action !== "string" || !/^[a-zA-Z0-9_-]{1,64}$/.test(obj.action)) {
+      return { ok: false, error: "rpc_request missing valid 'action' identifier", closeCode: 4400 };
+    }
+  } else if (msgType === "chat" || msgType === "direct_message") {
+    if (typeof obj.text !== "string") {
+      return { ok: false, error: "Message missing valid 'text' string attribute", closeCode: 4400 };
     }
   }
 

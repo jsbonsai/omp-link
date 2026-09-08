@@ -10,6 +10,8 @@ export const MAX_FILE_SIZE = 50 * 1024 * 1024; // 50MB
 export const INACTIVITY_TIMEOUT_MS = 30_000;
 export const ABSOLUTE_TIMEOUT_MS = 120_000;
 export const MAX_CONCURRENT_TRANSFERS = 5;
+export const MAX_IN_FLIGHT_PER_PEER = 2;
+export const MAX_QUARANTINE_BYTES = 250 * 1024 * 1024; // 250MB
 
 export interface IncomingTransfer {
   transferId: string;
@@ -34,6 +36,29 @@ export class TransferReceiver {
   constructor(customOmpDir?: string) {
     this.ompDir = customOmpDir || getOmpDir();
     this.cleanupStaleParts();
+  }
+
+  public getQuarantineDiskUsage(): number {
+    const inboxRoot = path.join(this.ompDir, "inbox");
+    if (!fs.existsSync(inboxRoot)) return 0;
+    let totalBytes = 0;
+    try {
+      const walk = (dir: string) => {
+        const entries = fs.readdirSync(dir, { withFileTypes: true });
+        for (const entry of entries) {
+          const full = path.join(dir, entry.name);
+          if (entry.isDirectory()) {
+            walk(full);
+          } else if (entry.isFile()) {
+            try {
+              totalBytes += fs.statSync(full).size;
+            } catch {}
+          }
+        }
+      };
+      walk(inboxRoot);
+    } catch {}
+    return totalBytes;
   }
 
   public cleanupStaleParts(): void {
@@ -74,6 +99,17 @@ export class TransferReceiver {
       return { ok: false, error: `Transfer ID "${offer.transferId}" already active` };
     }
 
+    // Per-peer in-flight transfer quota
+    const senderId = offer.originPrincipalId || offer.from || "unknown";
+    let inFlightForPeer = 0;
+    for (const [_, t] of this.activeTransfers) {
+      const tSender = t.offer.originPrincipalId || t.offer.from;
+      if (tSender === senderId) inFlightForPeer++;
+    }
+    if (inFlightForPeer >= MAX_IN_FLIGHT_PER_PEER) {
+      return { ok: false, error: `In-flight transfer limit reached for peer (max ${MAX_IN_FLIGHT_PER_PEER})` };
+    }
+
     // Validate sizeBytes
     if (
       !Number.isSafeInteger(offer.sizeBytes) ||
@@ -81,6 +117,12 @@ export class TransferReceiver {
       offer.sizeBytes > MAX_FILE_SIZE
     ) {
       return { ok: false, error: `Invalid sizeBytes: must be integer between 1 and ${MAX_FILE_SIZE}` };
+    }
+
+    // Check quarantine disk quota
+    const currentUsage = this.getQuarantineDiskUsage();
+    if (currentUsage + offer.sizeBytes > MAX_QUARANTINE_BYTES) {
+      return { ok: false, error: "Quarantine storage quota exceeded (max 250MB)" };
     }
 
     // Validate totalChunks
@@ -160,6 +202,11 @@ export class TransferReceiver {
     transfer.lastActivityAt = Date.now();
 
     // Verify chunk bindings to offer
+    if (chunk.originPrincipalId && transfer.offer.originPrincipalId && chunk.originPrincipalId !== transfer.offer.originPrincipalId) {
+      this.abortTransfer(chunk.transferId, "Sender principal mismatch for active transfer");
+      return { complete: false, ok: false, error: "Sender principal does not match accepted transfer offer" };
+    }
+
     if (chunk.from && transfer.offer.from && chunk.from !== transfer.offer.from) {
       this.abortTransfer(chunk.transferId, "Sender mismatch for active transfer");
       return { complete: false, ok: false, error: "Sender does not match accepted transfer offer" };
@@ -195,6 +242,11 @@ export class TransferReceiver {
     } catch {
       this.abortTransfer(chunk.transferId, "Malformed base64 payload");
       return { complete: false, ok: false, error: "Base64 payload decoding failed" };
+    }
+
+    if (buf.length === 0) {
+      this.abortTransfer(chunk.transferId, "Zero-length chunk payload rejected");
+      return { complete: false, ok: false, error: "Empty chunk payload is not permitted" };
     }
 
     if (buf.length > CHUNK_SIZE) {
@@ -296,7 +348,10 @@ export class TransferReceiver {
 
   public cleanupPeerTransfers(peerNameOrPrincipal: string): void {
     for (const [id, t] of this.activeTransfers) {
-      if (t.offer.from === peerNameOrPrincipal) {
+      if (
+        t.offer.from === peerNameOrPrincipal ||
+        t.offer.originPrincipalId === peerNameOrPrincipal
+      ) {
         this.abortTransfer(id, "Peer disconnected");
       }
     }

@@ -60,6 +60,7 @@ import {
   safeReadFile,
   safeListDir,
   resolveTrustedGit,
+  isTrustedExecutable,
 } from "../src/inspection.js";
 
 import { TransferReceiver, CHUNK_SIZE, MAX_FILE_SIZE } from "../src/transfer-receiver.js";
@@ -305,6 +306,40 @@ describe("OMP-LINK v5 Security & Cryptography Suite", () => {
       const check = checkAndConsumeExecGrant(newPrincipal);
       assert.strictEqual(check.allowed, false);
     });
+
+    test("Execution grant workspace confinement is strictly enforced (missing workspace does not bypass confinement)", () => {
+      const principal = "ed25519-sha256:CONFINED_DEV";
+      createExecGrant(principal, "confined-peer", {
+        workspaceId: "backend-core",
+        maxUses: 3,
+        durationMs: 60_000,
+      });
+
+      // 1. Unspecified workspace fails
+      const checkMissing = checkAndConsumeExecGrant(principal, undefined);
+      assert.strictEqual(checkMissing.allowed, false);
+      assert.match(checkMissing.reason, /confined to workspace "backend-core"/);
+
+      // 2. Mismatched workspace fails
+      const checkWrong = checkAndConsumeExecGrant(principal, "frontend-ui");
+      assert.strictEqual(checkWrong.allowed, false);
+      assert.match(checkWrong.reason, /confined to workspace "backend-core"/);
+
+      // 3. Matching workspace succeeds
+      const checkMatching = checkAndConsumeExecGrant(principal, "backend-core");
+      assert.strictEqual(checkMatching.allowed, true);
+    });
+
+    test("Execution grant lifecycle events are appended to audit log", () => {
+      const principal = "ed25519-sha256:AUDIT_TEST";
+      createExecGrant(principal, "audit-peer", { maxUses: 1, durationMs: 10_000 });
+      checkAndConsumeExecGrant(principal);
+      revokeGrantsForPrincipal(principal, "Test cleanup");
+
+      const logs = readAuditLogs(50);
+      assert.ok(logs.some((l) => l.type === "grant_created" && l.principalId === principal));
+      assert.ok(logs.some((l) => l.type === "grant_used" && l.principalId === principal));
+    });
   });
 
   // ── 4. Workspace Canonical Path Confinement & Inspection ───────────────────
@@ -372,6 +407,23 @@ describe("OMP-LINK v5 Security & Cryptography Suite", () => {
       const longRes = await safeGitGrep(tempDir, hugePattern);
       assert.strictEqual(longRes.ok, false);
       assert.match(longRes.error, /exceeds 512 characters/);
+    });
+
+    test("isTrustedExecutable verifies executable bit and prohibits group/other write permissions", () => {
+      const safeBin = path.join(tempDir, "safe-bin");
+      fs.writeFileSync(safeBin, "#!/bin/sh\necho ok\n", { mode: 0o755 });
+      assert.strictEqual(isTrustedExecutable(safeBin), true);
+
+      // Writable by others (insecure)
+      const worldWritable = path.join(tempDir, "insecure-bin");
+      fs.writeFileSync(worldWritable, "#!/bin/sh\necho ok\n");
+      fs.chmodSync(worldWritable, 0o777);
+      assert.strictEqual(isTrustedExecutable(worldWritable), false);
+
+      // Not executable
+      const nonExec = path.join(tempDir, "non-exec");
+      fs.writeFileSync(nonExec, "not executable", { mode: 0o644 });
+      assert.strictEqual(isTrustedExecutable(nonExec), false);
     });
   });
 
@@ -500,6 +552,55 @@ describe("OMP-LINK v5 Security & Cryptography Suite", () => {
       assert.strictEqual(info.sha256, expectedSha);
       assert.strictEqual(info.sizeBytes, 128 * 1024);
       assert.strictEqual(info.totalChunks, 2);
+    });
+
+    test("Rejects zero-byte chunk payloads and enforces in-flight peer quota", () => {
+      const qRecv = new TransferReceiver(tempDir);
+      const offer1 = {
+        type: "file_offer",
+        version: 5,
+        id: "off-q1",
+        transferId: "tx-quota-1",
+        from: "quota-peer",
+        originPrincipalId: "ed25519-sha256:QUOTA_PEER_KEY",
+        to: "hub",
+        filename: "f1.bin",
+        sizeBytes: 100,
+        totalChunks: 1,
+        sha256: "b".repeat(64),
+        ts: Date.now(),
+      };
+      assert.strictEqual(qRecv.handleOffer(offer1).ok, true);
+
+      // Zero-length chunk payload rejected
+      const emptyChunk = {
+        type: "file_chunk",
+        version: 5,
+        id: "c-empty",
+        transferId: "tx-quota-1",
+        from: "quota-peer",
+        to: "hub",
+        chunkIndex: 0,
+        totalChunks: 1,
+        data: "", // empty base64 string
+        ts: Date.now(),
+      };
+      const emptyRes = qRecv.handleChunk(emptyChunk);
+      assert.strictEqual(emptyRes.ok, false);
+      assert.match(emptyRes.error, /Empty chunk payload/);
+
+      // In-flight transfer limit: peer can have max 2 active transfers
+      const offerA = { ...offer1, transferId: "tx-quota-A", sha256: "c".repeat(64) };
+      const offerB = { ...offer1, transferId: "tx-quota-B", sha256: "d".repeat(64) };
+      const offerC = { ...offer1, transferId: "tx-quota-C", sha256: "e".repeat(64) };
+
+      assert.strictEqual(qRecv.handleOffer(offerA).ok, true);
+      assert.strictEqual(qRecv.handleOffer(offerB).ok, true);
+      const resC = qRecv.handleOffer(offerC);
+      assert.strictEqual(resC.ok, false);
+      assert.match(resC.error, /In-flight transfer limit reached/);
+
+      qRecv.abortAllTransfers();
     });
   });
 

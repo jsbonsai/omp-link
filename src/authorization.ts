@@ -1,6 +1,7 @@
 import { type DevicePermissions, savePairedDevice, getPairedDevice } from "./identity.js";
 import { type ApplicationMessage } from "./protocol-schema.js";
 import { type ConnectionContext } from "./connection-state.js";
+import { appendAuditLog } from "./audit.js";
 
 export interface ExecGrant {
   grantId: string;
@@ -32,7 +33,9 @@ export function requiredPermission(message: ApplicationMessage): keyof DevicePer
     case "file_ack":
       return "fileInbox";
     case "rpc_request":
-      return message.action === "exec" ? "execRequest" : "inspect";
+      return message.action === "exec"
+        ? "execRequest"
+        : (message.action === "system_status" ? "observe" : "inspect");
     case "status_update":
     default:
       return "observe";
@@ -99,10 +102,28 @@ export function createExecGrant(
 
   grant.timer = setTimeout(() => {
     activeExecGrants.delete(principalId);
+    appendAuditLog({
+      type: "grant_expired",
+      timestamp: Date.now(),
+      grantId,
+      principalId,
+    });
     if (options.onExpire) options.onExpire(grant);
   }, durationMs);
 
   activeExecGrants.set(principalId, grant);
+
+  appendAuditLog({
+    type: "grant_created",
+    timestamp: Date.now(),
+    grantId,
+    principalId,
+    displayName,
+    workspaceId: grant.workspaceId,
+    maxUses,
+    expiresAt: grant.expiresAt,
+  });
+
   return grant;
 }
 
@@ -121,6 +142,12 @@ export function checkAndConsumeExecGrant(
   if (Date.now() > grant.expiresAt) {
     if (grant.timer) clearTimeout(grant.timer);
     activeExecGrants.delete(principalId);
+    appendAuditLog({
+      type: "grant_expired",
+      timestamp: Date.now(),
+      grantId: grant.grantId,
+      principalId,
+    });
     return { allowed: false, reason: "Execution grant has expired" };
   }
 
@@ -130,14 +157,27 @@ export function checkAndConsumeExecGrant(
     return { allowed: false, reason: "Execution grant has no remaining uses" };
   }
 
-  if (grant.workspaceId !== "*" && workspaceId && grant.workspaceId !== workspaceId) {
-    return {
-      allowed: false,
-      reason: `Execution grant is confined to workspace "${grant.workspaceId}", requested "${workspaceId}"`,
-    };
+  // Strictly enforce workspace confinement if grant is confined to specific workspace
+  if (grant.workspaceId !== "*") {
+    if (!workspaceId || grant.workspaceId !== workspaceId) {
+      return {
+        allowed: false,
+        reason: `Execution grant is confined to workspace "${grant.workspaceId}", requested "${workspaceId || "unspecified"}"`,
+      };
+    }
   }
 
   grant.remainingUses--;
+
+  appendAuditLog({
+    type: "grant_used",
+    timestamp: Date.now(),
+    grantId: grant.grantId,
+    principalId,
+    remainingUses: grant.remainingUses,
+    workspaceId,
+  });
+
   if (grant.remainingUses <= 0) {
     if (grant.timer) clearTimeout(grant.timer);
     activeExecGrants.delete(principalId);
@@ -151,6 +191,13 @@ export function revokeGrantsForPrincipal(principalId: string, reason = "Manual r
   if (grant) {
     if (grant.timer) clearTimeout(grant.timer);
     activeExecGrants.delete(principalId);
+    appendAuditLog({
+      type: "grant_revoked",
+      timestamp: Date.now(),
+      grantId: grant.grantId,
+      principalId,
+      reason,
+    });
     return 1;
   }
   return 0;
@@ -158,8 +205,15 @@ export function revokeGrantsForPrincipal(principalId: string, reason = "Manual r
 
 export function revokeAllGrants(reason = "System revocation"): number {
   const count = activeExecGrants.size;
-  for (const [_, grant] of activeExecGrants) {
+  for (const [principalId, grant] of activeExecGrants) {
     if (grant.timer) clearTimeout(grant.timer);
+    appendAuditLog({
+      type: "grant_revoked",
+      timestamp: Date.now(),
+      grantId: grant.grantId,
+      principalId,
+      reason,
+    });
   }
   activeExecGrants.clear();
   return count;

@@ -28,6 +28,7 @@ import * as path from "node:path";
 import {
   getOrCreateDeviceIdentity,
   loadPairedDevices,
+  savePairedDevice,
   removePairedDevice,
   DEFAULT_PERMISSIONS,
   FULL_PERMISSIONS,
@@ -135,6 +136,7 @@ export default function (pi: ExtensionAPI) {
   let targetHubAddress: string | null = config.hub || null;
   let terminalName = config.terminalName || os.hostname() || "omp-node";
   let mutationGuardEnabled = true;
+  let lastContext: ExtensionContext | null = null;
 
   function initNode(): LinkNode {
     if (linkNode) return linkNode;
@@ -149,8 +151,21 @@ export default function (pi: ExtensionAPI) {
         content: `[${msg.from || "peer"}] ${msg.text}`,
         customType: "link",
         display: true,
-        details: { from: msg.from, text: msg.text },
+        details: { from: msg.from, text: msg.text, originPrincipalId: msg.originPrincipalId },
       });
+    };
+
+    linkNode.onCompactRequest = async (req) => {
+      if (lastContext && (lastContext as any).compact) {
+        return new Promise((resolve) => {
+          (lastContext as any).compact({
+            customInstructions: req.instructions,
+            onComplete: () => resolve({ ok: true }),
+            onError: (err: any) => resolve({ ok: false, reason: err?.message || "compaction error" }),
+          });
+        });
+      }
+      return { ok: true };
     };
 
     linkNode.onPairingRequested = (req) => {
@@ -180,6 +195,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   async function turnLinkOn(ctx?: ExtensionContext): Promise<void> {
+    if (ctx) lastContext = ctx;
     const node = initNode();
     linkActive = true;
     saveLinkConfig({ sessionId: currentSessionId, network: networkMode });
@@ -250,6 +266,39 @@ export default function (pi: ExtensionAPI) {
       const terms = linkNode.getConnectedTerminalsList();
       const list = terms.map((t) => `  • ${t.name} [${t.host || "unknown"}] (${t.status || "idle"})`).join("\n");
       return textResult(`Connected terminals (${terms.length}):\n${list}\n\nSession: "${linkNode.currentSessionId}" [${linkNode.role}]`);
+    },
+  });
+
+  pi.registerTool({
+    name: "link_compact",
+    label: "Link Compact",
+    description: "Ask one other Pi terminal on the link to compact its context. Blocks until compaction completes, fails, or times out (up to 180s).",
+    promptSnippet: "Ask another Pi terminal on the link to compact its context",
+    parameters: Type.Object({
+      to: Type.String({ description: "Target terminal name" }),
+      customInstructions: Type.Optional(
+        Type.String({
+          description: "Custom instructions to guide the compaction summary (optional)",
+        }),
+      ),
+    }),
+    async execute(_id, params) {
+      if (!linkActive || !linkNode) return textResult("Link mesh is not active. Connect with /link join or /link on.");
+      if (params.to === terminalName) {
+        return textResult("Cannot compact yourself - use /compact.", {
+          to: params.to,
+          error: "self_target",
+        });
+      }
+      try {
+        const res = await linkNode.requestCompact(params.to, params.customInstructions);
+        if (!res.ok) {
+          return textResult(`Compact request declined by "${params.to}": ${res.reason || "unknown reason"}`);
+        }
+        return textResult(`Terminal "${params.to}" completed compaction successfully.`);
+      } catch (err: any) {
+        return textResult(`Compact request failed: ${err.message}`);
+      }
     },
   });
 
@@ -454,27 +503,190 @@ export default function (pi: ExtensionAPI) {
           break;
         }
         case "devices": {
+          const subParts = restArgs.split(/\s+/).filter(Boolean);
+          const devAction = subParts[0]?.toLowerCase();
+          const devTarget = subParts[1];
+          const devExtra = subParts.slice(2).join(" ");
+
           const devices = loadPairedDevices();
-          if (devices.size === 0) {
-            ctx.ui.notify("No paired devices in ~/.omp/paired-devices.json.", "info");
+
+          if (!devAction || devAction === "list") {
+            if (devices.size === 0) {
+              ctx.ui.notify("No paired devices in ~/.omp/paired-devices.json.", "info");
+              return;
+            }
+            let out = `Paired Devices (${devices.size}):\n\n`;
+            for (const [fp, d] of devices) {
+              const p = d.permissions;
+              const permsStr = Object.entries(p).filter(([_, v]) => v).map(([k]) => k).join(", ");
+              out += `  • "${d.deviceName}"\n    Principal:   ${d.principalId}\n    Permissions: ${permsStr}\n    Paired At:   ${new Date(d.pairedAt).toISOString()}\n\n`;
+            }
+            ctx.ui.notify(out, "info");
             return;
           }
-          let out = `Paired Devices (${devices.size}):\n\n`;
-          for (const [fp, d] of devices) {
-            const p = d.permissions;
+
+          if (devAction === "show") {
+            if (!devTarget) {
+              ctx.ui.notify("Usage: /link devices show <device-name-or-fingerprint>", "warning");
+              return;
+            }
+            let matched: PairedDevice | null = null;
+            for (const [fp, d] of devices) {
+              if (d.deviceName === devTarget || d.principalId === devTarget || fp.startsWith(devTarget.toUpperCase())) {
+                matched = d;
+                break;
+              }
+            }
+            if (!matched) {
+              ctx.ui.notify(`Device "${devTarget}" not found in paired devices.`, "error");
+              return;
+            }
+            const p = matched.permissions;
             const permsStr = Object.entries(p).filter(([_, v]) => v).map(([k]) => k).join(", ");
-            out += `  • "${d.deviceName}"\n    Principal:   ${d.principalId}\n    Permissions: ${permsStr}\n    Paired At:   ${new Date(d.pairedAt).toISOString()}\n\n`;
+            ctx.ui.notify(
+              `📱 DEVICE RECORD\n` +
+              `  Name        : "${matched.deviceName}"\n` +
+              `  Principal   : ${matched.principalId}\n` +
+              `  Fingerprint : ${matched.fingerprint}\n` +
+              `  Permissions : ${permsStr}\n` +
+              `  Workspaces  : ${matched.workspaces?.join(", ") || "*"}\n` +
+              `  Paired At   : ${new Date(matched.pairedAt).toISOString()}\n` +
+              `  Last Seen   : ${matched.lastSeen ? new Date(matched.lastSeen).toISOString() : "never"}\n` +
+              `  Last Addr   : ${matched.lastAddress || "unknown"}`,
+              "info",
+            );
+            return;
           }
-          ctx.ui.notify(out, "info");
+
+          if (devAction === "allow" || devAction === "deny") {
+            if (!devTarget || !devExtra) {
+              ctx.ui.notify(`Usage: /link devices ${devAction} <device> <permission1,permission2>`, "warning");
+              return;
+            }
+            let matched: PairedDevice | null = null;
+            for (const [fp, d] of devices) {
+              if (d.deviceName === devTarget || d.principalId === devTarget || fp.startsWith(devTarget.toUpperCase())) {
+                matched = d;
+                break;
+              }
+            }
+            if (!matched) {
+              ctx.ui.notify(`Device "${devTarget}" not found.`, "error");
+              return;
+            }
+
+            const permList = devExtra.split(",").map((s) => s.trim().toLowerCase());
+            const updates: Partial<DevicePermissions> = {};
+            const val = devAction === "allow";
+
+            if (permList.includes("message")) updates.message = val;
+            if (permList.includes("compact")) updates.compact = val;
+            if (permList.includes("inspect")) updates.inspect = val;
+            if (permList.includes("file") || permList.includes("fileinbox")) updates.fileInbox = val;
+            if (permList.includes("exec") || permList.includes("execrequest")) updates.execRequest = val;
+
+            const ok = linkNode
+              ? linkNode.updatePeerPermissions(matched.principalId, updates)
+              : updateDevicePermissions(matched.fingerprint, updates);
+
+            if (ok) {
+              ctx.ui.notify(`Updated permissions for "${matched.deviceName}": ${devAction.toUpperCase()} ${Object.keys(updates).join(", ")}`, "info");
+            } else {
+              ctx.ui.notify(`Failed to update permissions for "${matched.deviceName}".`, "error");
+            }
+            return;
+          }
+
+          if (devAction === "workspace") {
+            if (!devTarget || !devExtra) {
+              ctx.ui.notify("Usage: /link devices workspace <device> <ws1,ws2>", "warning");
+              return;
+            }
+            let matched: PairedDevice | null = null;
+            for (const [fp, d] of devices) {
+              if (d.deviceName === devTarget || d.principalId === devTarget || fp.startsWith(devTarget.toUpperCase())) {
+                matched = d;
+                break;
+              }
+            }
+            if (!matched) {
+              ctx.ui.notify(`Device "${devTarget}" not found.`, "error");
+              return;
+            }
+            matched.workspaces = devExtra.split(",").map((s) => s.trim());
+            savePairedDevice(matched);
+            ctx.ui.notify(`Updated allowed workspaces for "${matched.deviceName}": ${matched.workspaces.join(", ")}`, "info");
+            return;
+          }
+
+          if (devAction === "remove" || devAction === "revoke") {
+            if (!devTarget) {
+              ctx.ui.notify("Usage: /link devices remove <device>", "warning");
+              return;
+            }
+            const ok = linkNode
+              ? linkNode.revokeDevice(devTarget)
+              : removePairedDevice(devTarget);
+            if (ok) {
+              ctx.ui.notify(`Revoked and removed device "${devTarget}".`, "info");
+            } else {
+              ctx.ui.notify(`Device "${devTarget}" not found.`, "error");
+            }
+            return;
+          }
+
+          ctx.ui.notify(`Unknown devices subcommand: "${devAction}". Available: show, allow, deny, workspace, remove, list`, "warning");
+          break;
+        }
+        case "revoke":
+        case "unpair": {
+          const target = restArgs.trim();
+          if (!target) {
+            ctx.ui.notify("Usage: /link revoke <device-name-or-fingerprint>", "warning");
+            return;
+          }
+          const ok = linkNode ? linkNode.revokeDevice(target) : removePairedDevice(target);
+          if (ok) {
+            ctx.ui.notify(`Device "${target}" unpair and revocation complete.`, "info");
+          } else {
+            ctx.ui.notify(`Device "${target}" not found.`, "error");
+          }
           break;
         }
         case "grant": {
           const grantParts = restArgs.split(/\s+/).filter(Boolean);
           const target = grantParts[0];
           if (!target) {
-            ctx.ui.notify("Usage: /link grant <device-name-or-fingerprint> exec [--for 10m] [--uses 1]", "warning");
+            ctx.ui.notify("Usage: /link grant <device> exec [--workspace backend] [--for 10m] [--uses 1]", "warning");
             return;
           }
+
+          // Parse flags
+          let workspaceId = "*";
+          let durationMs = 10 * 60 * 1000;
+          let maxUses = 1;
+
+          for (let i = 1; i < grantParts.length; i++) {
+            if (grantParts[i] === "--workspace" && grantParts[i + 1]) {
+              workspaceId = grantParts[i + 1];
+              i++;
+            } else if (grantParts[i] === "--for" && grantParts[i + 1]) {
+              const durStr = grantParts[i + 1];
+              const m = durStr.match(/^(\d+)(m|h|s)?$/);
+              if (m) {
+                const val = parseInt(m[1], 10);
+                const unit = m[2] || "m";
+                if (unit === "h") durationMs = val * 3600 * 1000;
+                else if (unit === "s") durationMs = val * 1000;
+                else durationMs = val * 60 * 1000;
+              }
+              i++;
+            } else if (grantParts[i] === "--uses" && grantParts[i + 1]) {
+              maxUses = Math.max(1, parseInt(grantParts[i + 1], 10) || 1);
+              i++;
+            }
+          }
+
           const devices = loadPairedDevices();
           let matched: PairedDevice | null = null;
           for (const [fp, d] of devices) {
@@ -487,15 +699,30 @@ export default function (pi: ExtensionAPI) {
             ctx.ui.notify(`No paired device matching "${target}".`, "error");
             return;
           }
+
+          // Ensure base capability is enabled
+          if (!matched.permissions.execRequest) {
+            if (linkNode) {
+              linkNode.updatePeerPermissions(matched.principalId, { execRequest: true });
+            } else {
+              updateDevicePermissions(matched.fingerprint, { execRequest: true });
+            }
+            ctx.ui.notify(`ℹ️ Note: Elevated base "execRequest" capability for "${matched.deviceName}".`, "info");
+          }
+
           const grant = createExecGrant(matched.principalId, matched.deviceName, {
-            durationMs: 10 * 60 * 1000,
-            maxUses: 1,
+            workspaceId,
+            durationMs,
+            maxUses,
           });
+
           ctx.ui.notify(
             `⚠️ EXECUTION ELEVATION GRANTED\n` +
             `   Device:      "${matched.deviceName}"\n` +
             `   Principal:   ${matched.principalId}\n` +
-            `   Expires:     10 minutes (1 single use)\n` +
+            `   Fingerprint: ${matched.fingerprint}\n` +
+            `   Workspace:   ${workspaceId}\n` +
+            `   Expires:     ${Math.ceil(durationMs / 60000)} minutes (${maxUses} use(s))\n` +
             `   ${MUTATION_GUARD_ADVISORY}`,
             "warning",
           );
@@ -583,8 +810,10 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerMessageRenderer("link", (message, _options, theme) => {
-    const from = (message.details as Record<string, unknown> | undefined)?.from ?? "link";
-    const text = theme.fg("accent", `⚡ [${from}] `) + theme.fg("text", String(message.content));
+    const details = message.details as Record<string, unknown> | undefined;
+    const from = details?.from ?? "link";
+    const principal = details?.originPrincipalId ? ` (${String(details.originPrincipalId).slice(0, 24)}...)` : "";
+    const text = theme.fg("accent", `⚡ [${from}${principal}] `) + theme.fg("text", String(message.content));
     return new Text(text, 0, 0);
   });
 }

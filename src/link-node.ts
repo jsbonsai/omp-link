@@ -16,6 +16,7 @@ import {
   loadPairedDevices,
   savePairedDevice,
   removePairedDevice,
+  getPairedDevice,
   normalizeFingerprint,
   verifyAndConsumeInvite,
   derivePairingSas,
@@ -42,6 +43,8 @@ import {
   type RpcRequestMsg,
   type RpcResponseMsg,
   parseWireMessage,
+  HANDSHAKE_MESSAGE_TYPES,
+  APPLICATION_MESSAGE_TYPES,
 } from "./protocol-schema.js";
 
 import {
@@ -68,6 +71,7 @@ import {
   revokeGrantsForPrincipal,
   revokeAllGrants,
   getActiveGrants,
+  updateDevicePermissions,
   MUTATION_GUARD_ADVISORY,
 } from "./authorization.js";
 
@@ -127,6 +131,10 @@ export class LinkNode {
     timer: NodeJS.Timeout;
   }>();
 
+  // Concurrency tracking for RPCs
+  private activeRpcsByPeer = new Map<string, number>();
+  public static readonly MAX_CONCURRENT_RPCS = 3;
+
   // Client components
   private clientWs: WebSocket | null = null;
   private clientContext: ConnectionContext | null = null;
@@ -158,6 +166,7 @@ export class LinkNode {
   public onPairingDenied?: (id: number) => void;
   public onTerminalsChanged?: (terminals: string[]) => void;
   public onNotification?: (msg: string, level: "info" | "warning" | "error") => void;
+  public onCompactRequest?: (msg: CompactRequestMsg) => Promise<{ ok: boolean; reason?: string }>;
 
   constructor(options: LinkNodeOptions = {}) {
     this.customOmpDir = options.customOmpDir;
@@ -181,7 +190,7 @@ export class LinkNode {
 
     return new Promise((resolve, reject) => {
       this.httpsServer = createHttpsServer(tlsOptions, (req, res) => {
-        // Minimal, public status endpoint
+        // Minimal, public status endpoint with strict security headers
         if (req.method === "GET" && (req.url === "/status" || req.url?.startsWith("/status?"))) {
           res.writeHead(200, {
             "Content-Type": "application/json",
@@ -328,7 +337,7 @@ export class LinkNode {
     // Capability check
     const permCheck = isActionPermitted(ctx.permissions, appMsg);
     if (!permCheck.permitted) {
-      this.sendToSocket(socket, {
+      this.sendApplicationFrame(socket, ctx, {
         type: appMsg.type === "rpc_request" ? "rpc_response" : "chat",
         version: 5,
         id: `err-${Date.now()}`,
@@ -342,7 +351,7 @@ export class LinkNode {
       return;
     }
 
-    // Overwrite authoritative origin
+    // Overwrite authoritative origin from authenticated socket
     const boundMsg = bindMessageOrigin(appMsg, ctx);
 
     // Route application message
@@ -373,9 +382,8 @@ export class LinkNode {
         savePairedDevice(paired, this.customOmpDir);
         ctx.principalId = paired.principalId;
         ctx.permissions = paired.permissions;
-        setConnectionPhase(ctx, "authenticated");
 
-        this.sendToSocket(socket, {
+        this.sendHandshakeFrame(socket, ctx, {
           type: "server_hello",
           version: 5,
           sessionId: this.currentSessionId,
@@ -386,6 +394,8 @@ export class LinkNode {
           host: os.hostname(),
           terminals: this.getConnectedTerminalsList(),
         } as ServerHelloMsg);
+
+        setConnectionPhase(ctx, "authenticated");
 
         this.broadcastTerminalList();
         if (this.onPairingApproved) this.onPairingApproved(paired);
@@ -400,9 +410,8 @@ export class LinkNode {
     if (paired) {
       ctx.principalId = paired.principalId;
       ctx.permissions = paired.permissions;
-      setConnectionPhase(ctx, "authenticated");
 
-      this.sendToSocket(socket, {
+      this.sendHandshakeFrame(socket, ctx, {
         type: "server_hello",
         version: 5,
         sessionId: this.currentSessionId,
@@ -413,6 +422,8 @@ export class LinkNode {
         host: os.hostname(),
         terminals: this.getConnectedTerminalsList(),
       } as ServerHelloMsg);
+
+      setConnectionPhase(ctx, "authenticated");
 
       this.broadcastTerminalList();
       return;
@@ -457,9 +468,8 @@ export class LinkNode {
         ctx.principalId = paired.principalId;
         ctx.displayName = displayName;
         ctx.permissions = paired.permissions;
-        setConnectionPhase(ctx, "authenticated");
 
-        this.sendToSocket(socket, {
+        this.sendHandshakeFrame(socket, ctx, {
           type: "server_hello",
           version: 5,
           sessionId: this.currentSessionId,
@@ -469,6 +479,8 @@ export class LinkNode {
           requiresPairing: false,
           terminals: this.getConnectedTerminalsList(),
         } as ServerHelloMsg);
+
+        setConnectionPhase(ctx, "authenticated");
 
         this.broadcastTerminalList();
         return;
@@ -507,7 +519,7 @@ export class LinkNode {
       timer,
     });
 
-    this.sendToSocket(socket, {
+    this.sendHandshakeFrame(socket, ctx, {
       type: "server_hello",
       version: 5,
       sessionId: this.currentSessionId,
@@ -534,7 +546,6 @@ export class LinkNode {
       socket.close(4403, "SAS verification mismatch");
       return;
     }
-    // SAS match verified
   }
 
   public approvePairing(id: number, permissions: DevicePermissions = DEFAULT_PERMISSIONS): PairedDevice | null {
@@ -561,14 +572,15 @@ export class LinkNode {
     if (ctx) {
       ctx.principalId = paired.principalId;
       ctx.permissions = paired.permissions;
-      setConnectionPhase(ctx, "authenticated");
 
-      this.sendToSocket(req.socket, {
+      this.sendHandshakeFrame(req.socket, ctx, {
         type: "pair_response",
         version: 5,
         approved: true,
         permissions: paired.permissions,
       } as PairResponseMsg);
+
+      setConnectionPhase(ctx, "authenticated");
 
       this.broadcastTerminalList();
     }
@@ -592,13 +604,16 @@ export class LinkNode {
     clearTimeout(req.timer);
     this.pendingPairRequests.delete(id);
 
+    const ctx = this.hubConnections.get(req.socket);
     try {
-      this.sendToSocket(req.socket, {
-        type: "pair_response",
-        version: 5,
-        approved: false,
-        reason: "Pairing request was denied by the host",
-      } as PairResponseMsg);
+      if (ctx) {
+        this.sendHandshakeFrame(req.socket, ctx, {
+          type: "pair_response",
+          version: 5,
+          approved: false,
+          reason: "Pairing request was denied by the host",
+        } as PairResponseMsg);
+      }
       req.socket.close(4403, "Pairing denied");
     } catch {}
 
@@ -610,6 +625,67 @@ export class LinkNode {
     });
 
     if (this.onPairingDenied) this.onPairingDenied(id);
+    return true;
+  }
+
+  public revokeDevice(fingerprintOrPrincipal: string): boolean {
+    const removed = removePairedDevice(fingerprintOrPrincipal, this.customOmpDir);
+    revokeGrantsForPrincipal(fingerprintOrPrincipal, "Device pairing revoked");
+
+    for (const [socket, ctx] of this.hubConnections) {
+      const matchesFp = ctx.peerCert && (
+        ctx.peerCert.principalId === fingerprintOrPrincipal ||
+        normalizeFingerprint(ctx.peerCert.fingerprint) === normalizeFingerprint(fingerprintOrPrincipal)
+      );
+      const matchesName = ctx.displayName === fingerprintOrPrincipal;
+      if (matchesFp || matchesName) {
+        if (ctx.principalId) revokeGrantsForPrincipal(ctx.principalId, "Device pairing revoked");
+        try {
+          socket.close(4403, "Device pairing revoked");
+        } catch {}
+        this.handleHubSocketClose(socket, ctx);
+      }
+    }
+
+    appendAuditLog({
+      type: "device_revoked",
+      timestamp: Date.now(),
+      target: fingerprintOrPrincipal,
+    });
+
+    this.broadcastTerminalList();
+    return removed;
+  }
+
+  public updatePeerPermissions(
+    fingerprintOrPrincipal: string,
+    updates: Partial<DevicePermissions>,
+  ): boolean {
+    const updated = updateDevicePermissions(fingerprintOrPrincipal, updates, this.customOmpDir);
+    if (!updated) return false;
+
+    // Update active connection context immediately
+    for (const [_, ctx] of this.hubConnections) {
+      const matchesFp = ctx.peerCert && (
+        ctx.peerCert.principalId === fingerprintOrPrincipal ||
+        normalizeFingerprint(ctx.peerCert.fingerprint) === normalizeFingerprint(fingerprintOrPrincipal)
+      );
+      const matchesName = ctx.displayName === fingerprintOrPrincipal;
+      if (matchesFp || matchesName) {
+        ctx.permissions = {
+          ...(ctx.permissions || DEFAULT_PERMISSIONS),
+          ...updates,
+        };
+      }
+    }
+
+    appendAuditLog({
+      type: "permissions_updated",
+      timestamp: Date.now(),
+      target: fingerprintOrPrincipal,
+      updates,
+    });
+
     return true;
   }
 
@@ -638,19 +714,21 @@ export class LinkNode {
 
     // 3. Routed to another peer
     let targetSocket: any = null;
+    let targetCtx: ConnectionContext | null = null;
     for (const [s, c] of this.hubConnections) {
       if (c.phase === "authenticated" && c.displayName === msg.to) {
         targetSocket = s;
+        targetCtx = c;
         break;
       }
     }
 
-    if (targetSocket) {
-      this.sendToSocket(targetSocket, msg);
+    if (targetSocket && targetCtx) {
+      this.sendApplicationFrame(targetSocket, targetCtx, msg);
     } else {
       // Recipient not found
       if (msg.type === "rpc_request") {
-        this.sendToSocket(senderSocket, {
+        this.sendApplicationFrame(senderSocket, senderCtx, {
           type: "rpc_response",
           version: 5,
           id: msg.id,
@@ -679,11 +757,44 @@ export class LinkNode {
       return;
     }
 
+    if (msg.type === "rpc_response") {
+      const resp = msg as RpcResponseMsg;
+      const pending = this.pendingRpcRequests.get(resp.id);
+      if (pending) {
+        clearTimeout(pending.timeout);
+        this.pendingRpcRequests.delete(resp.id);
+        pending.resolve(resp);
+      }
+      return;
+    }
+
+    if (msg.type === "file_ack") {
+      const ack = msg as FileAckMsg;
+      const pending = this.pendingFileAcks.get(ack.transferId);
+      if (pending) {
+        clearTimeout(pending.timeout);
+        this.pendingFileAcks.delete(ack.transferId);
+        pending.resolve(ack);
+      }
+      return;
+    }
+
+    if (msg.type === "compact_response") {
+      const cResp = msg as CompactResponseMsg;
+      const pending = this.pendingCompactRequests.get(cResp.id);
+      if (pending) {
+        clearTimeout(pending.timeout);
+        this.pendingCompactRequests.delete(cResp.id);
+        pending.resolve(cResp);
+      }
+      return;
+    }
+
     if (msg.type === "file_offer") {
       const offer = msg as FileOfferMsg;
-      const res = this.transferReceiver.handleOffer(offer);
+      const res = this.transferReceiver.handleOffer(offer, this.currentSessionId);
       if (!res.ok) {
-        this.sendToSocket(senderSocket, {
+        this.sendApplicationFrame(senderSocket, senderCtx, {
           type: "file_ack",
           version: 5,
           id: `ack-${offer.transferId}`,
@@ -701,8 +812,8 @@ export class LinkNode {
     if (msg.type === "file_chunk") {
       const chunk = msg as FileChunkMsg;
       const res = this.transferReceiver.handleChunk(chunk);
-      if (res.complete) {
-        this.sendToSocket(senderSocket, {
+      if (res.complete || !res.ok) {
+        this.sendApplicationFrame(senderSocket, senderCtx, {
           type: "file_ack",
           version: 5,
           id: `ack-${chunk.transferId}`,
@@ -728,14 +839,26 @@ export class LinkNode {
     }
 
     if (msg.type === "compact_request") {
-      // Hub compaction request
-      this.sendToSocket(senderSocket, {
+      let ok = true;
+      let reason: string | undefined;
+      if (this.onCompactRequest) {
+        try {
+          const cRes = await this.onCompactRequest(msg as CompactRequestMsg);
+          ok = cRes.ok;
+          reason = cRes.reason;
+        } catch (err: any) {
+          ok = false;
+          reason = err.message;
+        }
+      }
+      this.sendApplicationFrame(senderSocket, senderCtx, {
         type: "compact_response",
         version: 5,
         id: msg.id,
         from: this.terminalName,
         to: senderCtx.displayName,
-        ok: true,
+        ok,
+        reason,
         ts: Date.now(),
       } as CompactResponseMsg);
       return;
@@ -745,96 +868,171 @@ export class LinkNode {
   private async handleLocalRpcRequest(
     req: RpcRequestMsg,
     senderSocket: any,
-    senderCtx: ConnectionContext,
+    senderCtx: ConnectionContext | null,
   ): Promise<void> {
+    const callerPrincipalId = senderCtx?.principalId || req.originPrincipalId;
+    const callerDisplayName = senderCtx?.displayName || req.from;
+    const callerDevice = callerPrincipalId
+      ? getPairedDevice(callerPrincipalId, this.customOmpDir)
+      : undefined;
+    const callerPermissions =
+      senderCtx?.permissions ||
+      callerDevice?.permissions ||
+      (this.role === "client" ? FULL_PERMISSIONS : DEFAULT_PERMISSIONS);
+
     const sendRes = (ok: boolean, result?: any, error?: string) => {
-      this.sendToSocket(senderSocket, {
+      const resp: RpcResponseMsg = {
         type: "rpc_response",
         version: 5,
         id: req.id,
         from: this.terminalName,
-        to: senderCtx.displayName,
+        to: callerDisplayName || "unknown",
         ok,
         result,
         error,
         ts: Date.now(),
-      } as RpcResponseMsg);
+      };
+      if (this.role === "hub" && senderSocket && senderCtx) {
+        this.sendApplicationFrame(senderSocket, senderCtx, resp);
+      } else if (this.role === "client" && this.clientWs && this.clientContext) {
+        this.sendApplicationFrame(this.clientWs, this.clientContext, resp);
+      }
     };
 
-    if (req.action === "exec") {
-      // Check execution grant
-      const grantCheck = checkAndConsumeExecGrant(senderCtx.principalId || "");
-      if (!grantCheck.allowed) {
-        appendAuditLog({
-          type: "exec_blocked",
-          timestamp: Date.now(),
-          principalId: senderCtx.principalId,
-          peer: senderCtx.displayName,
-          command: req.params?.command,
-          reason: grantCheck.reason,
-        });
-        sendRes(false, undefined, grantCheck.reason);
+    // Concurrency limiting per peer
+    const peerKey = callerPrincipalId || callerDisplayName || "unknown";
+    const currentActive = this.activeRpcsByPeer.get(peerKey) || 0;
+    if (currentActive >= LinkNode.MAX_CONCURRENT_RPCS) {
+      sendRes(false, undefined, `Inspection concurrency limit exceeded (max ${LinkNode.MAX_CONCURRENT_RPCS} in flight)`);
+      return;
+    }
+    this.activeRpcsByPeer.set(peerKey, currentActive + 1);
+
+    const finishRpc = () => {
+      const active = this.activeRpcsByPeer.get(peerKey) || 1;
+      if (active <= 1) {
+        this.activeRpcsByPeer.delete(peerKey);
+      } else {
+        this.activeRpcsByPeer.set(peerKey, active - 1);
+      }
+    };
+
+    try {
+      if (req.action === "system_status") {
+        const statusData = {
+          service: "omp-link",
+          protocolVersion: PROTOCOL_VERSION,
+          hubPrincipalId: this.identity.principalId,
+          hubFingerprint: this.identity.fingerprint,
+          sessionId: this.currentSessionId,
+          role: this.role,
+          terminalName: this.terminalName,
+          connectedPeers: this.getConnectedTerminalsList(),
+          caller: {
+            principalId: callerPrincipalId,
+            displayName: callerDisplayName,
+            permissions: callerPermissions,
+            workspaces: callerDevice?.workspaces || [],
+          },
+          activeGrants: getActiveGrants().map((g) => ({
+            grantId: g.grantId,
+            principalId: g.principalId,
+            displayName: g.displayName,
+            workspaceId: g.workspaceId,
+            remainingUses: g.remainingUses,
+            expiresAt: g.expiresAt,
+          })),
+        };
+        sendRes(true, statusData);
         return;
       }
 
-      appendAuditLog({
-        type: "exec_executed",
-        timestamp: Date.now(),
-        principalId: senderCtx.principalId,
-        peer: senderCtx.displayName,
-        command: req.params?.command,
-      });
+      if (req.action === "exec") {
+        // Require base capability first
+        if (!callerPermissions?.execRequest) {
+          sendRes(false, undefined, 'Permission denied: device does not have base "execRequest" capability');
+          return;
+        }
 
-      exec(
-        req.params?.command || "",
-        { cwd: process.cwd(), timeout: 15_000 },
-        (err, stdout, stderr) => {
-          if (err) {
-            sendRes(false, undefined, stderr || err.message);
-          } else {
-            sendRes(true, stdout || "[Command succeeded with no output]");
-          }
-        },
-      );
-      return;
-    }
+        // Check execution grant with workspace confinement
+        const grantCheck = checkAndConsumeExecGrant(
+          callerPrincipalId || "",
+          req.params?.workspace,
+        );
+        if (!grantCheck.allowed) {
+          appendAuditLog({
+            type: "exec_blocked",
+            timestamp: Date.now(),
+            principalId: callerPrincipalId,
+            peer: callerDisplayName,
+            command: req.params?.command,
+            reason: grantCheck.reason,
+          });
+          sendRes(false, undefined, grantCheck.reason);
+          return;
+        }
 
-    const cwd = process.cwd();
+        appendAuditLog({
+          type: "exec_executed",
+          timestamp: Date.now(),
+          principalId: callerPrincipalId,
+          peer: callerDisplayName,
+          command: req.params?.command,
+        });
 
-    switch (req.action) {
-      case "git_status": {
-        const res = await safeGitStatus(cwd);
-        sendRes(res.ok, res.output, res.error);
-        break;
+        exec(
+          req.params?.command || "",
+          { cwd: process.cwd(), timeout: 15_000 },
+          (err, stdout, stderr) => {
+            if (err) {
+              sendRes(false, undefined, stderr || err.message);
+            } else {
+              sendRes(true, stdout || "[Command succeeded with no output]");
+            }
+          },
+        );
+        return;
       }
-      case "git_diff": {
-        const res = await safeGitDiff(cwd);
-        sendRes(res.ok, res.output, res.error);
-        break;
+
+      const cwd = process.cwd();
+
+      switch (req.action) {
+        case "git_status": {
+          const res = await safeGitStatus(cwd);
+          sendRes(res.ok, res.output, res.error);
+          break;
+        }
+        case "git_diff": {
+          const res = await safeGitDiff(cwd);
+          sendRes(res.ok, res.output, res.error);
+          break;
+        }
+        case "git_log": {
+          const res = await safeGitLog(cwd, req.params?.count || 10);
+          sendRes(res.ok, res.output, res.error);
+          break;
+        }
+        case "search_text": {
+          const res = await safeGitGrep(cwd, req.params?.pattern || "");
+          sendRes(res.ok, res.output, res.error);
+          break;
+        }
+        case "read_file": {
+          const res = await safeReadFile(cwd, req.params?.filePath || "");
+          sendRes(res.ok, res.content, res.error);
+          break;
+        }
+        case "list_dir": {
+          const res = await safeListDir(cwd, req.params?.filePath || "");
+          sendRes(res.ok, res.entries?.join("\n"), res.error);
+          break;
+        }
+        default:
+          sendRes(false, undefined, `Unsupported RPC action: "${req.action}"`);
+          break;
       }
-      case "git_log": {
-        const res = await safeGitLog(cwd, req.params?.count || 10);
-        sendRes(res.ok, res.output, res.error);
-        break;
-      }
-      case "search_text": {
-        const res = await safeGitGrep(cwd, req.params?.pattern || "");
-        sendRes(res.ok, res.output, res.error);
-        break;
-      }
-      case "read_file": {
-        const res = await safeReadFile(cwd, req.params?.filePath || "");
-        sendRes(res.ok, res.content, res.error);
-        break;
-      }
-      case "list_dir": {
-        const res = await safeListDir(cwd, req.params?.filePath || "");
-        sendRes(res.ok, res.entries?.join("\n"), res.error);
-        break;
-      }
-      default:
-        sendRes(false, undefined, `Unsupported RPC action: "${req.action}"`);
-        break;
+    } finally {
+      finishRpc();
     }
   }
 
@@ -842,8 +1040,12 @@ export class LinkNode {
     cleanupConnectionContext(ctx);
     this.hubConnections.delete(socket);
 
+    const peerKey = ctx.principalId || ctx.displayName;
+    this.activeRpcsByPeer.delete(peerKey);
+
     if (ctx.principalId) {
       revokeGrantsForPrincipal(ctx.principalId, "Peer disconnected");
+      this.transferReceiver.cleanupPeerTransfers(ctx.principalId);
       this.transferReceiver.cleanupPeerTransfers(ctx.displayName);
       appendAuditLog({
         type: "peer_disconnected",
@@ -877,10 +1079,38 @@ export class LinkNode {
       await this.stop();
     }
 
-    this.pinnedHubFingerprint = pinnedFingerprint || null;
+    let effectiveFingerprint = pinnedFingerprint;
+    let caCertPem: string | undefined;
+
+    // Look up known hub in paired devices if not explicitly provided
+    const paired = loadPairedDevices(this.customOmpDir);
+    if (!effectiveFingerprint) {
+      for (const [_, dev] of paired) {
+        if (dev.lastAddress === hubUrl || hubUrl.includes(dev.deviceName)) {
+          effectiveFingerprint = dev.fingerprint;
+          caCertPem = dev.certPem;
+          break;
+        }
+      }
+      if (!effectiveFingerprint && paired.size === 1) {
+        const single = paired.values().next().value;
+        if (single) {
+          effectiveFingerprint = single.fingerprint;
+          caCertPem = single.certPem;
+        }
+      }
+    } else {
+      const match = paired.get(normalizeFingerprint(effectiveFingerprint));
+      if (match) {
+        caCertPem = match.certPem;
+      }
+    }
+
+    this.pinnedHubFingerprint = effectiveFingerprint || null;
     const tlsOptions = getClientTlsOptions(this.identity, {
-      pinnedFingerprint,
-      allowUnpaired: !pinnedFingerprint,
+      pinnedFingerprint: effectiveFingerprint,
+      caCertPem,
+      allowUnpaired: !effectiveFingerprint,
     });
 
     return new Promise((resolve, reject) => {
@@ -895,7 +1125,7 @@ export class LinkNode {
           isLocal: hubUrl.includes("127.0.0.1") || hubUrl.includes("localhost"),
         });
 
-        // Send client_hello
+        // Send client_hello (Handshake frame)
         const hello: ClientHelloMsg = {
           type: "client_hello",
           version: 5,
@@ -905,7 +1135,7 @@ export class LinkNode {
           cwd: process.cwd(),
         };
 
-        this.sendToSocket(ws, hello);
+        this.sendHandshakeFrame(ws, this.clientContext, hello);
         resolve();
       });
 
@@ -933,7 +1163,7 @@ export class LinkNode {
     });
   }
 
-  private handleClientSocketMessage(rawData: any): void {
+  private async handleClientSocketMessage(rawData: any): Promise<void> {
     const parsed = parseWireMessage(rawData);
     if (!parsed.ok) return;
 
@@ -950,6 +1180,8 @@ export class LinkNode {
         }
       } else {
         if (this.clientContext) setConnectionPhase(this.clientContext, "authenticated");
+        // Save paired hub certificate for future pinned connections
+        this.persistPairedHubIdentity(sHello.hubPrincipalId);
         if (this.onNotification) {
           this.onNotification(`Connected to session "${sHello.sessionId}"`, "info");
         }
@@ -961,6 +1193,8 @@ export class LinkNode {
       const pResp = msg as PairResponseMsg;
       if (pResp.approved) {
         if (this.clientContext) setConnectionPhase(this.clientContext, "authenticated");
+        // Save paired hub certificate for future pinned connections
+        this.persistPairedHubIdentity();
         if (this.onNotification) this.onNotification("Device pairing approved by host!", "info");
       } else {
         if (this.onNotification) this.onNotification(`Pairing rejected: ${pResp.reason}`, "error");
@@ -1003,7 +1237,7 @@ export class LinkNode {
 
     if (msg.type === "file_offer") {
       const offer = msg as FileOfferMsg;
-      const res = this.transferReceiver.handleOffer(offer);
+      const res = this.transferReceiver.handleOffer(offer, this.currentSessionId);
       if (!res.ok) {
         this.sendToHub({
           type: "file_ack",
@@ -1023,7 +1257,7 @@ export class LinkNode {
     if (msg.type === "file_chunk") {
       const chunk = msg as FileChunkMsg;
       const res = this.transferReceiver.handleChunk(chunk);
-      if (res.complete) {
+      if (res.complete || !res.ok) {
         this.sendToHub({
           type: "file_ack",
           version: 5,
@@ -1039,10 +1273,61 @@ export class LinkNode {
       return;
     }
 
+    if (msg.type === "rpc_request") {
+      await this.handleLocalRpcRequest(msg as RpcRequestMsg, null, null);
+      return;
+    }
+
+    if (msg.type === "compact_request") {
+      let ok = true;
+      let reason: string | undefined;
+      if (this.onCompactRequest) {
+        try {
+          const cRes = await this.onCompactRequest(msg as CompactRequestMsg);
+          ok = cRes.ok;
+          reason = cRes.reason;
+        } catch (err: any) {
+          ok = false;
+          reason = err.message;
+        }
+      }
+      this.sendToHub({
+        type: "compact_response",
+        version: 5,
+        id: msg.id,
+        from: this.terminalName,
+        to: msg.from,
+        ok,
+        reason,
+        ts: Date.now(),
+      } as CompactResponseMsg);
+      return;
+    }
+
     if (msg.type === "chat" || msg.type === "direct_message") {
       if (this.onMessage) this.onMessage(msg as ApplicationMessage);
       return;
     }
+  }
+
+  private persistPairedHubIdentity(hubPrincipalId?: string): void {
+    try {
+      const peerCert = extractPeerCertificate((this.clientWs as any)?._socket);
+      if (peerCert) {
+        const canonicalFp = normalizeFingerprint(peerCert.fingerprint);
+        const pairedHub: PairedDevice = {
+          principalId: peerCert.principalId,
+          fingerprint: canonicalFp,
+          certPem: peerCert.certPem,
+          deviceName: hubPrincipalId || "hub",
+          permissions: FULL_PERMISSIONS,
+          pairedAt: Date.now(),
+          lastSeen: Date.now(),
+          lastAddress: this.clientWs?.url,
+        };
+        savePairedDevice(pairedHub, this.customOmpDir);
+      }
+    } catch {}
   }
 
   // ── Operations & Helper Methods ───────────────────────────────────────────
@@ -1065,13 +1350,13 @@ export class LinkNode {
       }
       for (const [s, c] of this.hubConnections) {
         if (c.phase === "authenticated" && c.displayName === to) {
-          this.sendToSocket(s, msg);
+          this.sendApplicationFrame(s, c, msg);
           return true;
         }
       }
       return false;
-    } else if (this.role === "client" && this.clientWs) {
-      this.sendToSocket(this.clientWs, msg);
+    } else if (this.role === "client" && this.clientWs && this.clientContext) {
+      this.sendApplicationFrame(this.clientWs, this.clientContext, msg);
       return true;
     }
     return false;
@@ -1106,7 +1391,7 @@ export class LinkNode {
         let sent = false;
         for (const [s, c] of this.hubConnections) {
           if (c.phase === "authenticated" && c.displayName === to) {
-            this.sendToSocket(s, msg);
+            this.sendApplicationFrame(s, c, msg);
             sent = true;
             break;
           }
@@ -1116,11 +1401,58 @@ export class LinkNode {
           this.pendingRpcRequests.delete(id);
           reject(new Error(`Peer "${to}" not found`));
         }
-      } else if (this.role === "client" && this.clientWs) {
-        this.sendToSocket(this.clientWs, msg);
+      } else if (this.role === "client" && this.clientWs && this.clientContext) {
+        this.sendApplicationFrame(this.clientWs, this.clientContext, msg);
       } else {
         clearTimeout(timeout);
         this.pendingRpcRequests.delete(id);
+        reject(new Error("Node not connected"));
+      }
+    });
+  }
+
+  public async requestCompact(
+    to: string,
+    instructions?: string,
+  ): Promise<CompactResponseMsg> {
+    const id = `compact-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    const msg: CompactRequestMsg = {
+      type: "compact_request",
+      version: 5,
+      id,
+      from: this.terminalName,
+      to,
+      instructions,
+      ts: Date.now(),
+    };
+
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        this.pendingCompactRequests.delete(id);
+        reject(new Error(`Compact request to "${to}" timed out after 180s`));
+      }, 180_000);
+
+      this.pendingCompactRequests.set(id, { resolve, reject, timeout });
+
+      if (this.role === "hub") {
+        let sent = false;
+        for (const [s, c] of this.hubConnections) {
+          if (c.phase === "authenticated" && c.displayName === to) {
+            this.sendApplicationFrame(s, c, msg);
+            sent = true;
+            break;
+          }
+        }
+        if (!sent) {
+          clearTimeout(timeout);
+          this.pendingCompactRequests.delete(id);
+          reject(new Error(`Peer "${to}" not online`));
+        }
+      } else if (this.role === "client" && this.clientWs && this.clientContext) {
+        this.sendApplicationFrame(this.clientWs, this.clientContext, msg);
+      } else {
+        clearTimeout(timeout);
+        this.pendingCompactRequests.delete(id);
         reject(new Error("Node not connected"));
       }
     });
@@ -1137,6 +1469,7 @@ export class LinkNode {
       id: `offer-${transferId}`,
       transferId,
       from: this.terminalName,
+      originPrincipalId: this.identity.principalId,
       to,
       filename,
       sizeBytes: hashInfo.sizeBytes,
@@ -1155,31 +1488,34 @@ export class LinkNode {
 
     if (this.role === "hub") {
       let targetSocket: any = null;
+      let targetCtx: ConnectionContext | null = null;
       for (const [s, c] of this.hubConnections) {
         if (c.phase === "authenticated" && c.displayName === to) {
           targetSocket = s;
+          targetCtx = c;
           break;
         }
       }
-      if (!targetSocket) return { ok: false, error: `Peer "${to}" not online` };
-      this.sendToSocket(targetSocket, offer);
-    } else if (this.role === "client" && this.clientWs) {
-      this.sendToSocket(this.clientWs, offer);
+      if (!targetSocket || !targetCtx) return { ok: false, error: `Peer "${to}" not online` };
+      this.sendApplicationFrame(targetSocket, targetCtx, offer);
+    } else if (this.role === "client" && this.clientWs && this.clientContext) {
+      this.sendApplicationFrame(this.clientWs, this.clientContext, offer);
     } else {
       return { ok: false, error: "Not connected" };
     }
 
     const sendChunkFn = (chunk: FileChunkMsg) => {
+      chunk.originPrincipalId = this.identity.principalId;
       if (this.role === "hub") {
         for (const [s, c] of this.hubConnections) {
           if (c.phase === "authenticated" && c.displayName === to) {
-            this.sendToSocket(s, chunk);
+            this.sendApplicationFrame(s, c, chunk);
             return true;
           }
         }
         return false;
-      } else if (this.role === "client" && this.clientWs) {
-        this.sendToSocket(this.clientWs, chunk);
+      } else if (this.role === "client" && this.clientWs && this.clientContext) {
+        this.sendApplicationFrame(this.clientWs, this.clientContext, chunk);
         return true;
       }
       return false;
@@ -1198,6 +1534,20 @@ export class LinkNode {
     return { ok: finalAck.ok, error: finalAck.error };
   }
 
+  public sendHandshakeFrame(socket: any, ctx: ConnectionContext, msg: WireMessage): void {
+    if (ctx.phase === "authenticated") {
+      throw new Error(`Handshake frame "${msg.type}" strictly forbidden after connection is authenticated`);
+    }
+    this.sendToSocket(socket, msg);
+  }
+
+  public sendApplicationFrame(socket: any, ctx: ConnectionContext, msg: WireMessage): void {
+    if (ctx.phase !== "authenticated") {
+      throw new Error(`Application frame "${msg.type}" strictly forbidden before connection is authenticated`);
+    }
+    this.sendToSocket(socket, msg);
+  }
+
   private sendToSocket(socket: any, msg: WireMessage): void {
     try {
       if (socket && socket.readyState === WebSocket.OPEN) {
@@ -1207,15 +1557,19 @@ export class LinkNode {
   }
 
   private sendToHub(msg: WireMessage): void {
-    if (this.clientWs) {
-      this.sendToSocket(this.clientWs, msg);
+    if (this.clientWs && this.clientContext) {
+      if (this.clientContext.phase === "authenticated") {
+        this.sendApplicationFrame(this.clientWs, this.clientContext, msg);
+      } else {
+        this.sendHandshakeFrame(this.clientWs, this.clientContext, msg);
+      }
     }
   }
 
   private broadcastToOthers(excludeSocket: any, msg: WireMessage): void {
     for (const [socket, ctx] of this.hubConnections) {
       if (socket !== excludeSocket && ctx.phase === "authenticated") {
-        this.sendToSocket(socket, msg);
+        this.sendApplicationFrame(socket, ctx, msg);
       }
     }
   }
@@ -1256,6 +1610,7 @@ export class LinkNode {
   public async stop(): Promise<void> {
     revokeAllGrants("Link stopping");
     this.transferReceiver.abortAllTransfers();
+    this.activeRpcsByPeer.clear();
 
     for (const [_, p] of this.pendingRpcRequests) {
       clearTimeout(p.timeout);

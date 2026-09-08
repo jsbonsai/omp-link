@@ -280,12 +280,20 @@ export function removePairedDevice(fingerprintOrPrincipal: string, customOmpDir?
       targetFp = fp;
       break;
     }
+    if (dev.deviceName === fingerprintOrPrincipal) {
+      targetFp = fp;
+      break;
+    }
     try {
       if (normalizeFingerprint(fingerprintOrPrincipal) === fp) {
         targetFp = fp;
         break;
       }
     } catch {}
+    if (fp.startsWith(fingerprintOrPrincipal.toUpperCase())) {
+      targetFp = fp;
+      break;
+    }
   }
 
   if (!targetFp || !devices.has(targetFp)) {
@@ -302,9 +310,11 @@ export function getPairedDevice(fingerprintOrPrincipal: string, customOmpDir?: s
   const devices = loadPairedDevices(customOmpDir);
   for (const [fp, dev] of devices) {
     if (dev.principalId === fingerprintOrPrincipal) return dev;
+    if (dev.deviceName === fingerprintOrPrincipal) return dev;
     try {
       if (normalizeFingerprint(fingerprintOrPrincipal) === fp) return dev;
     } catch {}
+    if (fp.startsWith(fingerprintOrPrincipal.toUpperCase())) return dev;
   }
   return undefined;
 }

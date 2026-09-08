@@ -7,12 +7,23 @@ export const SENSITIVE_PATTERNS = [
   /^\.env(\..+)?$/i,
   /id_rsa/i,
   /id_ed25519/i,
+  /id_ecdsa/i,
+  /id_dsa/i,
   /\.pem$/i,
   /\.key$/i,
+  /\.pfx$/i,
+  /\.p12$/i,
+  /\.pkcs12$/i,
   /^\.git([\\/].*)?$/i,
   /[\\/]\.git([\\/].*)?$/i,
+  /^\.ssh([\\/].*)?$/i,
+  /[\\/]\.ssh([\\/].*)?$/i,
   /credentials/i,
   /secrets?(\.json|\.ya?ml)?$/i,
+  /^\.npmrc$/i,
+  /^\.netrc$/i,
+  /known_hosts/i,
+  /authorized_keys/i,
 ];
 
 const GIT_EXCLUSION_PATHSPECS = [
@@ -20,11 +31,18 @@ const GIT_EXCLUSION_PATHSPECS = [
   ":(exclude).env.*",
   ":(exclude)**/*.pem",
   ":(exclude)**/*.key",
+  ":(exclude)**/*.pfx",
+  ":(exclude)**/*.p12",
   ":(exclude)**/*id_rsa*",
   ":(exclude)**/*id_ed25519*",
+  ":(exclude)**/*id_ecdsa*",
+  ":(exclude)**/*id_dsa*",
   ":(exclude)**/.git",
+  ":(exclude)**/.ssh*",
   ":(exclude)**/credentials*",
   ":(exclude)**/secrets*",
+  ":(exclude)**/.npmrc",
+  ":(exclude)**/.netrc",
 ];
 
 export function isSensitivePath(filePath: string): boolean {
@@ -103,6 +121,20 @@ export function resolveConfinedPath(
   }
 }
 
+export function isTrustedExecutable(filePath: string): boolean {
+  try {
+    const stat = fs.statSync(filePath);
+    if (!stat.isFile()) return false;
+    // Must have executable bit set
+    if ((stat.mode & 0o111) === 0) return false;
+    // Must NOT be writable by group or others (0o022)
+    if ((stat.mode & 0o022) !== 0) return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 let cachedGitBinary: string | null = null;
 
 export function resolveTrustedGit(): string {
@@ -115,15 +147,10 @@ export function resolveTrustedGit(): string {
   ];
 
   for (const c of candidates) {
-    try {
-      if (fs.existsSync(c)) {
-        const stat = fs.statSync(c);
-        if (stat.isFile()) {
-          cachedGitBinary = c;
-          return c;
-        }
-      }
-    } catch {}
+    if (isTrustedExecutable(c)) {
+      cachedGitBinary = c;
+      return c;
+    }
   }
 
   cachedGitBinary = "git";
@@ -142,6 +169,8 @@ export function safeGitExecFile(
     "-c", "pager.diff=false",
     "-c", "pager.log=false",
     "-c", "diff.external=",
+    "-c", "diff.textconv=",
+    "-c", `core.hooksPath=${os.devNull || "/dev/null"}`,
   ];
 
   const cleanEnv: NodeJS.ProcessEnv = { ...process.env };
@@ -160,6 +189,9 @@ export function safeGitExecFile(
   for (const v of dangerousVars) {
     delete cleanEnv[v];
   }
+
+  // Enforce secure, fixed PATH to prevent binary hijacking
+  cleanEnv.PATH = "/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin";
   cleanEnv.GIT_CONFIG_NOSYSTEM = "1";
   cleanEnv.GIT_CONFIG_GLOBAL = os.devNull || "/dev/null";
   cleanEnv.GIT_TERMINAL_PROMPT = "0";
@@ -220,12 +252,17 @@ export async function safeGitDiff(cwd: string): Promise<{ ok: boolean; output?: 
       // 2. Diff only safe pathspecs
       safeGitExecFile(
         ["diff", "--no-ext-diff", "--no-textconv", "--", ...safeFiles],
-        { cwd },
+        { cwd, maxBuffer: 1024 * 1024 },
         (diffErr, diffStdout, diffStderr) => {
           if (diffErr) {
             resolve({ ok: false, error: diffStderr || diffErr.message });
           } else {
-            resolve({ ok: true, output: diffStdout || "[No diff]" });
+            let output = diffStdout || "[No diff]";
+            const MAX_DIFF_BYTES = 256 * 1024;
+            if (output.length > MAX_DIFF_BYTES) {
+              output = output.slice(0, MAX_DIFF_BYTES) + "\n... [Diff truncated: output exceeds 256KB limit]";
+            }
+            resolve({ ok: true, output });
           }
         },
       );
@@ -260,6 +297,9 @@ export async function safeGitGrep(
   if (!query || typeof query !== "string") {
     return { ok: false, error: "Search query required" };
   }
+  if (query.includes("\0")) {
+    return { ok: false, error: "Null bytes forbidden in search query" };
+  }
   if (query.length > 512) {
     return { ok: false, error: "Search query exceeds 512 characters maximum limit" };
   }
@@ -289,8 +329,16 @@ export async function safeGitGrep(
         const lines = stdout.split("\n").filter(Boolean);
         const capped = lines.slice(0, 100);
         let result = capped.join("\n");
-        if (lines.length > 100) {
-          result += `\n... [${lines.length - 100} additional matches truncated]`;
+        const MAX_GREP_BYTES = 64 * 1024;
+        let truncated = lines.length > 100;
+
+        if (result.length > MAX_GREP_BYTES) {
+          result = result.slice(0, MAX_GREP_BYTES);
+          truncated = true;
+        }
+
+        if (truncated) {
+          result += `\n... [Search results truncated: bounds exceeded (100 lines / 64KB)]`;
         }
         resolve({ ok: true, output: result });
       }
@@ -351,11 +399,15 @@ export async function safeListDir(
 
     const items = await fs.promises.readdir(confinement.fullPath, { withFileTypes: true });
     const entries: string[] = [];
+    let totalBytes = 0;
+    const MAX_LIST_BYTES = 64 * 1024;
 
     for (const item of items) {
       if (isSensitivePath(item.name)) continue;
-      entries.push(item.isDirectory() ? `${item.name}/` : item.name);
-      if (entries.length >= maxEntries) break;
+      const entry = item.isDirectory() ? `${item.name}/` : item.name;
+      totalBytes += entry.length;
+      entries.push(entry);
+      if (entries.length >= maxEntries || totalBytes >= MAX_LIST_BYTES) break;
     }
 
     return { ok: true, entries };
