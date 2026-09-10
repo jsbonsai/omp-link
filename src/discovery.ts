@@ -16,12 +16,14 @@ export interface NetworkInfo {
 
 export interface DiscoveredHub {
   hubId: string;
-  sessionId: string;
   host: string;
   ip: string;
   port: number;
   transport: "wss";
-  certificateFingerprint: string;
+  spkiFingerprint: string;
+  principalId?: string;
+  certificateFingerprint?: string; // legacy alias
+  sessionId?: string;
   source: "tailscale" | "lan" | "local";
   endpoints?: string[];
 }
@@ -81,7 +83,22 @@ export function resolveTailscaleBin(): string | null {
   return null;
 }
 
-export function startUdpDiscoveryResponder(tcpPort: number): dgram.Socket | null {
+export function startUdpDiscoveryResponder(
+  tcpPort: number,
+  options: { bindHost?: string; enabled?: boolean } = {},
+): dgram.Socket | null {
+  if (options.enabled === false) {
+    return null;
+  }
+  // If bindHost is loopback or Tailscale IP, disable LAN UDP discovery
+  if (
+    options.bindHost === "127.0.0.1" ||
+    options.bindHost === "::1" ||
+    (options.bindHost && options.bindHost.startsWith("100."))
+  ) {
+    return null;
+  }
+
   try {
     const socket = dgram.createSocket({ type: "udp4", reuseAddr: true });
     socket.on("message", (msg, rinfo) => {
@@ -96,7 +113,7 @@ export function startUdpDiscoveryResponder(tcpPort: number): dgram.Socket | null
     socket.on("error", () => {
       try { socket.close(); } catch {}
     });
-    socket.bind(UDP_DISCOVERY_PORT, "0.0.0.0");
+    socket.bind(UDP_DISCOVERY_PORT, options.bindHost && options.bindHost !== "0.0.0.0" ? options.bindHost : "0.0.0.0");
     return socket;
   } catch {
     return null;
@@ -131,23 +148,32 @@ export async function fetchPublicHubStatus(
       },
       (res) => {
         let body = "";
+        const MAX_STATUS_BYTES = 16 * 1024;
         res.on("data", (chunk) => {
           body += chunk;
+          if (body.length > MAX_STATUS_BYTES) {
+            clearTimeout(timer);
+            try { req.destroy(); } catch {}
+            resolve(null);
+          }
         });
         res.on("end", () => {
           clearTimeout(timer);
           try {
             const data = JSON.parse(body);
             if (data.service === "omp-link" && data.protocolVersion === PROTOCOL_VERSION) {
+              const spkiFp = data.spkiFingerprint || data.certificateFingerprint || "";
               resolve({
-                hubId: data.instanceId,
-                sessionId: data.sessionId || "team-link",
+                hubId: data.instanceId || `hub-${spkiFp.slice(0, 16)}`,
+                sessionId: data.sessionId,
                 host,
                 ip: host,
                 port,
                 transport: "wss",
-                certificateFingerprint: data.certificateFingerprint,
-                source: host === "127.0.0.1" ? "local" : "lan",
+                spkiFingerprint: spkiFp,
+                certificateFingerprint: spkiFp,
+                principalId: data.principalId,
+                source: host === "127.0.0.1" ? "local" : (host.startsWith("100.") ? "tailscale" : "lan"),
               });
               return;
             }
@@ -225,7 +251,9 @@ export function discoverLanHubsViaUdp(
 export async function discoverAllHubs(
   port = DEFAULT_PORT,
   timeoutMs = 1200,
+  options: { mode?: "tailscale" | "lan" | "loopback" | "all" } = {},
 ): Promise<DiscoveredHub[]> {
+  const mode = options.mode || "all";
   const hubs: DiscoveredHub[] = [];
   const probed = new Set<string>();
 
@@ -234,60 +262,68 @@ export async function discoverAllHubs(
   const localHub = await fetchPublicHubStatus("127.0.0.1", port, Math.min(timeoutMs, 400));
   if (localHub) hubs.push({ ...localHub, source: "local" });
 
-  // 2. Discover via LAN UDP
-  const lanEndpoints = await discoverLanHubsViaUdp(port, Math.min(timeoutMs, 600));
-  const lanProbes = lanEndpoints.map(async (ep) => {
-    const key = `${ep.host}:${ep.port}`;
-    if (probed.has(key)) return null;
-    probed.add(key);
-    const res = await fetchPublicHubStatus(ep.host, ep.port, timeoutMs);
-    if (res) return { ...res, source: "lan" as const };
-    return null;
-  });
+  if (mode === "loopback") {
+    return hubs;
+  }
 
-  const lanResults = await Promise.all(lanProbes);
-  for (const h of lanResults) {
-    if (h && !hubs.some((existing) => existing.hubId === h.hubId)) {
-      hubs.push(h);
+  // 2. Discover via LAN UDP (only if mode is 'lan' or 'all')
+  if (mode === "lan" || mode === "all") {
+    const lanEndpoints = await discoverLanHubsViaUdp(port, Math.min(timeoutMs, 600));
+    const lanProbes = lanEndpoints.map(async (ep) => {
+      const key = `${ep.host}:${ep.port}`;
+      if (probed.has(key)) return null;
+      probed.add(key);
+      const res = await fetchPublicHubStatus(ep.host, ep.port, timeoutMs);
+      if (res) return { ...res, source: "lan" as const };
+      return null;
+    });
+
+    const lanResults = await Promise.all(lanProbes);
+    for (const h of lanResults) {
+      if (h && !hubs.some((existing) => existing.hubId === h.hubId)) {
+        hubs.push(h);
+      }
     }
   }
 
-  // 3. Discover via Tailscale
-  const tsBin = resolveTailscaleBin();
-  if (tsBin) {
-    try {
-      const stdout = execSync(`"${tsBin}" status --json`, {
-        encoding: "utf8",
-        timeout: 2000,
-        stdio: ["ignore", "pipe", "ignore"],
-      });
-      const tsStatus = JSON.parse(stdout);
-      const peerIps: string[] = [];
-      if (tsStatus.Peer) {
-        for (const peer of Object.values<any>(tsStatus.Peer)) {
-          if (peer.Online && peer.TailscaleIPs) {
-            const ip4 = peer.TailscaleIPs.find((ip: string) => ip.startsWith("100."));
-            if (ip4) peerIps.push(ip4);
+  // 3. Discover via Tailscale (only if mode is 'tailscale' or 'all')
+  if (mode === "tailscale" || mode === "all") {
+    const tsBin = resolveTailscaleBin();
+    if (tsBin) {
+      try {
+        const stdout = execSync(`"${tsBin}" status --json`, {
+          encoding: "utf8",
+          timeout: 2000,
+          stdio: ["ignore", "pipe", "ignore"],
+        });
+        const tsStatus = JSON.parse(stdout);
+        const peerIps: string[] = [];
+        if (tsStatus.Peer) {
+          for (const peer of Object.values<any>(tsStatus.Peer)) {
+            if (peer.Online && peer.TailscaleIPs) {
+              const ip4 = peer.TailscaleIPs.find((ip: string) => ip.startsWith("100."));
+              if (ip4) peerIps.push(ip4);
+            }
           }
         }
-      }
 
-      const tsProbes = peerIps.map(async (ip) => {
-        const key = `${ip}:${port}`;
-        if (probed.has(key)) return null;
-        probed.add(key);
-        const res = await fetchPublicHubStatus(ip, port, timeoutMs);
-        if (res) return { ...res, source: "tailscale" as const };
-        return null;
-      });
+        const tsProbes = peerIps.map(async (ip) => {
+          const key = `${ip}:${port}`;
+          if (probed.has(key)) return null;
+          probed.add(key);
+          const res = await fetchPublicHubStatus(ip, port, timeoutMs);
+          if (res) return { ...res, source: "tailscale" as const };
+          return null;
+        });
 
-      const tsResults = await Promise.all(tsProbes);
-      for (const h of tsResults) {
-        if (h && !hubs.some((existing) => existing.hubId === h.hubId)) {
-          hubs.push(h);
+        const tsResults = await Promise.all(tsProbes);
+        for (const h of tsResults) {
+          if (h && !hubs.some((existing) => existing.hubId === h.hubId)) {
+            hubs.push(h);
+          }
         }
-      }
-    } catch {}
+      } catch {}
+    }
   }
 
   return hubs;

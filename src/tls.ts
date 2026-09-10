@@ -5,6 +5,7 @@ import type { ClientOptions as WsClientOptions } from "ws";
 import {
   type DeviceIdentity,
   fingerprintDer,
+  fingerprintPublicKey,
   normalizeFingerprint,
   canonicalSpkiDer,
 } from "./identity.js";
@@ -34,6 +35,7 @@ export function getClientTlsOptions(
     pinnedFingerprint?: string;
     caCertPem?: string;
     allowUnpaired?: boolean;
+    onServerCertificate?: (certInfo: PeerCertificateInfo) => void;
   } = {},
 ): WsClientOptions {
   const isPairedPinned = Boolean(options.pinnedFingerprint && options.caCertPem && !options.allowUnpaired);
@@ -54,7 +56,25 @@ export function getClientTlsOptions(
         throw new Error("No server certificate presented during TLS handshake");
       }
 
-      const serverFp = fingerprintDer(rawDer);
+      const spkiDer = canonicalSpkiDer(rawDer);
+      const serverFp = fingerprintPublicKey(spkiDer);
+      const x509 = new crypto.X509Certificate(rawDer);
+      const certPem = x509.toString();
+      const keyType = x509.publicKey.asymmetricKeyType || "unknown";
+      const principalId = `${keyType}-sha256:${serverFp}`;
+
+      const certInfo: PeerCertificateInfo = {
+        certDer: rawDer,
+        certPem,
+        fingerprint: serverFp,
+        spkiDer,
+        principalId,
+        keyType,
+      };
+
+      if (options.onServerCertificate) {
+        options.onServerCertificate(certInfo);
+      }
 
       if (options.pinnedFingerprint) {
         const canonicalPinned = normalizeFingerprint(options.pinnedFingerprint);
@@ -90,6 +110,7 @@ export function getClientTlsOptions(
 
 export function extractPeerCertificate(socket: any): PeerCertificateInfo | null {
   if (!socket) return null;
+  if (socket._peerCertInfo) return socket._peerCertInfo;
   const tlsSocket: TLSSocket = socket;
 
   if (typeof tlsSocket.getPeerX509Certificate === "function") {
@@ -98,8 +119,8 @@ export function extractPeerCertificate(socket: any): PeerCertificateInfo | null 
       if (x509) {
         const certDer = x509.raw;
         const certPem = x509.toString();
-        const fingerprint = fingerprintDer(certDer);
         const spkiDer = x509.publicKey.export({ format: "der", type: "spki" }) as Buffer;
+        const fingerprint = fingerprintPublicKey(spkiDer);
         const keyType = x509.publicKey.asymmetricKeyType || "unknown";
         const principalId = `${keyType}-sha256:${fingerprint}`;
         return {
@@ -121,8 +142,8 @@ export function extractPeerCertificate(socket: any): PeerCertificateInfo | null 
         const certDer = Buffer.isBuffer(cert.raw) ? cert.raw : Buffer.from(cert.raw);
         const x509 = new crypto.X509Certificate(certDer);
         const certPem = x509.toString();
-        const fingerprint = fingerprintDer(certDer);
         const spkiDer = x509.publicKey.export({ format: "der", type: "spki" }) as Buffer;
+        const fingerprint = fingerprintPublicKey(spkiDer);
         const keyType = x509.publicKey.asymmetricKeyType || "unknown";
         const principalId = `${keyType}-sha256:${fingerprint}`;
         return {
@@ -138,4 +159,24 @@ export function extractPeerCertificate(socket: any): PeerCertificateInfo | null 
   }
 
   return null;
+}
+
+export function verifyPeerSpki(socket: any, expected: string): PeerCertificateInfo {
+  const peer = extractPeerCertificate(socket);
+  if (!peer) {
+    throw new Error("Peer did not present a certificate");
+  }
+
+  const actual = fingerprintPublicKey(peer.spkiDer);
+  const actualBytes = Buffer.from(normalizeFingerprint(actual));
+  const expectedBytes = Buffer.from(normalizeFingerprint(expected));
+
+  if (
+    actualBytes.length !== expectedBytes.length ||
+    !crypto.timingSafeEqual(actualBytes, expectedBytes)
+  ) {
+    throw new Error(`SPKI mismatch: expected ${expected}, received ${actual}`);
+  }
+
+  return { ...peer, fingerprint: actual };
 }

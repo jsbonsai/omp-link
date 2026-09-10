@@ -51,6 +51,7 @@ import {
 
 import {
   discoverAllHubs,
+  fetchPublicHubStatus,
   getNetworkInfo,
   DEFAULT_PORT,
 } from "./src/discovery.js";
@@ -134,6 +135,8 @@ export default function (pi: ExtensionAPI) {
   let currentSessionId = config.sessionId || "team-link";
   let networkMode: "lan" | "tailscale" = config.network || "lan";
   let targetHubAddress: string | null = config.hub || null;
+  let targetInviteSecret: string | null = null;
+  let targetFingerprint: string | null = null;
   let terminalName = config.terminalName || os.hostname() || "omp-node";
   let mutationGuardEnabled = true;
   let lastContext: ExtensionContext | null = null;
@@ -144,6 +147,7 @@ export default function (pi: ExtensionAPI) {
       networkMode,
       terminalName,
       sessionId: currentSessionId,
+      allowRemoteExec: false,
     });
 
     linkNode.onMessage = (msg) => {
@@ -203,22 +207,56 @@ export default function (pi: ExtensionAPI) {
     if (targetHubAddress) {
       try {
         const url = `wss://${targetHubAddress}`;
-        await node.connectToHub(url);
+        await node.connectToHub(url, targetFingerprint || undefined, targetInviteSecret || undefined);
         ctx?.ui.notify(`Connected to link hub at ${targetHubAddress}`, "info");
       } catch (err: any) {
-        ctx?.ui.notify(`Failed to connect to ${targetHubAddress}: ${err.message}. Starting as host...`, "warning");
-        try {
-          await node.startHub();
-          ctx?.ui.notify(`Hosting link session "${currentSessionId}" on port ${node.port}`, "info");
-        } catch (hubErr: any) {
-          ctx?.ui.notify(`Failed to host link: ${hubErr.message}`, "error");
-        }
+        linkActive = false;
+        ctx?.ui.notify(`Failed to connect to link hub at ${targetHubAddress}: ${err.message}`, "error");
       }
     } else {
+      // 1. Check if a link hub is already running on localhost (e.g. another terminal on same machine)
+      try {
+        const localStatus = await fetchPublicHubStatus("127.0.0.1", node.port, 250);
+        if (localStatus) {
+          try {
+            await node.connectToHub(`wss://127.0.0.1:${node.port}`);
+            ctx?.ui.notify(`Connected to local link hub on port ${node.port}`, "info");
+            return;
+          } catch {}
+        }
+      } catch {}
+
+      // 2. Discover existing hubs on network (LAN / Tailscale)
+      try {
+        const discovered = await discoverAllHubs(node.port, 600, { mode: networkMode });
+        const matching = discovered.find((h) => h.sessionId === currentSessionId) ||
+          (discovered.length === 1 && discovered[0].source !== "local" ? discovered[0] : null);
+        if (matching && matching.host !== "127.0.0.1") {
+          try {
+            await node.connectToHub(`wss://${matching.host}:${matching.port}`);
+            ctx?.ui.notify(`Auto-connected to link hub at ${matching.host}:${matching.port} [${matching.source.toUpperCase()}]`, "info");
+            return;
+          } catch {}
+        }
+      } catch {}
+
+      // 3. If no existing hub found, host as hub
       try {
         await node.startHub();
-        ctx?.ui.notify(`Hosting link session "${currentSessionId}" on port ${node.port}`, "info");
+        const net = getNetworkInfo();
+        const hostIp = networkMode === "tailscale" ? (net.tailscaleIp || "tailscale") : (net.lanIps[0] || "127.0.0.1");
+        ctx?.ui.notify(`Hosting link session "${currentSessionId}" on ${hostIp}:${node.port}`, "info");
       } catch (err: any) {
+        // If port is already in use, attempt connecting to localhost as client
+        const errMsg = String(err?.message || "");
+        if (errMsg.includes("in use") || err?.code === "EADDRINUSE") {
+          try {
+            await node.connectToHub(`wss://127.0.0.1:${node.port}`);
+            ctx?.ui.notify(`Port ${node.port} in use: connected as client to local hub.`, "info");
+            return;
+          } catch {}
+        }
+        linkActive = false;
         ctx?.ui.notify(`Failed to host link: ${err.message}`, "error");
       }
     }
@@ -396,24 +434,51 @@ export default function (pi: ExtensionAPI) {
       const restArgs = args.trim().slice(parts[0]?.length || 0).trim();
 
       if (!subcmd || subcmd === "status") {
-        const id = getOrCreateDeviceIdentity();
+        const verbose = restArgs.includes("--verbose") || restArgs.includes("-v");
+        const net = getNetworkInfo();
+        const primaryIp = networkMode === "tailscale"
+          ? (net.tailscaleIp || "Tailscale not detected")
+          : (net.lanIps[0] || "127.0.0.1");
+        const endpoint = linkNode?.role === "hub"
+          ? `${primaryIp}:${linkNode.port}`
+          : (targetHubAddress || (linkNode?.role === "client" ? "Remote Hub" : "None"));
+
+        let roleLabel = "OFFLINE";
+        if (linkActive) {
+          roleLabel = linkNode?.role === "hub" ? "ACTIVE (Host Hub)" : "ACTIVE (Connected Peer)";
+        }
+
         let out =
-          `⚡ OMP-LINK STATUS (v5)\n` +
-          `  Mesh State  : ${linkActive ? "ACTIVE" : "OFFLINE"}\n` +
-          `  Node Role   : ${linkNode?.role || "disconnected"}\n` +
-          `  Session     : "${currentSessionId}" [${networkMode.toUpperCase()}]\n` +
-          `  Terminal    : ${terminalName}\n` +
-          `  Fingerprint : ${id.fingerprint}\n` +
-          `  Principal   : ${id.principalId}\n`;
+          `⚡ OMP-LINK: ${roleLabel}\n` +
+          `  Session  : "${currentSessionId}" [${networkMode.toUpperCase()}]\n` +
+          `  Endpoint : ${endpoint}\n` +
+          `  Terminal : ${terminalName}\n`;
 
         if (linkNode && linkActive) {
           const terms = linkNode.getConnectedTerminalsList();
-          out += `  Connected   : ${terms.length} node(s) (${terms.map((t) => t.name).join(", ")})\n`;
+          out += `  Nodes (${terms.length}): ${terms.map((t) => t.name + (t.name === terminalName ? " (this)" : "")).join(", ")}\n`;
         }
 
         const grants = getActiveGrants();
         if (grants.length > 0) {
-          out += `  Grants      : ⚠️ ${grants.map((g) => `${g.displayName} (${Math.ceil((g.expiresAt - Date.now()) / 60000)}m left, ${g.remainingUses} uses)`).join(", ")}\n`;
+          out += `  Grants   : ⚠️ ${grants.map((g) => `${g.displayName} (${Math.ceil((g.expiresAt - Date.now()) / 60000)}m left, ${g.remainingUses} uses)`).join(", ")}\n`;
+        }
+
+        if (verbose) {
+          const id = getOrCreateDeviceIdentity();
+          out +=
+            `\n  [Security Diagnostics]\n` +
+            `  Fingerprint : ${id.fingerprint}\n` +
+            `  Principal   : ${id.principalId}\n`;
+        } else {
+          out +=
+            `\nQuick Commands:\n` +
+            `  /link on | off          Turn link mesh ON or OFF\n` +
+            `  /link scan              Scan LAN & Tailscale for active sessions\n` +
+            `  /link join [ip:port]    Connect to an active session\n` +
+            `  /link invite            Create a one-time pairing invite code\n` +
+            `  /link doctor            Run system and TLS security diagnostic\n` +
+            `  /link help              Show full command reference\n`;
         }
 
         ctx.ui.notify(out, linkActive ? "info" : "warning");
@@ -427,12 +492,43 @@ export default function (pi: ExtensionAPI) {
         case "off":
           await turnLinkOff(ctx);
           break;
-        case "join": {
-          if (!restArgs) {
-            ctx.ui.notify("Usage: /link join <ip:port | session-name>", "warning");
+        case "scan": {
+          ctx.ui.notify(`Scanning ${networkMode.toUpperCase()} for active link sessions...`, "info");
+          const hubs = await discoverAllHubs(DEFAULT_PORT, 1000, { mode: networkMode });
+          if (hubs.length === 0) {
+            ctx.ui.notify(`No active link hubs found on ${networkMode.toUpperCase()}. Start one with '/link on'.`, "warning");
             return;
           }
-          targetHubAddress = restArgs;
+          let scanOut = `🔍 Discovered Link Sessions (${hubs.length}):\n`;
+          for (const h of hubs) {
+            scanOut += `  • "${h.sessionId || "link"}" on ${h.host}:${h.port} [${h.source.toUpperCase()}]\n    Join with: /link join ${h.host}:${h.port}\n`;
+          }
+          ctx.ui.notify(scanOut, "info");
+          break;
+        }
+        case "join": {
+          if (!restArgs) {
+            ctx.ui.notify("Searching for active link sessions to join...", "info");
+            const hubs = await discoverAllHubs(DEFAULT_PORT, 800, { mode: networkMode });
+            if (hubs.length === 1) {
+              targetHubAddress = `${hubs[0].host}:${hubs[0].port}`;
+              saveLinkConfig({ hub: targetHubAddress });
+              ctx.ui.notify(`Found session "${hubs[0].sessionId || "link"}" at ${targetHubAddress}. Joining...`, "info");
+              await turnLinkOn(ctx);
+              return;
+            } else if (hubs.length > 1) {
+              const list = hubs.map((h) => `  • "${h.sessionId || "session"}" on ${h.host}:${h.port} -> /link join ${h.host}:${h.port}`).join("\n");
+              ctx.ui.notify(`Multiple sessions found:\n${list}`, "warning");
+              return;
+            } else {
+              ctx.ui.notify("No active link hubs found. Specify address: /link join <ip:port>", "warning");
+              return;
+            }
+          }
+          const joinParts = restArgs.split(/\s+/).filter(Boolean);
+          targetHubAddress = joinParts[0];
+          targetInviteSecret = joinParts[1] || null;
+          targetFingerprint = joinParts[2] || null;
           saveLinkConfig({ hub: targetHubAddress });
           await turnLinkOn(ctx);
           break;
@@ -443,6 +539,8 @@ export default function (pi: ExtensionAPI) {
             saveLinkConfig({ sessionId: currentSessionId });
           }
           targetHubAddress = null;
+          targetInviteSecret = null;
+          targetFingerprint = null;
           saveLinkConfig({ hub: undefined });
           await turnLinkOn(ctx);
           break;
@@ -451,27 +549,35 @@ export default function (pi: ExtensionAPI) {
           const reqParts = restArgs.split(/\s+/).filter(Boolean);
           const reqId = parseInt(reqParts[0] || "", 10);
           if (!reqId) {
-            ctx.ui.notify("Usage: /link accept <request-id> [--allow perms]", "warning");
+            ctx.ui.notify("Usage: /link accept <request-id> [code] [--allow perms]", "warning");
             return;
           }
-          let perms = DEFAULT_PERMISSIONS;
+          let code: string | undefined;
+          if (reqParts[1] && !reqParts[1].startsWith("--")) {
+            code = reqParts[1];
+          }
+          let perms: DevicePermissions = { ...DEFAULT_PERMISSIONS };
           if (restArgs.includes("--allow")) {
             const permIdx = restArgs.indexOf("--allow");
-            const permList = restArgs.slice(permIdx + 7).trim().split(",");
+            const permList = restArgs.slice(permIdx + 7).trim().split(",").map((s) => s.trim().toLowerCase());
+            const allowInspect = permList.includes("inspect");
             perms = {
               observe: true,
               message: permList.includes("message"),
               compact: permList.includes("compact"),
-              inspect: permList.includes("inspect"),
-              fileInbox: permList.includes("file") || permList.includes("fileInbox"),
-              execRequest: permList.includes("exec") || permList.includes("execRequest"),
+              inspectMetadata: allowInspect || permList.includes("inspectmetadata") || permList.includes("metadata"),
+              readContent: allowInspect || permList.includes("readcontent") || permList.includes("content"),
+              readDiff: allowInspect || permList.includes("readdiff") || permList.includes("diff"),
+              fileInbox: permList.includes("file") || permList.includes("fileinbox"),
+              execRequest: permList.includes("exec") || permList.includes("execrequest"),
+              inspect: allowInspect,
             };
           }
-          const approved = linkNode?.approvePairing(reqId, perms);
+          const approved = linkNode?.approvePairing(reqId, perms, code);
           if (approved) {
             ctx.ui.notify(`Approved device "${approved.deviceName}" (${approved.fingerprint})!`, "info");
           } else {
-            ctx.ui.notify(`Pairing request #${reqId} not found or expired.`, "error");
+            ctx.ui.notify(`Pairing request #${reqId} not found, expired, or verification code mismatched.`, "error");
           }
           break;
         }
@@ -492,12 +598,13 @@ export default function (pi: ExtensionAPI) {
         case "invite": {
           const identity = getOrCreateDeviceIdentity();
           const invite = createInvite(identity, { expiresInMs: 300_000 });
+          const endpoint = `${networkMode === "tailscale" ? (linkNode?.bindHost || "<tailscale-ip>") : "<hub-ip>"}:${linkNode?.port || 9900}`;
           ctx.ui.notify(
             `🎟️ One-Time Pairing Invite Created (expires in 5m):\n` +
             `   Invite Code: ${invite.inviteCode}\n` +
             `   Secret:      ${invite.secret}\n` +
             `   Fingerprint: ${invite.hubFingerprint}\n` +
-            `   Join with:   /link join <hub-ip>:9900 ${invite.secret}`,
+            `   Join with:   /link join ${endpoint} ${invite.secret} ${invite.hubFingerprint}`,
             "info",
           );
           break;
@@ -581,7 +688,15 @@ export default function (pi: ExtensionAPI) {
 
             if (permList.includes("message")) updates.message = val;
             if (permList.includes("compact")) updates.compact = val;
-            if (permList.includes("inspect")) updates.inspect = val;
+            if (permList.includes("inspect")) {
+              updates.inspect = val;
+              updates.inspectMetadata = val;
+              updates.readContent = val;
+              updates.readDiff = val;
+            }
+            if (permList.includes("inspectmetadata") || permList.includes("metadata")) updates.inspectMetadata = val;
+            if (permList.includes("readcontent") || permList.includes("content")) updates.readContent = val;
+            if (permList.includes("readdiff") || permList.includes("diff")) updates.readDiff = val;
             if (permList.includes("file") || permList.includes("fileinbox")) updates.fileInbox = val;
             if (permList.includes("exec") || permList.includes("execrequest")) updates.execRequest = val;
 
@@ -785,9 +900,26 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("link-join", {
     description: "Join an active link session (alias for /link join)",
     handler: async (args, ctx) => {
-      targetHubAddress = args.trim();
-      saveLinkConfig({ hub: targetHubAddress });
-      await turnLinkOn(ctx);
+      const target = args.trim();
+      if (target) {
+        targetHubAddress = target;
+        saveLinkConfig({ hub: targetHubAddress });
+        await turnLinkOn(ctx);
+      } else {
+        ctx.ui.notify("Searching for active link sessions to join...", "info");
+        const hubs = await discoverAllHubs(DEFAULT_PORT, 800, { mode: networkMode });
+        if (hubs.length === 1) {
+          targetHubAddress = `${hubs[0].host}:${hubs[0].port}`;
+          saveLinkConfig({ hub: targetHubAddress });
+          ctx.ui.notify(`Found session "${hubs[0].sessionId || "link"}" at ${targetHubAddress}. Joining...`, "info");
+          await turnLinkOn(ctx);
+        } else if (hubs.length > 1) {
+          const list = hubs.map((h) => `  • "${h.sessionId || "session"}" on ${h.host}:${h.port} -> /link join ${h.host}:${h.port}`).join("\n");
+          ctx.ui.notify(`Multiple sessions found:\n${list}`, "warning");
+        } else {
+          ctx.ui.notify("No active link hubs found. Specify address: /link join <ip:port>", "warning");
+        }
+      }
     },
   });
 

@@ -24,6 +24,11 @@ export const SENSITIVE_PATTERNS = [
   /^\.netrc$/i,
   /known_hosts/i,
   /authorized_keys/i,
+  /\.aws([\\/].*)?$/i,
+  /kubeconfig/i,
+  /\.kube([\\/].*)?$/i,
+  /\.tfvars(\.json)?$/i,
+  /\.sops/i,
 ];
 
 const GIT_EXCLUSION_PATHSPECS = [
@@ -43,7 +48,143 @@ const GIT_EXCLUSION_PATHSPECS = [
   ":(exclude)**/secrets*",
   ":(exclude)**/.npmrc",
   ":(exclude)**/.netrc",
+  ":(exclude)**/.aws*",
+  ":(exclude)**/*kubeconfig*",
+  ":(exclude)**/*.tfvars*",
+  ":(exclude)**/*.sops*",
 ];
+
+export interface WorkspacePolicy {
+  id: string;
+  canonicalRoot: string;
+  allowMetadata: boolean;
+  allowContentRead: boolean;
+  allowDiffContent: boolean;
+  allowInboundFiles: boolean;
+  allowExec: boolean;
+}
+
+const registeredWorkspaces = new Map<string, WorkspacePolicy>();
+
+export function registerWorkspace(policy: {
+  id: string;
+  rootDir: string;
+  allowMetadata?: boolean;
+  allowContentRead?: boolean;
+  allowDiffContent?: boolean;
+  allowInboundFiles?: boolean;
+  allowExec?: boolean;
+}): WorkspacePolicy {
+  const canonicalRoot = fs.realpathSync(policy.rootDir || process.cwd());
+  const entry: WorkspacePolicy = {
+    id: policy.id,
+    canonicalRoot,
+    allowMetadata: policy.allowMetadata ?? true,
+    allowContentRead: policy.allowContentRead ?? true,
+    allowDiffContent: policy.allowDiffContent ?? true,
+    allowInboundFiles: policy.allowInboundFiles ?? true,
+    allowExec: policy.allowExec ?? false,
+  };
+  registeredWorkspaces.set(policy.id, entry);
+  return entry;
+}
+
+export function getRegisteredWorkspace(id = "default"): WorkspacePolicy | undefined {
+  if (registeredWorkspaces.has(id)) {
+    return registeredWorkspaces.get(id);
+  }
+  if (id === "default" || id === "*") {
+    return registerWorkspace({ id: "default", rootDir: process.cwd() });
+  }
+  return undefined;
+}
+
+export function getAllRegisteredWorkspaces(): WorkspacePolicy[] {
+  return Array.from(registeredWorkspaces.values());
+}
+
+export function clearRegisteredWorkspaces(): void {
+  registeredWorkspaces.clear();
+}
+
+export function validateOutboundFile(
+  workspaceRoot: string,
+  requestedPath: string,
+  additionalAllowedRoots: string[] = [],
+): { allowed: boolean; canonicalPath?: string; reason?: string } {
+  if (!requestedPath || typeof requestedPath !== "string") {
+    return { allowed: false, reason: "Missing path parameter" };
+  }
+  if (requestedPath.includes("\0")) {
+    return { allowed: false, reason: "Null bytes forbidden in path" };
+  }
+
+  let canonicalBase: string;
+  try {
+    canonicalBase = fs.realpathSync(workspaceRoot || process.cwd());
+  } catch (err: any) {
+    return { allowed: false, reason: `Workspace root invalid: ${err.message}` };
+  }
+
+  const normalizedPath = requestedPath.replace(/\\/g, "/");
+
+  // Sensitive pattern check on requested path
+  if (isSensitivePath(normalizedPath)) {
+    return {
+      allowed: false,
+      reason: `Outbound transfer of sensitive file "${path.basename(normalizedPath)}" is blocked`,
+    };
+  }
+
+  const candidate = path.isAbsolute(normalizedPath)
+    ? path.resolve(normalizedPath)
+    : path.resolve(canonicalBase, normalizedPath);
+
+  if (!fs.existsSync(candidate)) {
+    return { allowed: false, reason: `File does not exist: ${requestedPath}` };
+  }
+
+  try {
+    const realCandidate = fs.realpathSync(candidate);
+
+    const allowedRoots = [canonicalBase];
+    for (const root of additionalAllowedRoots) {
+      try {
+        allowedRoots.push(fs.realpathSync(root));
+      } catch {}
+    }
+    for (const ws of registeredWorkspaces.values()) {
+      allowedRoots.push(ws.canonicalRoot);
+    }
+
+    const isContained = allowedRoots.some(
+      (root) => realCandidate === root || realCandidate.startsWith(root + path.sep),
+    );
+
+    if (!isContained) {
+      return {
+        allowed: false,
+        reason: `File path escapes workspace root (${canonicalBase})`,
+      };
+    }
+
+    if (isSensitivePath(realCandidate)) {
+      return {
+        allowed: false,
+        reason: `Outbound transfer of sensitive target "${path.basename(realCandidate)}" is blocked`,
+      };
+    }
+
+    const stat = fs.statSync(realCandidate);
+    if (!stat.isFile()) {
+      return { allowed: false, reason: "Outbound transfer target is not a regular file" };
+    }
+
+    return { allowed: true, canonicalPath: realCandidate };
+  } catch (err: any) {
+    return { allowed: false, reason: `Path resolution error: ${err.message}` };
+  }
+}
 
 export function isSensitivePath(filePath: string): boolean {
   if (!filePath) return true;

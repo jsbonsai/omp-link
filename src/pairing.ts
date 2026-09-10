@@ -5,6 +5,7 @@ import {
   DEFAULT_PERMISSIONS,
   savePairedDevice,
   derivePairingSas,
+  deriveLocalSas,
   normalizeFingerprint,
 } from "./identity.js";
 import { type PeerCertificateInfo } from "./tls.js";
@@ -40,7 +41,7 @@ export class PairingManager {
   public createRequest(params: {
     socket: any;
     peerCert: PeerCertificateInfo;
-    hubCertDer: Buffer;
+    hubSpkiDer: Buffer;
     displayName: string;
     clientNonce: string;
     host?: string;
@@ -62,12 +63,13 @@ export class PairingManager {
       }
     }
 
-    const hubNonce = crypto.randomBytes(16).toString("hex");
-    const sasCode = derivePairingSas(
-      params.hubCertDer,
-      params.peerCert.certDer,
-      hubNonce,
-      params.clientNonce,
+    const hubNonce = crypto.randomBytes(32).toString("hex");
+    const sasCode = deriveLocalSas(
+      params.socket,
+      params.hubSpkiDer,
+      params.peerCert.spkiDer,
+      Buffer.from(hubNonce, "hex"),
+      Buffer.from(params.clientNonce, "hex"),
     );
 
     const id = this.nextRequestId++;
@@ -107,9 +109,20 @@ export class PairingManager {
   public approveRequest(
     id: number,
     permissions: DevicePermissions = DEFAULT_PERMISSIONS,
+    code?: string,
   ): PairedDevice | null {
     const req = this.pendingRequests.get(id);
     if (!req) return null;
+
+    if (code) {
+      const cleanExpected = req.sasCode.replace(/[^a-zA-Z0-9]/g, "").toUpperCase();
+      const cleanGiven = code.replace(/[^a-zA-Z0-9]/g, "").toUpperCase();
+      const expBuf = Buffer.from(cleanExpected, "utf8");
+      const givBuf = Buffer.from(cleanGiven, "utf8");
+      if (expBuf.length !== givBuf.length || !crypto.timingSafeEqual(expBuf, givBuf)) {
+        return null;
+      }
+    }
 
     clearTimeout(req.timer);
     this.pendingRequests.delete(id);

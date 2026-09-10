@@ -25,6 +25,7 @@ describe("OMP-LINK v5 Integration: Loopback Mesh & Node Coordination", () => {
       customOmpDir: hubDir,
       terminalName: "hub-primary",
       sessionId: "integration-session",
+      allowRemoteExec: true,
     });
 
     client = new LinkNode({
@@ -61,10 +62,10 @@ describe("OMP-LINK v5 Integration: Loopback Mesh & Node Coordination", () => {
 
     assert.ok(pairingRequestedEvent, "Expected pairing request event on hub");
     assert.strictEqual(pairingRequestedEvent.displayName, "client-secondary");
-    assert.match(pairingRequestedEvent.sasCode, /^[A-Z]+-[0-9]-[A-Z]+-[0-9]$/);
+    assert.match(pairingRequestedEvent.sasCode, /^[a-z]+-[a-z]+-[a-z]+-[a-z]+$/i);
 
-    // Host approves pairing with FULL_PERMISSIONS
-    const paired = hub.approvePairing(pairingRequestedEvent.id, FULL_PERMISSIONS);
+    // Host approves pairing with FULL_PERMISSIONS and SAS verification
+    const paired = hub.approvePairing(pairingRequestedEvent.id, FULL_PERMISSIONS, pairingRequestedEvent.sasCode);
     assert.ok(paired);
     assert.strictEqual(paired.deviceName, "client-secondary");
     assert.strictEqual(paired.permissions.message, true);
@@ -201,7 +202,7 @@ describe("OMP-LINK v5 Integration: Loopback Mesh & Node Coordination", () => {
       const res = await hub.executeRemoteRpc("client-secondary", "read_file", {
         filePath: "test-client-inspect.txt",
       });
-      assert.strictEqual(res.ok, true);
+      assert.strictEqual(res.ok, true, `read_file failed with error: ${res.error}`);
       assert.strictEqual(res.result, "Client inspection safe token");
     } finally {
       try { fs.unlinkSync(safeFile); } catch {}

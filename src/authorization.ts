@@ -1,3 +1,4 @@
+import * as crypto from "node:crypto";
 import { type DevicePermissions, savePairedDevice, getPairedDevice } from "./identity.js";
 import { type ApplicationMessage } from "./protocol-schema.js";
 import { type ConnectionContext } from "./connection-state.js";
@@ -8,6 +9,7 @@ export interface ExecGrant {
   principalId: string;
   displayName: string;
   workspaceId: string;
+  commandDigest?: string;
   createdAt: number;
   expiresAt: number;
   remainingUses: number;
@@ -32,10 +34,25 @@ export function requiredPermission(message: ApplicationMessage): keyof DevicePer
     case "file_chunk":
     case "file_ack":
       return "fileInbox";
-    case "rpc_request":
-      return message.action === "exec"
-        ? "execRequest"
-        : (message.action === "system_status" ? "observe" : "inspect");
+    case "rpc_request": {
+      switch (message.action) {
+        case "exec":
+          return "execRequest";
+        case "system_status":
+          return "observe";
+        case "git_status":
+        case "git_log":
+        case "list_dir":
+          return "inspectMetadata";
+        case "read_file":
+        case "search_text":
+          return "readContent";
+        case "git_diff":
+          return "readDiff";
+        default:
+          return "inspectMetadata";
+      }
+    }
     case "status_update":
     default:
       return "observe";
@@ -50,14 +67,25 @@ export function isActionPermitted(
   if (!permissions) {
     return { permitted: false, required: req, reason: "No device permissions attached to connection" };
   }
-  if (!permissions[req]) {
-    return {
-      permitted: false,
-      required: req,
-      reason: `Permission denied: action requires "${req}" capability, which is not granted to this device`,
-    };
+
+  // Check granular capability first
+  if (permissions[req]) {
+    return { permitted: true, required: req };
   }
-  return { permitted: true, required: req };
+
+  // Legacy fallback: if device has general 'inspect: true', allow readContent/readDiff/inspectMetadata
+  if (
+    permissions.inspect &&
+    (req === "inspectMetadata" || req === "readContent" || req === "readDiff")
+  ) {
+    return { permitted: true, required: req };
+  }
+
+  return {
+    permitted: false,
+    required: req,
+    reason: `Permission denied: action requires "${req}" capability, which is not granted to this device`,
+  };
 }
 
 export function bindMessageOrigin(
@@ -78,6 +106,7 @@ export function createExecGrant(
   displayName: string,
   options: {
     workspaceId?: string;
+    command?: string;
     durationMs?: number;
     maxUses?: number;
     onExpire?: (grant: ExecGrant) => void;
@@ -89,12 +118,16 @@ export function createExecGrant(
   const grantId = `grant-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
   const durationMs = options.durationMs ?? 10 * 60 * 1000; // 10m default
   const maxUses = options.maxUses ?? 1; // 1 use default
+  const commandDigest = options.command
+    ? crypto.createHash("sha256").update(options.command.trim()).digest("hex")
+    : undefined;
 
   const grant: ExecGrant = {
     grantId,
     principalId,
     displayName,
     workspaceId: options.workspaceId || "*",
+    commandDigest,
     createdAt: Date.now(),
     expiresAt: Date.now() + durationMs,
     remainingUses: maxUses,
@@ -120,6 +153,7 @@ export function createExecGrant(
     principalId,
     displayName,
     workspaceId: grant.workspaceId,
+    commandDigest,
     maxUses,
     expiresAt: grant.expiresAt,
   });
@@ -130,6 +164,7 @@ export function createExecGrant(
 export function checkAndConsumeExecGrant(
   principalId: string,
   workspaceId?: string,
+  command?: string,
 ): { allowed: boolean; reason?: string; grant?: ExecGrant } {
   const grant = activeExecGrants.get(principalId);
   if (!grant) {
@@ -167,6 +202,20 @@ export function checkAndConsumeExecGrant(
     }
   }
 
+  // Strictly enforce command digest matching if grant was bound to a specific command
+  if (grant.commandDigest) {
+    if (!command) {
+      return { allowed: false, reason: "Execution grant is bound to a specific command, none provided" };
+    }
+    const digest = crypto.createHash("sha256").update(command.trim()).digest("hex");
+    if (digest !== grant.commandDigest) {
+      return {
+        allowed: false,
+        reason: "Command does not match the approved command bound to this execution grant",
+      };
+    }
+  }
+
   grant.remainingUses--;
 
   appendAuditLog({
@@ -176,6 +225,7 @@ export function checkAndConsumeExecGrant(
     principalId,
     remainingUses: grant.remainingUses,
     workspaceId,
+    command: command ? `${command.slice(0, 32)}...` : undefined,
   });
 
   if (grant.remainingUses <= 0) {

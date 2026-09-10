@@ -33,14 +33,27 @@ export class TransferReceiver {
   private activeTransfers = new Map<string, IncomingTransfer>();
   private ompDir: string;
 
+  private cachedDiskUsage: number | null = null;
+  private lastDiskScan = 0;
+
   constructor(customOmpDir?: string) {
     this.ompDir = customOmpDir || getOmpDir();
     this.cleanupStaleParts();
+    this.purgeQuarantineOlderThan(7 * 24 * 60 * 60 * 1000); // 7 days retention default
   }
 
   public getQuarantineDiskUsage(): number {
+    const now = Date.now();
+    if (this.cachedDiskUsage !== null && now - this.lastDiskScan < 5_000) {
+      return this.cachedDiskUsage;
+    }
+
     const inboxRoot = path.join(this.ompDir, "inbox");
-    if (!fs.existsSync(inboxRoot)) return 0;
+    if (!fs.existsSync(inboxRoot)) {
+      this.cachedDiskUsage = 0;
+      this.lastDiskScan = now;
+      return 0;
+    }
     let totalBytes = 0;
     try {
       const walk = (dir: string) => {
@@ -58,7 +71,44 @@ export class TransferReceiver {
       };
       walk(inboxRoot);
     } catch {}
+
+    this.cachedDiskUsage = totalBytes;
+    this.lastDiskScan = now;
     return totalBytes;
+  }
+
+  public purgeQuarantineOlderThan(maxAgeMs = 7 * 24 * 60 * 60 * 1000): number {
+    const inboxRoot = path.join(this.ompDir, "inbox");
+    if (!fs.existsSync(inboxRoot)) return 0;
+    let purgedCount = 0;
+    const now = Date.now();
+
+    try {
+      const walk = (dir: string) => {
+        const entries = fs.readdirSync(dir, { withFileTypes: true });
+        for (const entry of entries) {
+          const full = path.join(dir, entry.name);
+          if (entry.isDirectory()) {
+            walk(full);
+            try {
+              if (fs.readdirSync(full).length === 0) fs.rmdirSync(full);
+            } catch {}
+          } else if (entry.isFile()) {
+            try {
+              const stat = fs.statSync(full);
+              if (now - stat.mtimeMs > maxAgeMs) {
+                fs.unlinkSync(full);
+                purgedCount++;
+              }
+            } catch {}
+          }
+        }
+      };
+      walk(inboxRoot);
+    } catch {}
+
+    this.cachedDiskUsage = null;
+    return purgedCount;
   }
 
   public cleanupStaleParts(): void {

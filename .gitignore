@@ -5,6 +5,7 @@ sync.ffs_db
 *.log
 .env
 .env.*
-link.json
 dist/
+link.json
 .system_generated/
+.cate/

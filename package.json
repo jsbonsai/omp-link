@@ -1,7 +1,7 @@
 {
   "name": "omp-link",
-  "version": "3.2.1",
-  "description": "Multi-machine and Tailnet-aware inter-terminal coordination mesh with TLS 1.3 Mutual Authentication, Capability Enforcement, Structured RPC, and Out-of-band File Transfer for Oh-My-Pi and Pi.",
+  "version": "3.3.0",
+  "description": "Multi-machine and Tailnet-aware peer-hosted coordination network with TLS 1.3 Mutual Authentication, SPKI Pinning, Scoped Capabilities, Structured RPC, and Quarantined File Transfer for Oh-My-Pi and Pi.",
   "type": "module",
   "author": "alvivar",
   "license": "MIT",
@@ -48,7 +48,7 @@
     "swarm"
   ],
   "dependencies": {
-    "ws": "^8.20.0"
+    "ws": "8.21.3"
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "^0.85.1",

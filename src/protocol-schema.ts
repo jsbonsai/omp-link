@@ -9,6 +9,7 @@ export interface BaseMessage {
   id?: string;
   from?: string;
   to?: string;
+  toPrincipalId?: string;
   ts?: number;
   originPrincipalId?: string;
   originAgentId?: string;
@@ -33,7 +34,6 @@ export interface ServerHelloMsg extends BaseMessage {
   hubFingerprint: string;
   hubNonce: string;
   requiresPairing: boolean;
-  sasCode?: string;
   host?: string;
   terminals?: Array<{ name: string; host?: string; cwd?: string; status?: string }>;
 }

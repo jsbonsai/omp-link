@@ -10,61 +10,55 @@
 When `omp-link` is running, type `/link` inside OMP to see your live mesh dashboard:
 
 ```text
-⚡ OMP LINK STATUS (v5)
-────────────────────────────────────────────────────────────
-  Mesh State  : ACTIVE
-  Node Role   : Host (macbook-pro)
-  Session     : "team-swarm" [TAILSCALE / LAN]
-  Principal   : ed25519-sha256:FA:3B:5C:FE:... (256-bit SHA-256)
-  Transport   : Mutual TLS 1.3 + SPKI Pinning (wss://)
-────────────────────────────────────────────────────────────
-  Online Peers (3):
-    • macbook-pro       (you) [host: mac-1   · project: web-app] (idle)
-    • linux-workstation       [host: linux-2 · project: backend] (idle)
-    • cloud-vm                [host: vm-3    · project: ai-models] (idle)
-────────────────────────────────────────────────────────────
-  Direct RPC  : < 25ms structured inspection (link_exec)
-  File Xfer   : Streamed quarantine transfer (~/.omp/inbox/)
-────────────────────────────────────────────────────────────
-  Join from another machine:
-    /link join 192.168.1.50:9900
+⚡ OMP-LINK: ACTIVE (Host Hub)
+  Session  : "team-swarm" [TAILSCALE]
+  Endpoint : 100.82.12.4:9900
+  Terminal : macbook-pro
+  Nodes (3): macbook-pro (this), linux-workstation, cloud-vm
+
+Quick Commands:
+  /link on | off          Turn link mesh ON or OFF
+  /link scan              Scan LAN & Tailscale for active sessions
+  /link join [ip:port]    Connect to an active session
+  /link invite            Create a one-time pairing invite code
+  /link doctor            Run system and TLS security diagnostic
+  /link help              Show full command reference
 ```
 
 ### Live Peer Joining & Message Stream
 When another terminal connects or sends a message, OMP displays live status notifications:
 
 ```text
-⚡ Connected to session "team-swarm" on LAN (2 online) [E2EE Active]
+⚡ Connected to session "team-swarm" [Tailscale: 100.82.12.4:9900]
 "linux-workstation" joined the link
 
 [Link: 1 message(s) received]
 
-From "linux-workstation on linux-2 (project: backend)":
+From "linux-workstation" (ed25519-sha256:40:E0:8C:...):
 I have refactored auth.ts and run the test suite. All 14 tests pass.
 ```
 
 ---
 
-## Why omp-link? (Zero-Infrastructure Decentralized Mesh)
+## Why omp-link? (Zero-Infrastructure Peer-Hosted Coordination)
 
-Most multi-agent or remote terminal tools require setting up a centralized relay server, deploying Docker containers, managing external brokers (like MQTT), or paying for cloud hosting.
+Most multi-agent or remote terminal tools require setting up an external relay server, deploying Docker containers, managing cloud brokers (like MQTT), or routing traffic through a third-party service.
 
-`omp-link` takes an entirely different approach: **zero infrastructure, zero central servers, and zero manual network configuration.**
+`omp-link` takes an entirely different approach: **zero infrastructure, zero central servers, and zero manual port forwarding.**
 
-| Feature | Centralized Relays (e.g. cloud relays, brokers) | `omp-link` |
+| Feature | Centralized Relays | `omp-link` |
 |---|---|---|
-| **Infrastructure** | Requires dedicated server, VPS, or cloud relay | **Zero**. Runs 100% inside your local OMP terminal |
-| **Server Management** | Must maintain, monitor, and pay for background daemons | **None**. No daemon processes, no Docker, no external services |
-| **Connection Topology** | Hub-and-spoke routed through a third-party server | **Direct Peer-to-Peer** across Tailscale & local LAN |
-| **Failure Handling** | If the central relay server dies, all terminals disconnect | **P2P Host Migration** (like a multiplayer game lobby) |
-| **Security Architecture** | Central server can inspect or log unencrypted traffic | **Mutual TLS 1.3** with client & server certificate pinning |
-| **Network Reachability** | Manual port-forwarding, static IPs, or relay join tokens | **Autonomous auto-discovery** across Tailnet & LAN |
+| **Infrastructure** | Requires dedicated cloud server or VPS | **Zero**. Runs 100% inside your local OMP terminal |
+| **Server Management** | Must maintain, monitor, and pay for background daemons | **None**. No daemon processes, no external services |
+| **Connection Topology** | Hub-and-spoke routed through third-party cloud | **Peer-Hosted Network** across Tailscale & local LAN |
+| **Security Architecture** | Central server can inspect or log unencrypted traffic | **Mutual TLS 1.3** with client & server SPKI pinning |
+| **Reachability** | Manual port-forwarding or relay join tokens | **Autonomous discovery** across Tailnet & LAN UDP |
 
-### The "Game Lobby" Host Migration Model
-Instead of hardcoding fixed client and server roles, every `omp-link` terminal is a symmetric, autonomous peer:
-1. **Auto-Election on Startup**: When you launch OMP, it checks if an active session exists for your project on your Tailnet or local subnet. If yes, it joins immediately. If not, it anchors the session as the host.
-2. **Seamless Host Migration**: If the hosting laptop closes its lid or disconnects, the remaining terminals detect the drop, elect a new host from the swarm, and reconnect automatically without human intervention.
-3. **Link in a Single Command**: You don't manage IP tables, DNS names, or firewall tunnels. Start your terminals and type `/link join` (or let startup auto-discovery handle it) to connect your machines into a unified swarm.
+### The Peer-Hosted Model
+Instead of requiring external servers, `omp-link` uses an autonomous peer-host model:
+1. **Zero-Config Discovery**: When you launch OMP or type `/link on`, it automatically checks if an active session already exists on `localhost`, your Tailnet, or local LAN. If found, it joins immediately as a client node. If no session exists, it anchors the session as the Host Hub.
+2. **Local Terminal Multiplexing**: If you open multiple terminal windows on the same laptop, subsequent terminals automatically detect the local host on port 9900 and join as clients without port collision errors.
+3. **Link in a Single Command**: You don't manage IP tables or firewalls. Start your terminals and run `/link on` or `/link scan` to coordinate your machines into a unified swarm.
 
 ---
 
@@ -74,22 +68,17 @@ All coordination happens directly inside OMP through the unified `/link` command
 
 | Command | Usage | Description |
 |---|---|---|
-| **`/link`** | `/link` | **Dashboard**: Live status card showing session ID, network mode, endpoint, peers, and cryptographic fingerprints. |
-| **`/link on` / `/link off`** | `/link on`<br>`/link off` | **Deterministic Mesh Control**: Enable or cleanly disable the mesh, stopping all background sockets and retries. |
-| **`/link join`** | `/link join`<br>`/link join [id\|ip] [pin]` | **Connect**: With no arguments, auto-discovers active sessions! Or specify session ID / IP and PIN. *(Alias: `/link-join`)* |
-| **`/link leave`** | `/link leave` | **Disconnect**: Cleanly leave the session and release network ports. *(Alias: `/link-leave`)* |
-| **`/link start`** | `/link start [id] [pin]` | **Host**: Start or switch to hosting a session with a custom ID or PIN. |
-| **`/link accept` / `/link deny`** | `/link accept [id]`<br>`/link deny [id]` | **Pairing Governance**: Approve or reject pending device join requests with Ed25519 key verification. |
-| **`/link requests`** | `/link requests` | **Pairing Queue**: View all pending device join requests awaiting host approval. |
-| **`/link devices`** | `/link devices`<br>`/link devices revoke <id>` | **Trusted Devices**: List paired devices and fingerprints or revoke a device's trust. |
-| **`/link grant`** | `/link grant <peer> [min]` | **Territorial Sovereignty Elevation**: Grant temporary (1–60 min) shell execution elevation to a trusted peer. |
-| **`/link revoke-grant`** | `/link revoke-grant <peer>` | **Revoke Elevation**: Immediately cancel active execution elevation for a peer. |
-| **`/link mutation`** | `/link mutation`<br>`/link mutation [on\|off\|log]` | **Mutation Guard**: Inspect, toggle, or view the real-time blocked mutation audit log. |
-| **`/link network`** | `/link network [tailscale\|lan]` | **Interface Selection**: Switch between Tailscale and LAN mode. |
+| **`/link`** | `/link`<br>`/link status [--verbose]` | **Dashboard**: Live status card showing session ID, network mode, endpoint, and online peers. Use `--verbose` for raw SPKI principals. |
+| **`/link on` / `/link off`** | `/link on`<br>`/link off` | **Deterministic Mesh Control**: Enable or cleanly disable the mesh, stopping background listeners and retries. |
+| **`/link scan`** | `/link scan` | **Network Scan**: Actively scan LAN and Tailscale for active link sessions with 1-click join instructions. |
+| **`/link join`** | `/link join`<br>`/link join <ip:port> [invite]` | **Connect**: With no arguments, auto-discovers and joins active sessions! Or specify an explicit endpoint. *(Alias: `/link-join`)* |
+| **`/link start`** | `/link start [session-id]` | **Host**: Anchor or switch to hosting a session under a custom project or session name. |
+| **`/link invite`** | `/link invite` | **One-Time Pairing**: Generate a single-use 5-minute cryptographic invite code for pairing a new device. |
+| **`/link accept` / `/link deny`** | `/link accept <id> [code]`<br>`/link deny <id>` | **Pairing Governance**: Approve or reject pending pairing requests with channel-bound SAS verification. |
+| **`/link devices`** | `/link devices`<br>`/link devices revoke <id>` | **Trusted Devices**: List paired devices and SPKI fingerprints or revoke a device's trust. |
 | **`/link doctor`** | `/link doctor` | **System & Security Diagnostics**: Comprehensive check of Ed25519 identity, TLS certificate, confinement, and ports. *(Alias: `/link-doctor`)* |
-| **`/link pin`** | `/link pin [pin]` | **LAN Security**: View or set session PIN for LAN connections. |
-| **`/link name`** | `/link name [name]` | **Mesh Identity**: Change terminal display name across the swarm. |
-| **`/link discover`** | `/link discover` | **Network Scan**: Scan active network interfaces and list all discovered sessions. |
+| **`/link grant`** | `/link grant <peer> exec` | **Execution Elevation**: Grant temporary single-use shell execution elevation to a trusted peer (requires `--unsafe-remote-exec`). |
+| **`/link revoke-grant`** | `/link revoke-grant [peer]` | **Revoke Elevation**: Immediately cancel active execution elevation for a peer. |
 | **`/link help`** | `/link help` | **Command Reference**: Print comprehensive summary of all `/link` subcommands. |
 
 > [!NOTE]

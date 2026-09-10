@@ -8,27 +8,48 @@ export interface DevicePermissions {
   observe: boolean;
   message: boolean;
   compact: boolean;
-  inspect: boolean;
+  inspectMetadata: boolean;
+  readContent: boolean;
+  readDiff: boolean;
   fileInbox: boolean;
   execRequest: boolean;
+  inspect?: boolean; // legacy compatibility alias
 }
+
+export const NO_PERMISSIONS: DevicePermissions = {
+  observe: false,
+  message: false,
+  compact: false,
+  inspectMetadata: false,
+  readContent: false,
+  readDiff: false,
+  fileInbox: false,
+  execRequest: false,
+  inspect: false,
+};
 
 export const DEFAULT_PERMISSIONS: DevicePermissions = {
   observe: true,
   message: true,
   compact: false,
-  inspect: false,
+  inspectMetadata: false,
+  readContent: false,
+  readDiff: false,
   fileInbox: false,
   execRequest: false,
+  inspect: false,
 };
 
 export const FULL_PERMISSIONS: DevicePermissions = {
   observe: true,
   message: true,
   compact: true,
-  inspect: true,
+  inspectMetadata: true,
+  readContent: true,
+  readDiff: true,
   fileInbox: true,
   execRequest: true,
+  inspect: true,
 };
 
 export interface DeviceIdentity {
@@ -59,16 +80,48 @@ export interface PairingInvite {
   secret: string;
   hubEndpoint?: string;
   hubFingerprint: string;
+  hubPrincipalId: string;
   expiresAt: number;
   protocolVersion: number;
+  sessionId?: string;
   used: boolean;
 }
 
-const WORD_LIST = [
-  "AMBER", "BERYL", "COBALT", "DELTA", "ECHO", "FERN", "GARNET",
-  "HAZEL", "INDIGO", "JADE", "KAPPA", "LUNAR", "METEOR", "NOVA",
-  "ONYX", "PRISM", "QUARTZ", "RIVER", "SOLAR", "TOPAZ", "URBAN",
-  "VALLEY", "WILLOW", "XENON", "YARROW", "ZENITH",
+export const PAIRED_DEVICES_SCHEMA_VERSION = 2;
+
+export const SAS_WORD_LIST = [
+  "ACORN", "ALARM", "ALPHA", "AMBER", "ANCHOR", "APEX", "APPLE", "ARROW",
+  "ATLAS", "ATOM", "AVENUE", "AXIOM", "AZURE", "BADGE", "BANNER", "BARON",
+  "BASIN", "BEACON", "BERYL", "BISON", "BLAZE", "BLOSSOM", "BOLT", "BONSAI",
+  "BOULDER", "BRAVO", "BREEZE", "BRIDGE", "BRONZE", "BROOK", "CABIN", "CABLE",
+  "CACTUS", "CANYON", "CARBON", "CASTLE", "CEDAR", "CHALK", "CHIME", "CHORUS",
+  "CHROME", "CIDER", "CIRRUS", "CLIFF", "CLOAK", "CLOVER", "COBALT", "COMET",
+  "COMPASS", "CONCORD", "COPPER", "CORAL", "COSMIC", "CRAG", "CRATER", "CREEK",
+  "CREST", "CRYSTAL", "CYPRESS", "DAWN", "DELTA", "DUNE", "EAGLE", "ECHO",
+  "EMBER", "EMERALD", "EPOCH", "FALCON", "FERN", "FINCH", "FJORD", "FLAME",
+  "FLINT", "FLORA", "FORGE", "FOSSIL", "FROST", "GALAXY", "GARNET", "GEYSER",
+  "GLADE", "GLACIER", "GLOW", "GRANITE", "GROVE", "HARBOR", "HAZEL", "HELMET",
+  "HORIZON", "IGLOO", "INDIGO", "INLET", "IONIC", "ISLAND", "IVORY", "JADE",
+  "JASPER", "JUNIPER", "KAPPA", "KELP", "KINETIC", "LAGOON", "LARCH", "LASER",
+  "LAUREL", "LAVA", "LEGEND", "LEMON", "LIGHT", "LILAC", "LIME", "LINEN",
+  "LIZARD", "LODGE", "LOTUS", "LUNAR", "MAGNET", "MANGO", "MANTLE", "MAPLE",
+  "MARBLE", "MARINE", "MATRIX", "MEADOW", "MERCURY", "METEOR", "MINERAL", "MINT",
+  "MIRAGE", "MIST", "MONARCH", "MOSS", "MYTHIC", "NEBULA", "NEPTUNE", "NICKEL",
+  "NIMBUS", "NITRO", "NOVA", "OASIS", "OCEAN", "OLIVE", "OMEGA", "ONYX",
+  "OPAL", "ORBIT", "ORCHID", "ORIGIN", "OSPREY", "OXYGEN", "PACIFIC", "PALM",
+  "PANDA", "PANTHER", "PEBBLE", "PENGUIN", "PETAL", "PHOENIX", "PILLAR", "PINE",
+  "PLANET", "PLASMA", "PLATINUM", "PLOVER", "POLAR", "POPPY", "PORTAL", "PRISM",
+  "PROTON", "PULSAR", "PYRITE", "QUARTZ", "QUIVER", "RADAR", "RADIAN", "RAINBOW",
+  "RAVEN", "REEF", "RELIC", "RIDGE", "RIVER", "ROBOT", "ROCKET", "RUBY",
+  "RUSTIC", "SABLE", "SAHARA", "SAPPHIRE", "SATURN", "SCENIC", "SCORPIO", "SHADOW",
+  "SIERRA", "SIGNAL", "SILVER", "SOLAR", "SONAR", "SPARK", "SPIRIT", "SPRING",
+  "SPRUCE", "STAR", "SUMMIT", "SUNSET", "TALON", "TANDEM", "TARTAN", "TAURUS",
+  "TELESCOPE", "TEMPLE", "TERRA", "THISTLE", "THUNDER", "TIDAL", "TIGER", "TIMBER",
+  "TITAN", "TOPAZ", "TORCH", "TORNADO", "TOWER", "TRACK", "TRAIL", "TROPIC",
+  "TUNDRA", "TURQUOISE", "ULTRA", "URANIUM", "URBAN", "VALLEY", "VALOR", "VELVET",
+  "VENTURE", "VESSEL", "VIOLET", "VORTEX", "VOYAGE", "VULCAN", "WALNUT", "WAVE",
+  "WILLOW", "WIND", "WINTER", "WOLF", "WONDER", "XENON", "YARROW", "YONDER",
+  "ZENITH", "ZEPHYR", "ZINC", "ZODIAC",
 ];
 
 export function getOmpDir(): string {
@@ -124,6 +177,42 @@ export function normalizeFingerprint(fp: string): string {
   return cleaned.match(/.{2}/g)!.join(":");
 }
 
+export function identityFromCertificate(certPemOrDer: string | Buffer): {
+  cert: crypto.X509Certificate;
+  certDer: Buffer;
+  spkiDer: Buffer;
+  keyType: string;
+  fingerprint: string;
+  principalId: string;
+} {
+  const cert = new crypto.X509Certificate(certPemOrDer);
+  const keyType = cert.publicKey.asymmetricKeyType;
+
+  if (keyType !== "ed25519" && keyType !== "ec") {
+    throw new Error(`Unsupported identity key type: ${keyType}`);
+  }
+
+  const spkiDer = cert.publicKey.export({
+    format: "der",
+    type: "spki",
+  }) as Buffer;
+
+  const spkiFingerprint = fingerprintDer(spkiDer);
+
+  return {
+    cert,
+    certDer: cert.raw,
+    spkiDer,
+    keyType,
+    fingerprint: spkiFingerprint,
+    principalId: `${keyType}-sha256:${spkiFingerprint}`,
+  };
+}
+
+export function principalFromCertificate(certPemOrDer: string | Buffer): string {
+  return identityFromCertificate(certPemOrDer).principalId;
+}
+
 export function generateDeviceCertificate(keyPath: string, certPath: string): { keyType: string } {
   let keyType = "ed25519";
   try {
@@ -175,12 +264,7 @@ export function getOrCreateDeviceIdentity(customOmpDir?: string): DeviceIdentity
     try {
       const certPem = fs.readFileSync(certPath, "utf8");
       const keyPem = fs.readFileSync(keyPath, "utf8");
-      const cert = new crypto.X509Certificate(certPem);
-      const certDer = cert.raw;
-      const spkiDer = cert.publicKey.export({ format: "der", type: "spki" }) as Buffer;
-      const fingerprint = fingerprintDer(certDer);
-      const keyType = cert.publicKey.asymmetricKeyType || "unknown";
-      const principalId = `${keyType}-sha256:${fingerprint}`;
+      const info = identityFromCertificate(certPem);
 
       if (fs.existsSync(metaPath)) {
         try {
@@ -189,15 +273,29 @@ export function getOrCreateDeviceIdentity(customOmpDir?: string): DeviceIdentity
         } catch {}
       }
 
+      atomicWriteSecureFile(
+        metaPath,
+        JSON.stringify(
+          {
+            deviceName,
+            createdAt: Date.now(),
+            principalId: info.principalId,
+            fingerprint: info.fingerprint,
+          },
+          null,
+          2,
+        ),
+      );
+
       return {
         certPem,
         keyPem,
-        certDer,
-        spkiDer,
-        fingerprint,
-        principalId,
+        certDer: info.certDer,
+        spkiDer: info.spkiDer,
+        fingerprint: info.fingerprint,
+        principalId: info.principalId,
         deviceName,
-        keyType,
+        keyType: info.keyType,
       };
     } catch {}
   }
@@ -205,26 +303,31 @@ export function getOrCreateDeviceIdentity(customOmpDir?: string): DeviceIdentity
   const { keyType } = generateDeviceCertificate(keyPath, certPath);
   const certPem = fs.readFileSync(certPath, "utf8");
   const keyPem = fs.readFileSync(keyPath, "utf8");
-  const cert = new crypto.X509Certificate(certPem);
-  const certDer = cert.raw;
-  const spkiDer = cert.publicKey.export({ format: "der", type: "spki" }) as Buffer;
-  const fingerprint = fingerprintDer(certDer);
-  const principalId = `${keyType}-sha256:${fingerprint}`;
+  const info = identityFromCertificate(certPem);
 
   atomicWriteSecureFile(
     metaPath,
-    JSON.stringify({ deviceName, createdAt: Date.now(), principalId, fingerprint }, null, 2),
+    JSON.stringify(
+      {
+        deviceName,
+        createdAt: Date.now(),
+        principalId: info.principalId,
+        fingerprint: info.fingerprint,
+      },
+      null,
+      2,
+    ),
   );
 
   return {
     certPem,
     keyPem,
-    certDer,
-    spkiDer,
-    fingerprint,
-    principalId,
+    certDer: info.certDer,
+    spkiDer: info.spkiDer,
+    fingerprint: info.fingerprint,
+    principalId: info.principalId,
     deviceName,
-    keyType,
+    keyType: info.keyType,
   };
 }
 
@@ -236,19 +339,59 @@ export function loadPairedDevices(customOmpDir?: string): Map<string, PairedDevi
 
   try {
     const data = JSON.parse(fs.readFileSync(file, "utf8"));
-    const items = Array.isArray(data) ? data : Object.values(data);
-    for (const item of items) {
-      if (item && item.fingerprint && item.certPem) {
-        const canonicalFp = normalizeFingerprint(item.fingerprint);
-        map.set(canonicalFp, {
-          ...item,
-          fingerprint: canonicalFp,
-          permissions: {
-            ...DEFAULT_PERMISSIONS,
-            ...(item.permissions || {}),
-          },
-        });
+    let version = 1;
+    let rawItems: any[] = [];
+
+    if (Array.isArray(data)) {
+      rawItems = data;
+    } else if (data && typeof data === "object") {
+      if (typeof data.version === "number" && Array.isArray(data.devices)) {
+        version = data.version;
+        rawItems = data.devices;
+      } else {
+        rawItems = Object.values(data);
       }
+    }
+
+    let needsSave = version < PAIRED_DEVICES_SCHEMA_VERSION;
+
+    for (const item of rawItems) {
+      if (item && item.certPem) {
+        let canonicalFp = item.fingerprint ? normalizeFingerprint(item.fingerprint) : "";
+        let principalId = item.principalId;
+
+        if (version < 2) {
+          try {
+            const info = identityFromCertificate(item.certPem);
+            canonicalFp = info.fingerprint;
+            principalId = info.principalId;
+            needsSave = true;
+          } catch {}
+        }
+
+        if (canonicalFp) {
+          map.set(canonicalFp, {
+            ...item,
+            fingerprint: canonicalFp,
+            principalId: principalId || item.principalId,
+            permissions: {
+              ...DEFAULT_PERMISSIONS,
+              ...(item.permissions || {}),
+              ...(item.permissions?.inspect
+                ? { inspectMetadata: true, readContent: true, readDiff: true }
+                : {}),
+            },
+          });
+        }
+      }
+    }
+
+    if (needsSave && map.size > 0) {
+      const arr = Array.from(map.values());
+      atomicWriteSecureFile(
+        file,
+        JSON.stringify({ version: PAIRED_DEVICES_SCHEMA_VERSION, devices: arr }, null, 2) + "\n",
+      );
     }
   } catch {}
 
@@ -266,7 +409,10 @@ export function savePairedDevice(device: PairedDevice, customOmpDir?: string): v
   });
 
   const arr = Array.from(devices.values());
-  atomicWriteSecureFile(file, JSON.stringify(arr, null, 2) + "\n");
+  atomicWriteSecureFile(
+    file,
+    JSON.stringify({ version: PAIRED_DEVICES_SCHEMA_VERSION, devices: arr }, null, 2) + "\n",
+  );
 }
 
 export function removePairedDevice(fingerprintOrPrincipal: string, customOmpDir?: string): boolean {
@@ -302,7 +448,10 @@ export function removePairedDevice(fingerprintOrPrincipal: string, customOmpDir?
 
   devices.delete(targetFp);
   const arr = Array.from(devices.values());
-  atomicWriteSecureFile(file, JSON.stringify(arr, null, 2) + "\n");
+  atomicWriteSecureFile(
+    file,
+    JSON.stringify({ version: PAIRED_DEVICES_SCHEMA_VERSION, devices: arr }, null, 2) + "\n",
+  );
   return true;
 }
 
@@ -319,34 +468,81 @@ export function getPairedDevice(fingerprintOrPrincipal: string, customOmpDir?: s
   return undefined;
 }
 
+export function encodeSasWords(hash: Buffer): string {
+  const w1 = SAS_WORD_LIST[hash[0]];
+  const w2 = SAS_WORD_LIST[hash[1]];
+  const w3 = SAS_WORD_LIST[hash[2]];
+  const w4 = SAS_WORD_LIST[hash[3]];
+  return `${w1}-${w2}-${w3}-${w4}`;
+}
+
+export function deriveLocalSas(
+  socket: any,
+  hubSpki: Buffer,
+  clientSpki: Buffer,
+  hubNonce: Buffer,
+  clientNonce: Buffer,
+): string {
+  const context = crypto
+    .createHash("sha256")
+    .update("omp-link/pairing/v5\0")
+    .update(hubSpki)
+    .update(clientSpki)
+    .update(hubNonce)
+    .update(clientNonce)
+    .digest();
+
+  let key: Buffer;
+  if (socket && typeof socket.exportKeyingMaterial === "function") {
+    key = socket.exportKeyingMaterial(
+      32,
+      "EXPORTER-omp-link-pairing-v5",
+      context,
+    );
+  } else {
+    key = crypto.createHmac("sha256", "omp-link-pairing-offline-fallback").update(context).digest();
+  }
+
+  const value = crypto
+    .createHmac("sha256", key)
+    .update(context)
+    .digest();
+
+  return encodeSasWords(value);
+}
+
 export function derivePairingSas(
-  hubCertDer: Buffer,
-  clientCertDer: Buffer,
+  hubCertOrSpki: Buffer,
+  clientCertOrSpki: Buffer,
   hubNonce: string,
   clientNonce: string,
 ): string {
+  let hubSpki = hubCertOrSpki;
+  let clientSpki = clientCertOrSpki;
+  try {
+    hubSpki = canonicalSpkiDer(hubCertOrSpki);
+  } catch {}
+  try {
+    clientSpki = canonicalSpkiDer(clientCertOrSpki);
+  } catch {}
+
   const hash = crypto
     .createHash("sha256")
-    .update(Buffer.from("omp-link/pairing/v5"))
-    .update(hubCertDer)
-    .update(clientCertDer)
+    .update(Buffer.from("omp-link/pairing/v5\0"))
+    .update(hubSpki)
+    .update(clientSpki)
     .update(Buffer.from(hubNonce, "utf8"))
     .update(Buffer.from(clientNonce, "utf8"))
     .digest();
 
-  const w1 = WORD_LIST[hash[0] % WORD_LIST.length];
-  const d1 = (hash[1] % 9) + 1;
-  const w2 = WORD_LIST[hash[2] % WORD_LIST.length];
-  const d2 = (hash[3] % 9) + 1;
-
-  return `${w1}-${d1}-${w2}-${d2}`;
+  return encodeSasWords(hash);
 }
 
 const activeInvites = new Map<string, PairingInvite>();
 
 export function createInvite(
   hubIdentity: DeviceIdentity,
-  options: { expiresInMs?: number; endpoint?: string } = {},
+  options: { expiresInMs?: number; endpoint?: string; sessionId?: string } = {},
 ): PairingInvite {
   const expiresInMs = options.expiresInMs || 300_000;
   const secret = crypto.randomBytes(32).toString("hex");
@@ -356,15 +552,17 @@ export function createInvite(
     secret,
     hubEndpoint: options.endpoint,
     hubFingerprint: hubIdentity.fingerprint,
+    hubPrincipalId: hubIdentity.principalId,
     expiresAt: Date.now() + expiresInMs,
     protocolVersion: 5,
+    sessionId: options.sessionId,
     used: false,
   };
   activeInvites.set(secret, invite);
   return invite;
 }
 
-export function verifyAndConsumeInvite(secret: string): { valid: boolean; reason?: string } {
+export function verifyAndConsumeInvite(secret: string): { valid: boolean; reason?: string; invite?: PairingInvite } {
   const invite = activeInvites.get(secret);
   if (!invite) {
     return { valid: false, reason: "Invitation not found" };
@@ -378,7 +576,16 @@ export function verifyAndConsumeInvite(secret: string): { valid: boolean; reason
   }
   invite.used = true;
   activeInvites.delete(secret);
-  return { valid: true };
+  return { valid: true, invite };
+}
+
+export function getActiveInvite(secret: string): PairingInvite | undefined {
+  const inv = activeInvites.get(secret);
+  if (inv && Date.now() > inv.expiresAt) {
+    activeInvites.delete(secret);
+    return undefined;
+  }
+  return inv;
 }
 
 export function clearActiveInvites(): void {
