@@ -9,3 +9,6 @@ dist/
 link.json
 .system_generated/
 .cate/
+
+# Internal agent handoff
+INTERNAL_HANDOFF.md
