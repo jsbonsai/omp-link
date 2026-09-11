@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-`omp-link` (CLI alias `pi-link`, package `omp-link@3.4.0`) is a peer-hosted coordination network for Oh-My-Pi / Pi agent terminals across a Tailnet or LAN, with **zero external infrastructure**. Terminals discover each other, delegate reasoning (`link_send`), run zero-token structured inspection (`link_exec`), stream files, and gate context compaction (`link_compact`).
+`omp-link` (CLI alias `pi-link`, package `omp-link@3.5.0`) is a peer-hosted coordination network for Oh-My-Pi / Pi agent terminals across a Tailnet or LAN, with **zero external infrastructure**. Terminals discover each other, delegate reasoning (`link_send`), run zero-token structured inspection (`link_exec`), stream files, and gate context compaction (`link_compact`).
 
 Terminals are no longer only OMP/Pi: `bin/omp-link-mcp.mjs` (`src/mcp-server.ts`) exposes six of the tools over MCP stdio, so Claude Code, Codex CLI or any other MCP host joins the same mesh as an ordinary client.
 
@@ -157,7 +157,7 @@ Maintenance CLI: `omp-link cleanup` (preview only; `--apply` acts, and only on l
 ## Runtime/Tooling Preferences
 
 - **Node, not Bun.** Shebangs are `#!/usr/bin/env node`; `setup.sh` hard-fails without Node ≥ 18; `@types/node@^26`. Bun appears only as a search path for the `omp` binary.
-- **npm** (`package-lock.json`, lockfileVersion 3). `package.json` and both lockfile version fields must be bumped together; they are all `3.4.0` today.
+- **npm** (`package-lock.json`, lockfileVersion 3). `package.json` and both lockfile version fields must be bumped together; they are all `3.5.0` today.
 - **TypeScript is never compiled.** `noEmit: true`; Pi loads `index.ts` directly and tests run under `node --import tsx`. Shipped CLI files are hand-written `.mjs` so they need no loader.
 - `tsconfig.json`: ES2022 / NodeNext / `strict: true`, `include: ["src/**/*", "index.ts"]` — `tests/` and `bin/` are **not** typechecked.
 - Publishing ships raw `.ts` (`files` allowlist in `package.json`); there is no `main`, `types`, or `exports` map.

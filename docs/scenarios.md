@@ -389,7 +389,7 @@ Two limits, both deliberate. A `/link off` sets `intentionalDisconnect` in the t
 that typed it, so releasing the port on purpose never triggers a takeover there. And
 succession is **local only**: when the last terminal on the hosting machine exits there is
 nobody to claim the port and the room ends. Remote peers are not woken either — there is no
-reconnect backoff in v3.4.0, so they rejoin with `/link on`.
+reconnect backoff in v3.5.0, so they rejoin with `/link on`.
 
 ### The manual fallback: on the surviving local terminal
 

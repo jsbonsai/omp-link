@@ -16,7 +16,7 @@ Three sources outrank this file on their own subjects, and this file does not re
 
 ## 1. What this is
 
-`omp-link` (CLI alias `pi-link`, package `omp-link@3.4.0`, protocol 5) connects OMP/Pi agent
+`omp-link` (CLI alias `pi-link`, package `omp-link@3.5.0`, protocol 5) connects OMP/Pi agent
 terminals across a LAN or a Tailscale tailnet with no external infrastructure. One terminal hosts
 a **hub** on TCP `9900`; the others join it.
 

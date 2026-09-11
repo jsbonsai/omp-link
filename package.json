@@ -1,6 +1,6 @@
 {
   "name": "omp-link",
-  "version": "3.4.0",
+  "version": "3.5.0",
   "description": "Multi-machine and Tailnet-aware peer-hosted coordination network with TLS 1.3 Mutual Authentication, SPKI Pinning, Scoped Capabilities, Structured RPC, and Quarantined File Transfer for Oh-My-Pi and Pi.",
   "type": "module",
   "author": "alvivar",

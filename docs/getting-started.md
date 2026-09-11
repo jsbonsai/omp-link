@@ -42,7 +42,7 @@ omp-link version
 ```
 
 ```
-3.4.0
+3.5.0
 ```
 
 `omp-link --version` and `omp-link -v` are aliases of the same verb
@@ -57,7 +57,7 @@ omp-link doctor
 ```
 omp-link doctor — measured values only
 
-  version           3.4.0
+  version           3.5.0
   repo              /Users/you/omp-link
   node              22.23.2
   platform          darwin arm64

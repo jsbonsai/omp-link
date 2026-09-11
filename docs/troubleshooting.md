@@ -145,7 +145,7 @@ bug to work around.
    ```
 
    ```
-     version            3.4.0 (protocol 5)
+     version            3.5.0 (protocol 5)
    ```
 
    and from a shell, `omp-link doctor` prints the interpreter it is running under:
@@ -716,7 +716,7 @@ The hub's process exited, the transport failed, or the hub went silent. On the c
 stops answering without closing anything reaches the same state through the client's
 liveness sweep after `clientHubSilenceTimeoutMs` (45 s by default), audited
 `hub_liveness_timeout`. `linkState()` maps a node in that role to `off`. **There is no
-reconnect backoff in v3.4.0**, so a client of a *remote* hub stays off until you act.
+reconnect backoff in v3.5.0**, so a client of a *remote* hub stays off until you act.
 
 If the hub was a sibling terminal on **this machine**, it is different:
 `onHubDisconnected` calls `attemptLocalSuccession`, and one of the survivors takes the room
@@ -774,7 +774,7 @@ machine**; `/link doctor` inspects the **live node**. Run both.
 ```
 omp-link doctor — measured values only
 
-  version           3.4.0
+  version           3.5.0
   repo              /Users/you/omp-link
   node              22.23.2
   platform          darwin arm64
@@ -826,7 +826,7 @@ omp-link doctor --json
 
 ```
 omp-link doctor
-  version            3.4.0 (protocol 5)
+  version            3.5.0 (protocol 5)
   device principal   ed25519-sha256:AA:BB:...:FF
   state directory    /Users/you/.omp
   paired devices     1

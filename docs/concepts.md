@@ -301,7 +301,7 @@ room list and the terminal name, nothing cryptographic.
 
 ```jsonc
 {
-  "configVersion": 1,               // CONFIG_SCHEMA_VERSION; absent in files written before 3.4.0's config pass
+  "configVersion": 1,               // CONFIG_SCHEMA_VERSION; absent in files written by 3.4.0 and earlier
   "terminalName": "mac-studio",     // display name; --link-name still wins for one launch
   "network": "lan",                 // "lan" | "tailscale"
   "currentRoomId": "…uuid…",        // must match a rooms[] entry to be usable

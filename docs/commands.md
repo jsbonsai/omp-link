@@ -43,7 +43,7 @@ omp-link help
 ```
 
 ```
-omp-link v3.4.0 — peer-hosted coordination mesh for Oh My Pi and Pi
+omp-link v3.5.0 — peer-hosted coordination mesh for Oh My Pi and Pi
 
 Usage:
   omp-link [agent-options...]   Launch OMP/Pi with the omp-link extension loaded

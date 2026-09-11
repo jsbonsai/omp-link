@@ -4,6 +4,42 @@ All notable changes to pi-link are documented here.
 
 This changelog is based on the git history from `2026-03-21` (initial commit) through the present. Versions correspond to npm publishes.
 
+## 3.5.0 — 2026-09-10
+
+### Liveness, Standardised Configuration, Structured Audit & an MCP Server
+
+Released the same day as 3.4.0, from the pass that followed it. **No wire change, no re-pairing and no command removed**: a terminal running 3.4.0 interoperates with this one. Upgrade is `git pull && npm install && ./setup.sh`.
+
+#### Added
+
+- **Liveness and TTL, where there was none.** There was previously no heartbeat, no TTL and no idle detection: a suspended laptop or a dropped Wi-Fi link left a socket that neither end noticed, and the hub kept naming a dead agent in `link_list` indefinitely. Now every authenticated connection is pinged each `heartbeatIntervalMs`; any inbound frame or pong counts as alive; a peer silent for `heartbeatIntervalMs * heartbeatMissesBeforeDrop` (30 s by default) is closed `4408`, audited `peer_liveness_timeout` and torn down through the ordinary path — grants revoked, transfers and pending requests failed with a real reason, roster rebroadcast. Clients run the mirror check against the hub (`clientHubSilenceTimeoutMs`, 45 s, audited `hub_liveness_timeout`) and go `disconnected`, which is what triggers local hub succession. The client's deadline is deliberately the longer of the two: a spurious takeover is worse than a briefly stale roster.
+- **A reconnecting terminal no longer appears twice.** A terminal returning after a crash, a sleep or a network flap presents the same `agentInstanceId`; the hub evicts its own stale connection (`4409 Superseded by a newer connection from the same agent`, audited `peer_connection_superseded`) instead of double-counting the agent, splitting routing by display name and keeping the dead connection's exec grants.
+- **`src/config.ts`: one place for configuration and tunables.** `LinkConfig` (now carrying `configVersion`), `LinkTimings` with `DEFAULT_TIMINGS` and per-key floors, `loadConfig()` (never throws), `saveConfig()` and `getTimings()`. Ten timings that used to be `const`s scattered across four modules are now config keys, each read at its call site: `handshakeTimeoutMs`, `pairingWindowMs`, `heartbeatIntervalMs`, `heartbeatMissesBeforeDrop`, `clientHubSilenceTimeoutMs`, `rpcTimeoutMs`, `transferInactivityMs`, `transferAbsoluteMs`, `discoveryProbeMs` and `grantDefaultMs`. `discoveryProbeMs` also unifies every discovery sweep — `link_discover`, `/link scan` and the scan inside `/link join` — which each used to pass a different literal. **Retuning is a config edit, not a recompilation** — and the strings follow the setting: the close reason is now `Handshake timeout (<n>s)` and a stalled transfer aborts with `Absolute transfer timeout exceeded (<n>s)`, both interpolating the configured value instead of a baked-in `10s`/`120s`. Validation is per key with a floor, so one bad entry never poisons its neighbours.
+- **`omp-link-mcp`: omp-link stops being Pi-only.** A new MCP stdio server (`src/mcp-server.ts`, `bin/omp-link-mcp.mjs`) makes the mesh usable from **Claude Code CLI, Codex CLI and anything else that speaks MCP** — hand-rolled JSON-RPC 2.0 over stdio, **no new dependency** (`ws` is still the only runtime dep). Six tools: `link_status`, `link_send`, `link_list`, `link_discover`, `link_exec`, `link_send_file`; parameter schemas are identical to the extension's and a regression test compares them. `link_compact` is deliberately excluded — compaction is meaningful only where the host exposes a compaction API for the agent's own context, and a tool that reports success while doing nothing is worse than an absent one. The server attaches to the room in `link.json`, re-attaches on a later call if a room appears while it runs, never hosts, never creates or joins a room, and never enables remote exec. `tools/list` works with the link down; every call made with no room names `omp-link create <name>` / `omp-link join <ip:port>`. It runs under bare `node` through a three-tier loader: Node 22.18+ type stripping, `tsx` when installed, or a re-exec with `--experimental-strip-types` for 22.6–22.17. Wiring for both hosts: [`docs/mcp.md`](docs/mcp.md).
+
+#### Changed
+
+- **Structured audit log.** `AuditEventType` is now a closed union of every event the codebase emits. Records are stamped `logSeq` — renamed from `seq`, because the log was silently clobbering a caller's own `seq` field and corrupting the record it exists to preserve — and `agentInstanceId`, so sibling terminals appending to one file stay attributable. Lines are written with one `write(2)` on a persistent `O_APPEND` descriptor, so concurrent writers interleave whole lines rather than fragments, with a single re-open-and-retry when the descriptor goes stale.
+- **An unwritable audit log is reported instead of swallowed.** `appendAuditLog` still never throws, but the failure is remembered and exposed by `getAuditLogStatus()`: `/link doctor` prints `AUDIT LOG NOT WRITABLE — security decisions are not being recorded` with the reason and the directory to fix, and `/link shared` refuses to print a reassuring "nothing recorded yet" when the truth is "nothing could be recorded".
+- **`/link doctor` reports the config file**: its path, whether file values or defaults are in force, and any load warning.
+- New audit events: `peer_liveness_timeout`, `hub_liveness_timeout`, `peer_connection_superseded`.
+
+#### Security
+
+- **Unauthenticated `/status` fields are validated before being rendered.** An endpoint could previously smuggle newlines and ANSI escapes into `scan` output and forge a line that looked like a "VERIFIED" result from the tool. Fields are now bounded printable ASCII, with fingerprints held to the canonical hex form, and anything else is dropped.
+- **Peer-supplied `error`, `reason` and `text` are sanitised and bounded** (control characters and ANSI/OSC escapes stripped, 2 000 characters) at the wire boundary, because they land on an operator's screen and in a model's context.
+- **`streamFileChunks` enforces the size it announced and refuses symlinks**, aborting rather than sending more bytes than the `file_offer` declared.
+- **The UDP discovery responder drops off-subnet sources and rate-limits replies**, so it cannot be used as an amplifier.
+- **Device lookup refuses an ambiguous argument** instead of guessing which paired record you meant.
+- **An identity key/certificate mismatch self-heals** instead of wedging every start.
+- **The paired-store lock carries an ownership token**, so a lock is only ever removed by the process that holds it.
+- **`setup.sh` refuses to "install" into a real directory**, and **`omp-link update` shows the remote and the incoming commits** before touching anything, with a scrubbed environment.
+
+#### Tests & docs
+
+- **Test suite: 207 tests** (33 security, 11 integration, 5 fuzz, 158 regression), green on macOS arm64 **and** Linux x86_64, `tsc --noEmit` clean. New regression files cover liveness, config loading and the MCP server end to end (including "stdout carried nothing but valid JSON-RPC frames").
+- Docs: new [`docs/mcp.md`](docs/mcp.md); liveness and the `link.json`/`timings` contract in [`docs/concepts.md`](docs/concepts.md); liveness symptoms and audit meanings in [`docs/troubleshooting.md`](docs/troubleshooting.md); the closed event vocabulary and log integrity in [`docs/security.md`](docs/security.md).
+
 ## 3.4.0 — 2026-09-10
 
 ### Symmetric Authorization, Mandatory Verification Codes, Agent Identity & Opaque Rooms
@@ -41,41 +77,7 @@ This changelog is based on the git history from `2026-03-21` (initial commit) th
 - **`omp-link cleanup` is preview-only.** It lists what it would remove and does nothing without `--apply`, and even then it acts only on link-owned targets with proven ownership. The command it replaces, `clean`, sent SIGKILL to any pid holding 9900 or 9901 regardless of owner.
 - **New `link_status` tool** returning structured `details`, so an agent no longer has to scrape the human status card. Tool set is now: `link_status`, `link_send`, `link_list`, `link_compact`, `link_discover`, `link_exec`, `link_send_file`.
 - **One command registry.** `src/command-registry.mjs` with a hand-written `.d.mts` is the single source for parsing, aliases, help and the CLI — `bin/*.mjs` imports it under bare node and `index.ts` imports it typed, with no build step. The three divergent help lists are gone. `--version` reads `package.json`.
-- **Test suite** at that point: 76 tests (33 security, 11 integration, 5 fuzz, 27 regression), covering each fix above from its failing side — denial paths assert the emitted `audit.log` events, and the crash test asserts a child process exit code of 0. The later pass below takes it to 207.
-
-### Liveness, Standardised Configuration, Structured Audit & an MCP Server
-
-A second pass on the same version. No wire change, no re-pairing, no command removed: a terminal running the earlier 3.4.0 build interoperates with this one.
-
-#### Added
-
-- **Liveness and TTL, where there was none.** There was previously no heartbeat, no TTL and no idle detection: a suspended laptop or a dropped Wi-Fi link left a socket that neither end noticed, and the hub kept naming a dead agent in `link_list` indefinitely. Now every authenticated connection is pinged each `heartbeatIntervalMs`; any inbound frame or pong counts as alive; a peer silent for `heartbeatIntervalMs * heartbeatMissesBeforeDrop` (30 s by default) is closed `4408`, audited `peer_liveness_timeout` and torn down through the ordinary path — grants revoked, transfers and pending requests failed with a real reason, roster rebroadcast. Clients run the mirror check against the hub (`clientHubSilenceTimeoutMs`, 45 s, audited `hub_liveness_timeout`) and go `disconnected`, which is what triggers local hub succession. The client's deadline is deliberately the longer of the two: a spurious takeover is worse than a briefly stale roster.
-- **A reconnecting terminal no longer appears twice.** A terminal returning after a crash, a sleep or a network flap presents the same `agentInstanceId`; the hub evicts its own stale connection (`4409 Superseded by a newer connection from the same agent`, audited `peer_connection_superseded`) instead of double-counting the agent, splitting routing by display name and keeping the dead connection's exec grants.
-- **`src/config.ts`: one place for configuration and tunables.** `LinkConfig` (now carrying `configVersion`), `LinkTimings` with `DEFAULT_TIMINGS` and per-key floors, `loadConfig()` (never throws), `saveConfig()` and `getTimings()`. Ten timings that used to be `const`s scattered across four modules are now config keys, each read at its call site: `handshakeTimeoutMs`, `pairingWindowMs`, `heartbeatIntervalMs`, `heartbeatMissesBeforeDrop`, `clientHubSilenceTimeoutMs`, `rpcTimeoutMs`, `transferInactivityMs`, `transferAbsoluteMs`, `discoveryProbeMs` and `grantDefaultMs`. `discoveryProbeMs` also unifies every discovery sweep — `link_discover`, `/link scan` and the scan inside `/link join` — which each used to pass a different literal. **Retuning is a config edit, not a recompilation** — and the strings follow the setting: the close reason is now `Handshake timeout (<n>s)` and a stalled transfer aborts with `Absolute transfer timeout exceeded (<n>s)`, both interpolating the configured value instead of a baked-in `10s`/`120s`. Validation is per key with a floor, so one bad entry never poisons its neighbours.
-- **`omp-link-mcp`: omp-link stops being Pi-only.** A new MCP stdio server (`src/mcp-server.ts`, `bin/omp-link-mcp.mjs`) makes the mesh usable from **Claude Code CLI, Codex CLI and anything else that speaks MCP** — hand-rolled JSON-RPC 2.0 over stdio, **no new dependency** (`ws` is still the only runtime dep). Six tools: `link_status`, `link_send`, `link_list`, `link_discover`, `link_exec`, `link_send_file`; parameter schemas are identical to the extension's and a regression test compares them. `link_compact` is deliberately excluded — compaction is meaningful only where the host exposes a compaction API for the agent's own context, and a tool that reports success while doing nothing is worse than an absent one. The server attaches to the room in `link.json`, re-attaches on a later call if a room appears while it runs, never hosts, never creates or joins a room, and never enables remote exec. `tools/list` works with the link down; every call made with no room names `omp-link create <name>` / `omp-link join <ip:port>`. It runs under bare `node` through a three-tier loader: Node 22.18+ type stripping, `tsx` when installed, or a re-exec with `--experimental-strip-types` for 22.6–22.17. Wiring for both hosts: [`docs/mcp.md`](docs/mcp.md).
-
-#### Changed
-
-- **Structured audit log.** `AuditEventType` is now a closed union of every event the codebase emits. Records are stamped `logSeq` — renamed from `seq`, because the log was silently clobbering a caller's own `seq` field and corrupting the record it exists to preserve — and `agentInstanceId`, so sibling terminals appending to one file stay attributable. Lines are written with one `write(2)` on a persistent `O_APPEND` descriptor, so concurrent writers interleave whole lines rather than fragments, with a single re-open-and-retry when the descriptor goes stale.
-- **An unwritable audit log is reported instead of swallowed.** `appendAuditLog` still never throws, but the failure is remembered and exposed by `getAuditLogStatus()`: `/link doctor` prints `AUDIT LOG NOT WRITABLE — security decisions are not being recorded` with the reason and the directory to fix, and `/link shared` refuses to print a reassuring "nothing recorded yet" when the truth is "nothing could be recorded".
-- **`/link doctor` reports the config file**: its path, whether file values or defaults are in force, and any load warning.
-- New audit events: `peer_liveness_timeout`, `hub_liveness_timeout`, `peer_connection_superseded`.
-
-#### Security
-
-- **Unauthenticated `/status` fields are validated before being rendered.** An endpoint could previously smuggle newlines and ANSI escapes into `scan` output and forge a line that looked like a "VERIFIED" result from the tool. Fields are now bounded printable ASCII, with fingerprints held to the canonical hex form, and anything else is dropped.
-- **Peer-supplied `error`, `reason` and `text` are sanitised and bounded** (control characters and ANSI/OSC escapes stripped, 2 000 characters) at the wire boundary, because they land on an operator's screen and in a model's context.
-- **`streamFileChunks` enforces the size it announced and refuses symlinks**, aborting rather than sending more bytes than the `file_offer` declared.
-- **The UDP discovery responder drops off-subnet sources and rate-limits replies**, so it cannot be used as an amplifier.
-- **Device lookup refuses an ambiguous argument** instead of guessing which paired record you meant.
-- **An identity key/certificate mismatch self-heals** instead of wedging every start.
-- **The paired-store lock carries an ownership token**, so a lock is only ever removed by the process that holds it.
-- **`setup.sh` refuses to "install" into a real directory**, and **`omp-link update` shows the remote and the incoming commits** before touching anything, with a scrubbed environment.
-
-#### Tests & docs
-
-- **Test suite: 207 tests** (33 security, 11 integration, 5 fuzz, 158 regression), green on macOS arm64 **and** Linux x86_64, `tsc --noEmit` clean. New regression files cover liveness, config loading and the MCP server end to end (including "stdout carried nothing but valid JSON-RPC frames").
-- Docs: new [`docs/mcp.md`](docs/mcp.md); liveness and the `link.json`/`timings` contract in [`docs/concepts.md`](docs/concepts.md); liveness symptoms and audit meanings in [`docs/troubleshooting.md`](docs/troubleshooting.md); the closed event vocabulary and log integrity in [`docs/security.md`](docs/security.md).
+- **Test suite** at that point: 76 tests (33 security, 11 integration, 5 fuzz, 27 regression), covering each fix above from its failing side — denial paths assert the emitted `audit.log` events, and the crash test asserts a child process exit code of 0. 3.5.0 takes it to 212.
 
 ## 3.2.0 — 2026-09-08
 
