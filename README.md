@@ -264,6 +264,62 @@ When you send a message with `link_send` and wait for a reply, the turn takes 15
 
 ---
 
+## Liveness: Nobody Stays Connected Forever
+
+An authenticated connection is not trusted to still be alive. The hub pings every peer on
+an interval using WebSocket ping/pong; any inbound frame or pong counts as proof of life.
+A peer that goes silent for `heartbeatIntervalMs × heartbeatMissesBeforeDrop` (**30 s** by
+default) is closed `4408`, audited `peer_liveness_timeout`, and torn down through the
+ordinary path — grants revoked, transfers and pending requests failed with a real reason,
+roster rebroadcast.
+
+This is what TCP cannot do for you. A laptop that sleeps, a Wi-Fi drop, or a process frozen
+with `SIGSTOP` leaves a socket that looks perfectly healthy at the transport layer. Without
+a heartbeat, `link_list` names agents that are gone.
+
+Clients run the mirror check against their hub (`clientHubSilenceTimeoutMs`, **45 s**,
+audited `hub_liveness_timeout`) and go disconnected, which is what triggers local hub
+succession. The client deadline is deliberately **longer** than the hub's: a client that
+wrongly declares its hub dead starts a takeover, and a spurious takeover is worse than a
+slightly stale roster.
+
+A terminal that reconnects presents the same `agentInstanceId`, so the hub evicts its own
+stale connection (`4409`, audited `peer_connection_superseded`) rather than listing the
+agent twice and splitting its routing.
+
+---
+
+## Configuration (`<OMP_DIR>/link.json`)
+
+Timeouts are configuration, not a recompile. The file is created and maintained for you at
+`~/.omp/link.json` (mode `0600`); every key is optional.
+
+```jsonc
+{
+  "configVersion": 1,
+  "network": "tailscale",          // or "lan"
+  "currentRoomId": "8f2c1d4a-…",
+  "rooms": [ /* opaque room id + the hub principal and SPKI it is pinned to */ ],
+  "timings": {
+    "heartbeatIntervalMs": 15000,
+    "heartbeatMissesBeforeDrop": 2,
+    "clientHubSilenceTimeoutMs": 45000,
+    "rpcTimeoutMs": 30000
+  }
+}
+```
+
+Ten `timings` keys are read at terminal start: `handshakeTimeoutMs`, `pairingWindowMs`,
+`heartbeatIntervalMs`, `heartbeatMissesBeforeDrop`, `clientHubSilenceTimeoutMs`,
+`rpcTimeoutMs`, `transferInactivityMs`, `transferAbsoluteMs`, `discoveryProbeMs` and
+`grantDefaultMs`. See [docs/concepts.md](docs/concepts.md) for defaults and floors.
+
+Loading **never throws**. A malformed file, a wrong-typed value or a key from a newer build
+yields defaults plus a warning surfaced by `/link doctor`; a bad value for one key never
+poisons its neighbours, and keys this build does not recognise are written back untouched.
+
+---
+
 ## Quick Start (60 Seconds)
 
 ### Step 1: Clone repo on each machine
