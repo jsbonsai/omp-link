@@ -1,10 +1,10 @@
 import * as crypto from "node:crypto";
-import type { TLSSocket } from "node:tls";
+import type { PeerCertificate, TLSSocket } from "node:tls";
+import type { Socket } from "node:net";
 import type { ServerOptions as HttpsServerOptions } from "node:https";
 import type { ClientOptions as WsClientOptions } from "ws";
 import {
   type DeviceIdentity,
-  fingerprintDer,
   fingerprintPublicKey,
   normalizeFingerprint,
   canonicalSpkiDer,
@@ -39,79 +39,93 @@ export function getClientTlsOptions(
   } = {},
 ): WsClientOptions {
   const isPairedPinned = Boolean(options.pinnedFingerprint && options.caCertPem && !options.allowUnpaired);
+
+  // node invokes `checkServerIdentity` with a tls.PeerCertificate and treats **any** truthy
+  // return as a verification failure, so the accepting path returns undefined. @types/ws
+  // re-declares the callback as `(servername, cert: CertMeta) => boolean`, which describes
+  // neither argument nor result: type it against node:tls and cast this one field.
+  const checkServerIdentity = (_host: string, cert: PeerCertificate): Error | undefined => {
+    let rawDer: Buffer | null = null;
+    if (cert.raw && Buffer.isBuffer(cert.raw)) {
+      rawDer = cert.raw;
+    } else if (cert.raw) {
+      rawDer = Buffer.from(cert.raw);
+    }
+
+    if (!rawDer) {
+      throw new Error("No server certificate presented during TLS handshake");
+    }
+
+    const spkiDer = canonicalSpkiDer(rawDer);
+    const serverFp = fingerprintPublicKey(spkiDer);
+    const x509 = new crypto.X509Certificate(rawDer);
+    const certPem = x509.toString();
+    const keyType = x509.publicKey.asymmetricKeyType || "unknown";
+    const principalId = `${keyType}-sha256:${serverFp}`;
+
+    const certInfo: PeerCertificateInfo = {
+      certDer: rawDer,
+      certPem,
+      fingerprint: serverFp,
+      spkiDer,
+      principalId,
+      keyType,
+    };
+
+    if (options.onServerCertificate) {
+      options.onServerCertificate(certInfo);
+    }
+
+    if (options.pinnedFingerprint) {
+      const canonicalPinned = normalizeFingerprint(options.pinnedFingerprint);
+      const serverBuf = Buffer.from(serverFp, "utf8");
+      const pinnedBuf = Buffer.from(canonicalPinned, "utf8");
+      if (
+        serverBuf.length !== pinnedBuf.length ||
+        !crypto.timingSafeEqual(serverBuf, pinnedBuf)
+      ) {
+        throw new Error(
+          `Server certificate pinning mismatch! Expected ${canonicalPinned}, received ${serverFp}`,
+        );
+      }
+      return undefined;
+    }
+
+    if (!options.allowUnpaired) {
+      throw new Error(
+        `Unpinned hub certificate rejected (${serverFp}). Initial pairing requires explicit trust confirmation.`,
+      );
+    }
+
+    return undefined;
+  };
+
   const opts: WsClientOptions = {
     key: identity.keyPem,
     cert: identity.certPem,
     minVersion: "TLSv1.3",
     rejectUnauthorized: isPairedPinned,
-    checkServerIdentity: (_host: string, cert: any) => {
-      let rawDer: Buffer | null = null;
-      if (cert.raw && Buffer.isBuffer(cert.raw)) {
-        rawDer = cert.raw;
-      } else if (cert.raw) {
-        rawDer = Buffer.from(cert.raw);
-      }
-
-      if (!rawDer) {
-        throw new Error("No server certificate presented during TLS handshake");
-      }
-
-      const spkiDer = canonicalSpkiDer(rawDer);
-      const serverFp = fingerprintPublicKey(spkiDer);
-      const x509 = new crypto.X509Certificate(rawDer);
-      const certPem = x509.toString();
-      const keyType = x509.publicKey.asymmetricKeyType || "unknown";
-      const principalId = `${keyType}-sha256:${serverFp}`;
-
-      const certInfo: PeerCertificateInfo = {
-        certDer: rawDer,
-        certPem,
-        fingerprint: serverFp,
-        spkiDer,
-        principalId,
-        keyType,
-      };
-
-      if (options.onServerCertificate) {
-        options.onServerCertificate(certInfo);
-      }
-
-      if (options.pinnedFingerprint) {
-        const canonicalPinned = normalizeFingerprint(options.pinnedFingerprint);
-        const serverBuf = Buffer.from(serverFp, "utf8");
-        const pinnedBuf = Buffer.from(canonicalPinned, "utf8");
-        if (
-          serverBuf.length !== pinnedBuf.length ||
-          !crypto.timingSafeEqual(serverBuf, pinnedBuf)
-        ) {
-          throw new Error(
-            `Server certificate pinning mismatch! Expected ${canonicalPinned}, received ${serverFp}`,
-          );
-        }
-        return undefined as any;
-      }
-
-      if (!options.allowUnpaired) {
-        throw new Error(
-          `Unpinned hub certificate rejected (${serverFp}). Initial pairing requires explicit trust confirmation.`,
-        );
-      }
-
-      return undefined as any;
-    },
+    checkServerIdentity: checkServerIdentity as unknown as WsClientOptions["checkServerIdentity"],
   };
 
   if (options.caCertPem) {
-    (opts as any).ca = [options.caCertPem];
+    opts.ca = [options.caCertPem];
   }
 
   return opts;
 }
 
-export function extractPeerCertificate(socket: any): PeerCertificateInfo | null {
+/**
+ * A socket that may or may not be a TLS socket: `req.socket` on an upgrade request and `ws._socket`
+ * are both typed as plain sockets, so the TLS accessors are probed at runtime, never assumed.
+ */
+export type TlsCapableSocket = Socket | TLSSocket;
+
+export function extractPeerCertificate(socket: TlsCapableSocket | null | undefined): PeerCertificateInfo | null {
   if (!socket) return null;
-  if (socket._peerCertInfo) return socket._peerCertInfo;
-  const tlsSocket: TLSSocket = socket;
+  // One cast, because a plain Socket carries neither accessor; both call sites below re-check
+  // with `typeof` before invoking, so nothing is taken on the type's word.
+  const tlsSocket = socket as TLSSocket;
 
   if (typeof tlsSocket.getPeerX509Certificate === "function") {
     try {
@@ -161,7 +175,7 @@ export function extractPeerCertificate(socket: any): PeerCertificateInfo | null 
   return null;
 }
 
-export function verifyPeerSpki(socket: any, expected: string): PeerCertificateInfo {
+export function verifyPeerSpki(socket: TlsCapableSocket | null | undefined, expected: string): PeerCertificateInfo {
   const peer = extractPeerCertificate(socket);
   if (!peer) {
     throw new Error("Peer did not present a certificate");

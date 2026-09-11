@@ -12,20 +12,27 @@ import { createExecGrant, checkAndConsumeExecGrant } from "../../src/authorizati
 describe("OMP-LINK v5 Integration: Loopback Mesh & Node Coordination", () => {
   let hubDir;
   let clientDir;
+  let workspaceDir;
   let hub;
   let client;
-  const testPort = 19950;
+  let hubUrl;
 
   before(async () => {
     hubDir = fs.mkdtempSync(path.join(os.tmpdir(), "mesh-hub-"));
     clientDir = fs.mkdtempSync(path.join(os.tmpdir(), "mesh-client-"));
+    // `registeredWorkspaces` is a process-global registry keyed by "default", so both nodes
+    // resolve inspection RPCs to the same root. Point it at a scratch dir: no test may write
+    // fixtures into the repository working tree.
+    workspaceDir = fs.mkdtempSync(path.join(os.tmpdir(), "mesh-workspace-"));
 
     hub = new LinkNode({
-      port: testPort,
+      port: 0,
+      bindHost: "127.0.0.1",
       customOmpDir: hubDir,
       terminalName: "hub-primary",
       sessionId: "integration-session",
       allowRemoteExec: true,
+      workspaceRoot: workspaceDir,
     });
 
     client = new LinkNode({
@@ -33,9 +40,11 @@ describe("OMP-LINK v5 Integration: Loopback Mesh & Node Coordination", () => {
       customOmpDir: clientDir,
       terminalName: "client-secondary",
       sessionId: "integration-session",
+      workspaceRoot: workspaceDir,
     });
 
     await hub.startHub();
+    hubUrl = `wss://127.0.0.1:${hub.port}`;
   });
 
   after(async () => {
@@ -43,6 +52,7 @@ describe("OMP-LINK v5 Integration: Loopback Mesh & Node Coordination", () => {
     if (hub) await hub.stop();
     if (hubDir && fs.existsSync(hubDir)) fs.rmSync(hubDir, { recursive: true, force: true });
     if (clientDir && fs.existsSync(clientDir)) fs.rmSync(clientDir, { recursive: true, force: true });
+    if (workspaceDir && fs.existsSync(workspaceDir)) fs.rmSync(workspaceDir, { recursive: true, force: true });
   });
 
   test("Initial pairing handshake with Short Authentication String (SAS)", async () => {
@@ -52,7 +62,8 @@ describe("OMP-LINK v5 Integration: Loopback Mesh & Node Coordination", () => {
     };
 
     // Client connects without being pre-paired
-    await client.connectToHub(`wss://127.0.0.1:${testPort}`);
+    const outcome = await client.connectToHub(hubUrl);
+    assert.strictEqual(outcome.state, "pairing-required");
 
     // Wait for client_hello and server pairing notification
     for (let i = 0; i < 20; i++) {
@@ -62,10 +73,19 @@ describe("OMP-LINK v5 Integration: Loopback Mesh & Node Coordination", () => {
 
     assert.ok(pairingRequestedEvent, "Expected pairing request event on hub");
     assert.strictEqual(pairingRequestedEvent.displayName, "client-secondary");
-    assert.match(pairingRequestedEvent.sasCode, /^[a-z]+-[a-z]+-[a-z]+-[a-z]+$/i);
+    assert.match(pairingRequestedEvent.sasCode, /^[A-Z]+-[A-Z]+-[A-Z]+-[A-Z]+$/);
+
+    // The code is never transmitted: each side derives it from its own view of the TLS
+    // channel. Agreement is the whole proof, so the client's code — not the hub's own — is
+    // what gets fed back for verification.
+    assert.strictEqual(
+      outcome.sasCode,
+      pairingRequestedEvent.sasCode,
+      "Hub and client derived different codes from the same TLS channel",
+    );
 
     // Host approves pairing with FULL_PERMISSIONS and SAS verification
-    const paired = hub.approvePairing(pairingRequestedEvent.id, FULL_PERMISSIONS, pairingRequestedEvent.sasCode);
+    const paired = hub.approvePairing(pairingRequestedEvent.id, FULL_PERMISSIONS, outcome.sasCode);
     assert.ok(paired);
     assert.strictEqual(paired.deviceName, "client-secondary");
     assert.strictEqual(paired.permissions.message, true);
@@ -74,6 +94,13 @@ describe("OMP-LINK v5 Integration: Loopback Mesh & Node Coordination", () => {
 
     // Wait for approval frame propagation
     await new Promise((r) => setTimeout(r, 100));
+    assert.strictEqual(client.isAuthenticated, true, "Client must be authenticated once pairing is approved");
+
+    // Pairing is mutual, capabilities are not: the client records its hub with
+    // DEFAULT_PERMISSIONS and must grant inbound rights explicitly before the hub may inspect
+    // it, request a compaction, or send it a file.
+    const granted = client.updatePeerPermissions(hub.identity.principalId, FULL_PERMISSIONS);
+    assert.strictEqual(granted, true, "Client must be able to grant its hub inbound capabilities");
   });
 
   test("Bi-directional authenticated message exchange", async () => {
@@ -109,8 +136,8 @@ describe("OMP-LINK v5 Integration: Loopback Mesh & Node Coordination", () => {
   });
 
   test("Structured inspection RPC (git_status, read_file)", async () => {
-    // Write a safe test file in working directory
-    const testFile = path.join(process.cwd(), "test-inspect-safe.txt");
+    // Write a safe test file inside the exported workspace
+    const testFile = path.join(workspaceDir, "test-inspect-safe.txt");
     fs.writeFileSync(testFile, "OMP-LINK Inspection Verification Token");
 
     try {
@@ -141,8 +168,11 @@ describe("OMP-LINK v5 Integration: Loopback Mesh & Node Coordination", () => {
     assert.strictEqual(ungrantedRes.ok, false);
     assert.match(ungrantedRes.error, /No active execution grant found/);
 
-    // 2. Grant single-use permission on hub
-    createExecGrant(client.identity.principalId, "client-secondary", { maxUses: 1, durationMs: 10_000 });
+    // 2. Grant single-use permission on hub, for this client's agent instance
+    createExecGrant(client.identity.principalId, client.agentInstanceId, "client-secondary", {
+      maxUses: 1,
+      durationMs: 10_000,
+    });
 
     // 3. With grant: exec succeeds
     const grantedRes = await client.executeRemoteRpc("hub-primary", "exec", {
@@ -173,8 +203,8 @@ describe("OMP-LINK v5 Integration: Loopback Mesh & Node Coordination", () => {
     assert.strictEqual(client.role, "disconnected");
 
     // Reconnect client with hub fingerprint pinned
-    await client.connectToHub(`wss://127.0.0.1:${testPort}`, hub.identity.fingerprint);
-    await new Promise((r) => setTimeout(r, 200));
+    const outcome = await client.connectToHub(hubUrl, hub.identity.fingerprint);
+    assert.deepStrictEqual(outcome, { state: "authenticated" });
 
     assert.strictEqual(client.role, "client");
 
@@ -195,7 +225,7 @@ describe("OMP-LINK v5 Integration: Loopback Mesh & Node Coordination", () => {
   });
 
   test("Hub can execute remote inspection RPC on client terminal", async () => {
-    const safeFile = path.join(process.cwd(), "test-client-inspect.txt");
+    const safeFile = path.join(workspaceDir, "test-client-inspect.txt");
     fs.writeFileSync(safeFile, "Client inspection safe token");
 
     try {

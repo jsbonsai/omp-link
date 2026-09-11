@@ -103,10 +103,6 @@ export function getAllRegisteredWorkspaces(): WorkspacePolicy[] {
   return Array.from(registeredWorkspaces.values());
 }
 
-export function clearRegisteredWorkspaces(): void {
-  registeredWorkspaces.clear();
-}
-
 export function validateOutboundFile(
   workspaceRoot: string,
   requestedPath: string,
@@ -122,8 +118,9 @@ export function validateOutboundFile(
   let canonicalBase: string;
   try {
     canonicalBase = fs.realpathSync(workspaceRoot || process.cwd());
-  } catch (err: any) {
-    return { allowed: false, reason: `Workspace root invalid: ${err.message}` };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return { allowed: false, reason: `Workspace root invalid: ${message}` };
   }
 
   const normalizedPath = requestedPath.replace(/\\/g, "/");
@@ -181,8 +178,9 @@ export function validateOutboundFile(
     }
 
     return { allowed: true, canonicalPath: realCandidate };
-  } catch (err: any) {
-    return { allowed: false, reason: `Path resolution error: ${err.message}` };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return { allowed: false, reason: `Path resolution error: ${message}` };
   }
 }
 
@@ -211,8 +209,9 @@ export function resolveConfinedPath(
   let canonicalBase: string;
   try {
     canonicalBase = fs.realpathSync(baseDir || process.cwd());
-  } catch (err: any) {
-    return { allowed: false, reason: `Base directory invalid: ${err.message}` };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return { allowed: false, reason: `Base directory invalid: ${message}` };
   }
 
   const normalizedPath = requestedPath.replace(/\\/g, "/");
@@ -251,8 +250,9 @@ export function resolveConfinedPath(
         };
       }
       return { allowed: true, fullPath: realCandidate };
-    } catch (err: any) {
-      return { allowed: false, reason: `Path resolution error: ${err.message}` };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      return { allowed: false, reason: `Path resolution error: ${message}` };
     }
   } else {
     if (candidate !== canonicalBase && !candidate.startsWith(canonicalBase + path.sep)) {
@@ -461,7 +461,10 @@ export async function safeGitGrep(
   return new Promise((resolve) => {
     safeGitExecFile(args, { cwd, maxBuffer: 1024 * 1024 }, (err, stdout, stderr) => {
       if (err) {
-        if ((err as any).code === 1) {
+        // `git grep` exits 1 for "no matches", which is a result and not a failure. execFile
+        // stamps the child's exit status onto the error as `code`, absent from the Error type.
+        const exitStatus = "code" in err ? (err as Error & { code?: number | string }).code : undefined;
+        if (exitStatus === 1) {
           resolve({ ok: true, output: "[No matches found]" });
         } else {
           resolve({ ok: false, error: stderr || err.message });
@@ -517,8 +520,9 @@ export async function safeReadFile(
       content: buf.toString("utf8"),
       truncated: stat.size > maxBytes,
     };
-  } catch (err: any) {
-    return { ok: false, error: `Read error: ${err.message}` };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return { ok: false, error: `Read error: ${message}` };
   }
 }
 
@@ -552,7 +556,8 @@ export async function safeListDir(
     }
 
     return { ok: true, entries };
-  } catch (err: any) {
-    return { ok: false, error: `List directory error: ${err.message}` };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return { ok: false, error: `List directory error: ${message}` };
   }
 }

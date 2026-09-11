@@ -12,3 +12,8 @@ link.json
 
 # Internal agent handoff
 INTERNAL_HANDOFF.md
+INTERNAL_SPRINT_LOG.md
+
+# External review + UX spec that drove the v3.4.0 sprints. Internal design record:
+# it quotes local paths and an outside reviewer's assessment.
+omp-link-0665350-review-and-ux-spec.md

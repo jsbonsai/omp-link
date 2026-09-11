@@ -1,5 +1,18 @@
 import { type DevicePermissions } from "./identity.js";
 
+/**
+ * One running terminal in a room. `(principalId, agentInstanceId)` is the identity; `name` is a
+ * mutable label and must never be used as an authorization or routing key on its own.
+ */
+export interface TerminalEntry {
+  principalId: string;
+  agentInstanceId: string;
+  name: string;
+  workspaceLabel?: string;
+  status?: string;
+  isSelf?: boolean;
+}
+
 export const PROTOCOL_VERSION = 5;
 export const MAX_MESSAGE_SIZE = 2 * 1024 * 1024; // 2MB frame limit
 
@@ -21,6 +34,8 @@ export interface ClientHelloMsg extends BaseMessage {
   version: 5;
   clientNonce: string;
   displayName: string;
+  /** Distinguishes terminals that share one device certificate. */
+  agentInstanceId: string;
   inviteSecret?: string;
   host?: string;
   cwd?: string;
@@ -29,13 +44,14 @@ export interface ClientHelloMsg extends BaseMessage {
 export interface ServerHelloMsg extends BaseMessage {
   type: "server_hello";
   version: 5;
-  sessionId: string;
+  /** Opaque room identity. Bound to the hub principal; never a user-visible label. */
+  roomId: string;
   hubPrincipalId: string;
   hubFingerprint: string;
   hubNonce: string;
   requiresPairing: boolean;
   host?: string;
-  terminals?: Array<{ name: string; host?: string; cwd?: string; status?: string }>;
+  terminals?: TerminalEntry[];
 }
 
 export interface PairRequestMsg extends BaseMessage {
@@ -86,8 +102,8 @@ export interface StatusUpdateMsg extends BaseMessage {
   version: 5;
   id: string;
   from?: string;
-  status: any;
-  context?: any;
+  status: { terminals?: TerminalEntry[]; status?: string; [key: string]: unknown };
+  context?: unknown;
   ts: number;
 }
 
@@ -217,17 +233,36 @@ export const APPLICATION_MESSAGE_TYPES = new Set([
   "rpc_response",
 ]);
 
-export function sanitizeDisplayName(name: string): string {
-  // Strip control characters, ANSI escape sequences, and limit length
-  return name
+/**
+ * Returns the safe rendering of a peer-supplied name, or null when nothing renderable survives.
+ * A name that sanitises to empty must not reach an operator: approving `Device ""` is a prompt
+ * nobody can answer. Identity is the SPKI pin; the name is only a label.
+ */
+export function sanitizeDisplayName(name: string): string | null {
+  const clean = name
     .replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, "")
     .replace(/[\x00-\x1F\x7F-\x9F]/g, "")
     .trim()
     .slice(0, 64);
+  return clean.length > 0 ? clean : null;
+}
+
+/** Peer-supplied free text that ends up on an operator's screen or in a model's context. */
+const PEER_TEXT_FIELDS = ["error", "reason", "text"] as const;
+const MAX_PEER_TEXT_LENGTH = 2_000;
+
+/** Strip control characters and ANSI escapes, and bound the length. Never throws. */
+function sanitizePeerText(value: string): string {
+  return value
+    .replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, "")
+    .replace(/\x1B\][^\x07\x1B]*(?:\x07|\x1B\\)/g, "")
+    .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F]/g, "")
+    .slice(0, MAX_PEER_TEXT_LENGTH);
 }
 
 export function parseWireMessage(
-  raw: string | Buffer,
+  // A boundary validator takes whatever the socket produced and proves what it is.
+  raw: unknown,
 ): { ok: true; message: WireMessage } | { ok: false; error: string; closeCode: number } {
   if (typeof raw !== "string" && !Buffer.isBuffer(raw)) {
     return { ok: false, error: "Message must be a string or Buffer", closeCode: 4400 };
@@ -285,13 +320,24 @@ export function parseWireMessage(
     if (!obj.displayName || typeof obj.displayName !== "string") {
       return { ok: false, error: "client_hello missing valid displayName", closeCode: 4400 };
     }
-    obj.displayName = sanitizeDisplayName(obj.displayName);
+    if (!obj.agentInstanceId || typeof obj.agentInstanceId !== "string" || obj.agentInstanceId.length > 64) {
+      return { ok: false, error: "client_hello missing valid agentInstanceId", closeCode: 4400 };
+    }
+    const cleanName = sanitizeDisplayName(obj.displayName);
+    if (!cleanName) {
+      return { ok: false, error: "client_hello displayName is empty after sanitising", closeCode: 4400 };
+    }
+    obj.displayName = cleanName;
   } else if (msgType === "server_hello") {
-    if (!obj.sessionId || typeof obj.sessionId !== "string") {
-      return { ok: false, error: "server_hello missing valid sessionId", closeCode: 4400 };
+    if (!obj.roomId || typeof obj.roomId !== "string" || obj.roomId.length > 128) {
+      return { ok: false, error: "server_hello missing valid roomId", closeCode: 4400 };
     }
     if (!obj.hubPrincipalId || typeof obj.hubPrincipalId !== "string") {
       return { ok: false, error: "server_hello missing valid hubPrincipalId", closeCode: 4400 };
+    }
+    if (typeof obj.requiresPairing !== "boolean") {
+      // Never coerce a missing flag: an absent value must not read as "already approved".
+      return { ok: false, error: "server_hello missing valid requiresPairing", closeCode: 4400 };
     }
   } else if (msgType === "pair_request") {
     if (!obj.clientNonce || typeof obj.clientNonce !== "string") {
@@ -300,7 +346,11 @@ export function parseWireMessage(
     if (!obj.displayName || typeof obj.displayName !== "string") {
       return { ok: false, error: "pair_request missing valid displayName", closeCode: 4400 };
     }
-    obj.displayName = sanitizeDisplayName(obj.displayName);
+    const cleanName = sanitizeDisplayName(obj.displayName);
+    if (!cleanName) {
+      return { ok: false, error: "pair_request displayName is empty after sanitising", closeCode: 4400 };
+    }
+    obj.displayName = cleanName;
   } else if (msgType === "pair_verify") {
     if (!obj.sasCode || typeof obj.sasCode !== "string") {
       return { ok: false, error: "pair_verify missing valid sasCode", closeCode: 4400 };
@@ -343,6 +393,18 @@ export function parseWireMessage(
   } else if (msgType === "chat" || msgType === "direct_message") {
     if (typeof obj.text !== "string") {
       return { ok: false, error: "Message missing valid 'text' string attribute", closeCode: 4400 };
+    }
+  }
+
+  // Failure text from a peer is rendered straight to an operator and into an agent's context.
+  // Bound it and strip anything that could repaint a terminal or forge a line of our own
+  // output. Same reasoning as `sanitizeDisplayName`; these fields simply had no check.
+  for (const field of PEER_TEXT_FIELDS) {
+    const value = obj[field];
+    if (typeof value === "string") {
+      obj[field] = sanitizePeerText(value);
+    } else if (value !== undefined) {
+      delete obj[field];
     }
   }
 

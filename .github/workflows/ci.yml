@@ -1,0 +1,31 @@
+name: ci
+
+# Linux and macOS are both first-class: v3.4.0 was validated as 76/76 on Linux x86_64 and macOS
+# arm64 (INTERNAL_SPRINT_LOG.md, experiment 6), so both must stay green.
+
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    name: node ${{ matrix.node }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        node: [20, 22]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - run: npm ci
+      # typecheck + security + integration + fuzz + regression. There is no build step.
+      - run: npm run ci

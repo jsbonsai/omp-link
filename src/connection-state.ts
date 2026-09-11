@@ -8,8 +8,13 @@ export type ConnectionPhase =
   | "authenticated"
   | "closing";
 
+/**
+ * Documented default for the handshake deadline, and the fallback for a caller that has no
+ * configuration in hand. The live value is `handshakeTimeoutMs` in `link.json`: `LinkNode`
+ * resolves its timings once at construction and passes the number to
+ * `createConnectionContext`, so nothing here reads config per connection.
+ */
 export const HANDSHAKE_TIMEOUT_MS = 10_000;
-export const PAIRING_EXPIRY_MS = 60_000;
 const MAX_SEEN_MESSAGES_PER_CONN = 1_000;
 
 export interface ConnectionContext {
@@ -17,10 +22,19 @@ export interface ConnectionContext {
   socket: any; // WebSocket
   phase: ConnectionPhase;
   principalId?: string;
+  /** Distinguishes terminals sharing one device certificate. Set from client_hello. */
+  agentInstanceId?: string;
   agentId?: string;
   displayName: string;
+  workspaceLabel?: string;
   permissions?: DevicePermissions;
   connectedAt: number;
+  /**
+   * Wall clock of the last thing this peer said: any frame, or a WebSocket pong. Liveness is
+   * measured from inbound traffic rather than from pongs alone, so a busy peer is never dropped
+   * for a pong lost behind a large transfer.
+   */
+  lastInboundAt: number;
   handshakeDeadline?: NodeJS.Timeout;
   remoteAddress?: string;
   peerCert?: PeerCertificateInfo | null;
@@ -30,6 +44,12 @@ export interface ConnectionContext {
   sasCode?: string;
   isLocal: boolean;
   workspaces?: string[];
+  /**
+   * Set once the owning node has run its disconnect teardown for this context. A liveness drop
+   * tears down immediately and then terminates the socket, so the socket's own "close" event
+   * arrives afterwards and must not revoke grants, audit, or rebroadcast a second time.
+   */
+  teardownComplete: boolean;
 }
 
 export function createConnectionContext(params: {
@@ -37,6 +57,11 @@ export function createConnectionContext(params: {
   remoteAddress?: string;
   peerCert?: PeerCertificateInfo | null;
   isLocal?: boolean;
+  /**
+   * Live handshake deadline in ms, from `handshakeTimeoutMs`. Resolved by the owning node, not
+   * read here: this function runs once per inbound connection and must not touch the filesystem.
+   */
+  handshakeTimeoutMs?: number;
   onHandshakeTimeout?: () => void;
 }): ConnectionContext {
   const ctx: ConnectionContext = {
@@ -45,12 +70,14 @@ export function createConnectionContext(params: {
     phase: "tls-connected",
     displayName: "unauthenticated",
     connectedAt: Date.now(),
+    lastInboundAt: Date.now(),
     remoteAddress: params.remoteAddress,
     peerCert: params.peerCert,
     seenMessageIds: new Set<string>(),
     helloReceived: false,
     pairingRequested: false,
     isLocal: params.isLocal ?? false,
+    teardownComplete: false,
   };
 
   if (params.onHandshakeTimeout) {
@@ -58,10 +85,19 @@ export function createConnectionContext(params: {
       if (ctx.phase !== "authenticated") {
         params.onHandshakeTimeout!();
       }
-    }, HANDSHAKE_TIMEOUT_MS);
+    }, params.handshakeTimeoutMs ?? HANDSHAKE_TIMEOUT_MS);
   }
 
   return ctx;
+}
+
+/**
+ * Records that the peer on this connection is still there. Called for every inbound frame and
+ * for every WebSocket pong: a peer that is answering pings but sending nothing is alive, and so
+ * is a peer streaming a file whose pong is queued behind 64 KiB chunks.
+ */
+export function markConnectionAlive(ctx: ConnectionContext): void {
+  ctx.lastInboundAt = Date.now();
 }
 
 export function validateMessagePhase(
@@ -145,7 +181,12 @@ export function checkMessageDeduplication(ctx: ConnectionContext, msgId?: string
 
 export function setConnectionPhase(ctx: ConnectionContext, newPhase: ConnectionPhase): void {
   ctx.phase = newPhase;
-  if (newPhase === "authenticated" && ctx.handshakeDeadline) {
+  // The 10s handshake deadline covers "peer connected and said nothing". Both of these phases
+  // mean the peer said something and is now waiting on a decision: an admitted connection has
+  // no deadline at all, and a pairing connection is governed by the 60s pairing timer instead.
+  // Leaving the handshake deadline armed closes every pairing socket after 10s, which is less
+  // time than a human needs to compare four words on two screens.
+  if ((newPhase === "authenticated" || newPhase === "awaiting-pairing") && ctx.handshakeDeadline) {
     clearTimeout(ctx.handshakeDeadline);
     ctx.handshakeDeadline = undefined;
   }

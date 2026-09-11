@@ -1,0 +1,1287 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>omp-link — terminals that can reach each other</title>
+<meta name="description" content="A peer-hosted coordination mesh for agent terminals: Oh My Pi and Pi natively, Claude Code and Codex over MCP. One machine or several, over your own network. No cloud, no broker, no daemon — mutually authenticated TLS 1.3 with SPKI pinning.">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#f4f2ed" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#16181b" media="(prefers-color-scheme: dark)">
+<meta property="og:type" content="website">
+<meta property="og:title" content="omp-link — terminals that can reach each other">
+<meta property="og:description" content="Coordination between independently running coding agents, on one machine or several. Peer-hosted, no cloud, mutually authenticated TLS 1.3.">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='6' fill='%236b7f6e'/%3E%3Ccircle cx='16' cy='16' r='12' fill='none' stroke='%236b7f6e' stroke-opacity='.35' stroke-width='2'/%3E%3C/svg%3E">
+<style>
+  :root {
+    --bg: #f4f2ed;
+    --bg-raise: #fbfaf7;
+    --ink: #2b2a26;
+    --ink-soft: #6a675e;
+    --ink-faint: #9a968b;
+    --rule: #dedad0;
+    --accent: #6b7f6e;
+    --accent-soft: #e6ebe4;
+    --warn: #a3743f;
+    --term-bg: #23262b;
+    --term-edge: rgba(0,0,0,.28);
+    --term-ink: #d7d3c8;
+    --term-dim: #7d8590;
+    --code-bg: #efece5;
+    --grain: .035;
+    --shadow: 0 1px 2px rgba(43,42,38,.04), 0 8px 24px -12px rgba(43,42,38,.14);
+  }
+  html[data-theme="dark"] {
+    --bg: #16181b;
+    --bg-raise: #1c1f23;
+    --ink: #d9d6cd;
+    --ink-soft: #9a978e;
+    --ink-faint: #6c6a64;
+    --rule: #2b2f34;
+    --accent: #8fa892;
+    --accent-soft: #232a25;
+    --warn: #c69a63;
+    --term-bg: #0f1113;
+    --term-edge: #2f343a;
+    --term-ink: #cfcbc0;
+    --term-dim: #6b7280;
+    --code-bg: #202429;
+    --grain: .055;
+    --shadow: 0 1px 2px rgba(0,0,0,.3), 0 10px 30px -14px rgba(0,0,0,.6);
+  }
+
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; scroll-padding-top: 84px; }
+
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font: 400 16.5px/1.72 ui-serif, "Iowan Old Style", "Palatino Linotype", Georgia, serif;
+    -webkit-font-smoothing: antialiased;
+    transition: background .45s ease, color .45s ease;
+  }
+  body::before {
+    content: "";
+    position: fixed; inset: -50%;
+    pointer-events: none; z-index: 9999;
+    opacity: var(--grain);
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='220' height='220'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.82' numOctaves='4' stitchTiles='stitch'/%3E%3CfeColorMatrix type='saturate' values='0'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+    transition: opacity .45s ease;
+  }
+
+  .skip {
+    position: absolute; left: -9999px; top: 0; z-index: 200;
+    background: var(--bg-raise); color: var(--ink);
+    padding: 12px 18px; border: 1px solid var(--rule); border-radius: 8px;
+  }
+  .skip:focus { left: 16px; top: 16px; }
+
+  /* ── Top bar ─────────────────────────────────────────── */
+  .topbar {
+    position: sticky; top: 0; z-index: 50;
+    display: flex; align-items: center; gap: 16px;
+    padding: 13px 26px;
+    background: color-mix(in srgb, var(--bg) 88%, transparent);
+    backdrop-filter: blur(11px);
+    border-bottom: 1px solid var(--rule);
+  }
+  .brand {
+    display: inline-flex; align-items: center; gap: 9px;
+    font: 600 13px/1 ui-monospace, "SF Mono", Menlo, monospace;
+    letter-spacing: .1em; text-transform: uppercase;
+    color: var(--ink); text-decoration: none;
+  }
+  .brand .dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--accent); box-shadow: 0 0 0 4px var(--accent-soft);
+  }
+  .ver {
+    font: 500 11px/1 ui-monospace, Menlo, monospace;
+    color: var(--ink-faint); letter-spacing: .08em;
+    border: 1px solid var(--rule); border-radius: 999px; padding: 4px 9px;
+  }
+  .topbar .spacer { flex: 1; }
+  .tlink {
+    font: 500 12.5px/1 ui-monospace, Menlo, monospace;
+    color: var(--ink-soft); text-decoration: none; letter-spacing: .04em;
+  }
+  .tlink:hover { color: var(--ink); }
+  .toggle {
+    display: inline-flex; align-items: center; gap: 7px;
+    padding: 7px 13px; border-radius: 999px;
+    border: 1px solid var(--rule); background: var(--bg-raise); color: var(--ink-soft);
+    font: 500 12px/1 ui-monospace, Menlo, monospace; letter-spacing: .06em;
+    cursor: pointer;
+  }
+  .toggle:hover { color: var(--ink); border-color: var(--accent); }
+  .navbtn {
+    display: none;
+    padding: 7px 12px; border-radius: 8px;
+    border: 1px solid var(--rule); background: var(--bg-raise); color: var(--ink-soft);
+    font: 500 12px/1 ui-monospace, Menlo, monospace; cursor: pointer;
+  }
+
+  /* ── Hero ────────────────────────────────────────────── */
+  .hero { padding: 92px 26px 74px; border-bottom: 1px solid var(--rule); }
+  .hero-in { max-width: 1160px; margin: 0 auto; }
+  .hero h1 {
+    font-size: clamp(40px, 6.6vw, 64px); line-height: 1.05;
+    font-weight: 400; letter-spacing: -.022em; margin: 0;
+    max-width: 15ch;
+  }
+  .hero .lede {
+    font-size: 20.5px; line-height: 1.62; color: var(--ink-soft);
+    margin: 24px 0 0; max-width: 58ch;
+  }
+  .cta { display: flex; flex-wrap: wrap; gap: 12px; margin: 34px 0 0; align-items: center; }
+  .btn {
+    display: inline-flex; align-items: center; gap: 8px;
+    padding: 11px 20px; border-radius: 9px; text-decoration: none;
+    font: 500 14px/1 ui-monospace, Menlo, monospace;
+    border: 1px solid var(--accent); background: var(--accent); color: var(--bg);
+  }
+  html[data-theme="dark"] .btn { color: #14171a; }
+  .btn.ghost { background: transparent; color: var(--ink); border-color: var(--rule); }
+  .btn.ghost:hover { border-color: var(--accent); }
+
+  .pills { display: flex; flex-wrap: wrap; gap: 10px; margin: 40px 0 0; }
+  .pill {
+    font: 500 12px/1 ui-monospace, Menlo, monospace;
+    color: var(--ink-soft); border: 1px solid var(--rule);
+    border-radius: 999px; padding: 7px 13px; background: var(--bg-raise);
+  }
+  .pill b { color: var(--accent); font-weight: 600; }
+
+  /* ── Layout ──────────────────────────────────────────── */
+  .shell {
+    max-width: 1160px; margin: 0 auto; padding: 0 26px 120px;
+    display: grid; grid-template-columns: 216px minmax(0, 1fr); gap: 52px;
+  }
+  .side { position: sticky; top: 78px; align-self: start; padding-top: 46px; max-height: calc(100vh - 96px); overflow-y: auto; }
+  .side h4 {
+    font: 600 10.5px/1 ui-monospace, Menlo, monospace;
+    letter-spacing: .16em; text-transform: uppercase; color: var(--ink-faint);
+    margin: 22px 0 10px;
+  }
+  .side h4:first-child { margin-top: 0; }
+  .side a {
+    display: block; padding: 5px 0 5px 12px;
+    border-left: 2px solid var(--rule);
+    color: var(--ink-soft); text-decoration: none;
+    font-size: 14px; line-height: 1.45;
+  }
+  .side a:hover { color: var(--ink); }
+  .side a.on { color: var(--accent); border-left-color: var(--accent); font-weight: 600; }
+
+  main { padding-top: 46px; min-width: 0; }
+
+  /* ── Typography ──────────────────────────────────────── */
+  section { scroll-margin-top: 84px; padding-top: 44px; }
+  section + section { border-top: 1px solid var(--rule); margin-top: 66px; }
+  h2 { font-size: 28px; font-weight: 400; letter-spacing: -.015em; margin: 0 0 6px; }
+  h3 { font-size: 18.5px; font-weight: 600; margin: 40px 0 10px; }
+  .kicker {
+    font: 500 11px/1 ui-monospace, Menlo, monospace;
+    letter-spacing: .16em; text-transform: uppercase;
+    color: var(--accent); margin: 0 0 13px;
+  }
+  p { margin: 14px 0; max-width: 70ch; }
+  a { color: var(--ink); text-decoration-color: var(--ink-faint); text-underline-offset: 3px; }
+  .muted { color: var(--ink-soft); }
+  code, .mono { font-family: ui-monospace, "SF Mono", Menlo, monospace; }
+  p code, li code, td code {
+    font-size: .85em; background: var(--code-bg);
+    padding: .12em .38em; border-radius: 4px; border: 1px solid var(--rule);
+  }
+  ul { max-width: 70ch; }
+  li { margin: 6px 0; }
+
+  /* ── Blocks ──────────────────────────────────────────── */
+  .term, .code { position: relative; margin: 24px 0; border-radius: 11px; overflow: hidden; }
+  .term { background: var(--term-bg); color: var(--term-ink); box-shadow: var(--shadow); border: 1px solid var(--term-edge); }
+  .code { background: var(--code-bg); border: 1px solid var(--rule); }
+  .term-bar, .code-head {
+    display: flex; align-items: center; gap: 7px; padding: 10px 14px;
+    font: 500 11.5px/1 ui-monospace, Menlo, monospace; letter-spacing: .06em;
+  }
+  .term-bar { background: rgba(255,255,255,.038); border-bottom: 1px solid rgba(255,255,255,.06); color: var(--term-dim); }
+  .code-head { border-bottom: 1px solid var(--rule); color: var(--ink-faint); }
+  .term-bar i { width: 10px; height: 10px; border-radius: 50%; display: block; }
+  .term-bar i:nth-child(1) { background: #7a5450; }
+  .term-bar i:nth-child(2) { background: #7a6b47; }
+  .term-bar i:nth-child(3) { background: #4e6650; }
+  .term-bar span { margin-left: 8px; }
+  .term pre, .code pre {
+    margin: 0; padding: 16px 18px 19px;
+    font: 400 13.2px/1.62 ui-monospace, "SF Mono", Menlo, monospace;
+    overflow-x: auto; white-space: pre;
+  }
+  .code pre { color: var(--ink); }
+  .term .p { color: var(--accent); }
+  .term .c { color: var(--term-dim); }
+  .term .k { color: #93b1c7; }
+  .term .g { color: #93bd9a; }
+  .term .w { color: #d7ac72; }
+  .term .r { color: #cd8b80; }
+  .term .b { color: var(--term-ink); font-weight: 600; }
+  .code .cm { color: var(--ink-faint); font-style: italic; }
+  .code .st { color: var(--warn); }
+  .code .kw { color: var(--accent); }
+
+  .copy {
+    position: absolute; top: 8px; right: 9px;
+    padding: 5px 10px; border-radius: 6px; cursor: pointer;
+    font: 500 11px/1 ui-monospace, Menlo, monospace; letter-spacing: .06em;
+    border: 1px solid var(--rule); background: var(--bg-raise); color: var(--ink-soft);
+    opacity: 0; transition: opacity .18s;
+  }
+  .term .copy { border-color: rgba(255,255,255,.14); background: rgba(255,255,255,.07); color: var(--term-dim); }
+  .term:hover .copy, .code:hover .copy, .copy:focus { opacity: 1; }
+  .copy:hover { color: var(--accent); border-color: var(--accent); }
+
+  /* ── Callouts, tables, figures ───────────────────────── */
+  .note {
+    border-left: 2px solid var(--accent); background: var(--accent-soft);
+    padding: 15px 20px; margin: 26px 0; border-radius: 0 8px 8px 0;
+  }
+  .note.warn { background: transparent; border: 1px solid var(--rule); border-left: 2px solid var(--warn); }
+  .note p { margin: 6px 0; }
+  .note .lbl {
+    font: 600 10.5px/1 ui-monospace, Menlo, monospace;
+    letter-spacing: .14em; text-transform: uppercase; color: var(--accent);
+    display: block; margin-bottom: 8px;
+  }
+  .note.warn .lbl { color: var(--warn); }
+
+  .tw { overflow-x: auto; margin: 24px 0; }
+  table { width: 100%; border-collapse: collapse; font-size: 14.4px; }
+  th, td { text-align: left; padding: 10px 13px; border-bottom: 1px solid var(--rule); vertical-align: top; }
+  th { font: 600 11px/1 ui-monospace, Menlo, monospace; letter-spacing: .1em; text-transform: uppercase; color: var(--ink-faint); white-space: nowrap; }
+  tr:last-child td { border-bottom: none; }
+
+  .fig {
+    background: var(--bg-raise); border: 1px solid var(--rule);
+    border-radius: 12px; padding: 26px 22px 20px; margin: 28px 0; box-shadow: var(--shadow);
+  }
+  .fig svg { width: 100%; height: auto; display: block; }
+  .fig text { font-family: ui-monospace, Menlo, monospace; }
+  .fig figcaption { margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--rule); font-size: 13.5px; color: var(--ink-soft); }
+
+  .steps { counter-reset: s; list-style: none; padding: 0; margin: 26px 0; }
+  .steps > li { counter-increment: s; position: relative; padding: 0 0 4px 44px; margin: 0 0 26px; }
+  .steps > li::before {
+    content: counter(s); position: absolute; left: 0; top: 1px;
+    width: 27px; height: 27px; border-radius: 50%;
+    background: var(--accent-soft); color: var(--accent); border: 1px solid var(--rule);
+    display: grid; place-items: center;
+    font: 600 12.5px/1 ui-monospace, Menlo, monospace;
+  }
+  .steps h3 { margin: 0 0 6px; }
+
+  footer { border-top: 1px solid var(--rule); padding: 34px 26px 70px; }
+  .footer-in { max-width: 1160px; margin: 0 auto; color: var(--ink-faint); font-size: 13.6px; display: flex; flex-wrap: wrap; gap: 20px; justify-content: space-between; }
+
+  @media (max-width: 900px) {
+    .shell { grid-template-columns: 1fr; gap: 0; padding-bottom: 90px; }
+    .side {
+      position: static; max-height: none; padding: 18px 0 6px;
+      display: none; border-bottom: 1px solid var(--rule);
+    }
+    .side.open { display: block; }
+    .navbtn { display: inline-block; }
+    .hero { padding: 62px 22px 52px; }
+    main { padding-top: 34px; }
+    .topbar { padding: 11px 18px; gap: 10px; }
+    .ver, .tlink { display: none; }
+  }
+  @media print {
+    .topbar, .side, .copy, .toggle, .navbtn, body::before { display: none !important; }
+    .shell { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+
+<a class="skip" href="#start">Skip to content</a>
+
+<div class="topbar">
+  <a class="brand" href="#top"><span class="dot"></span> omp-link</a>
+  <span class="ver">v3.4.0 · protocol 5</span>
+  <span class="spacer"></span>
+  <a class="tlink" href="https://github.com/jsbonsai/omp-link">github</a>
+  <button class="navbtn" id="navBtn" aria-label="Toggle navigation">menu</button>
+  <button class="toggle" id="themeToggle" aria-label="Toggle colour theme">
+    <span id="themeIcon">☾</span><span id="themeLabel">dark</span>
+  </button>
+</div>
+
+<header class="hero" id="top">
+  <div class="hero-in">
+    <h1>Terminals that can reach each other.</h1>
+    <p class="lede">
+      A peer-hosted coordination mesh for agent terminals — Oh&nbsp;My&nbsp;Pi and Pi natively,
+      Claude&nbsp;Code and Codex over MCP — on one machine or across your network. No cloud, no
+      broker, no daemon. One terminal hosts, the others join over mutually authenticated
+      TLS&nbsp;1.3.
+    </p>
+    <div class="cta">
+      <a class="btn" href="#start">Get started</a>
+      <a class="btn ghost" href="#mcp">Wire up an MCP host</a>
+      <a class="btn ghost" href="#scenarios">See it work</a>
+      <a class="btn ghost" href="#limits">What it does not do</a>
+    </div>
+    <div class="pills">
+      <span class="pill"><b>zero</b> external infrastructure</span>
+      <span class="pill"><b>TLS 1.3</b> mutual auth, SPKI pinned</span>
+      <span class="pill"><b>deny</b> by default, capability gated</span>
+      <span class="pill"><b>MCP</b> Claude Code, Codex CLI</span>
+      <span class="pill"><b>207</b> tests, macOS + Linux</span>
+    </div>
+  </div>
+</header>
+
+<div class="shell">
+
+  <nav class="side" id="side" aria-label="Documentation">
+    <h4>Start</h4>
+    <a href="#start">Install &amp; first room</a>
+    <a href="#model">How it fits together</a>
+    <a href="#identity">Four identities</a>
+    <h4>Scenarios</h4>
+    <a href="#scenarios">Two repos, one machine</a>
+    <a href="#lan">Two machines on a LAN</a>
+    <a href="#tailscale">Across a Tailnet</a>
+    <a href="#mcp">Claude Code &amp; Codex</a>
+    <a href="#succession">When the host leaves</a>
+    <h4>Reference</h4>
+    <a href="#commands">Commands</a>
+    <a href="#tools">Agent tools</a>
+    <a href="#config">Configuration</a>
+    <a href="#trust">Consent &amp; revocation</a>
+    <a href="#trouble">Troubleshooting</a>
+    <h4>Honesty</h4>
+    <a href="#limits">What it does not do</a>
+  </nav>
+
+  <main>
+
+  <!-- ═══════════════════════════════════════════════ -->
+  <section id="start">
+    <p class="kicker">Start here</p>
+    <h2>Install and host your first room</h2>
+
+    <p>
+      Node 18 or newer. The installer symlinks the extension into <code>~/.omp</code> and
+      <code>~/.pi</code>, and puts <code>omp-link</code> on your <code>PATH</code>. Nothing runs
+      in the background afterwards.
+    </p>
+
+    <div class="code">
+      <div class="code-head"><span>shell</span></div>
+<pre>git clone https://github.com/jsbonsai/omp-link
+<span class="kw">cd</span> omp-link
+npm install &amp;&amp; ./setup.sh
+omp-link version   <span class="cm"># 3.4.0</span></pre>
+    </div>
+
+    <p>
+      Then, inside an agent terminal, host a room. <strong>Nothing is shared and nobody is
+      admitted</strong> until you approve them by hand.
+    </p>
+
+    <div class="term">
+      <div class="term-bar"><i></i><i></i><i></i><span>~/dev/api — omp</span></div>
+<pre><span class="p">/link</span> create backend
+
+Hosting room <span class="b">"backend"</span> on <span class="k">192.168.1.105:9900</span>.
+No peer is admitted until you approve it. Share access with /link invite.</pre>
+    </div>
+
+    <p>
+      When something looks wrong, ask. Every line of <code>doctor</code> is measured at the moment
+      you run it — a live socket, a real port probe, the negotiated TLS version — never a stored
+      assumption.
+    </p>
+
+    <div class="term">
+      <div class="term-bar"><i></i><i></i><i></i><span>omp-link doctor</span></div>
+<pre>omp-link doctor
+  version            3.4.0 (protocol 5)
+  device principal   ed25519-sha256:5C:4E:B0:76:51:B8:DE:C1:…
+  state directory    /Users/you/.omp
+  paired devices     2
+  link state         connected
+  port 9900          omp-link hub, room 8f2c1d4a-…
+  tls to host        <span class="g">TLSv1.3</span>
+  host identity      ed25519-sha256:5C:4E:B0:76:51:… pinned
+  network            tailscale · lan 192.168.1.105 · tailscale 100.99.86.63
+  audit events       34 recent</pre>
+    </div>
+  </section>
+
+  <!-- ═══════════════════════════════════════════════ -->
+  <section id="model">
+    <p class="kicker">Topology</p>
+    <h2>How it fits together</h2>
+
+    <p>
+      One terminal hosts a <strong>room</strong> on port 9900. Every other terminal joins it as a
+      client. That is the whole topology: a star, not a mesh — and it says so, because the hub
+      terminates TLS and reads everything it routes.
+    </p>
+
+    <figure class="fig">
+    <svg viewBox="0 0 720 292" role="img" aria-label="Three agent terminals connected to one hub terminal">
+      <defs>
+        <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+          <path d="M0 0 L10 5 L0 10 z" fill="currentColor"/>
+        </marker>
+      </defs>
+      <g fill="none" stroke="var(--accent)" stroke-width="1.5" color="var(--accent)" opacity=".55">
+        <path d="M188 78 L318 142" marker-end="url(#ah)"/>
+        <path d="M188 222 L318 158" marker-end="url(#ah)"/>
+        <path d="M598 150 L402 150" marker-end="url(#ah)"/>
+      </g>
+      <rect x="320" y="118" width="84" height="64" rx="9" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.5"/>
+      <text x="362" y="145" text-anchor="middle" font-size="12.5" font-weight="600" fill="var(--ink)">hub</text>
+      <text x="362" y="163" text-anchor="middle" font-size="10.5" fill="var(--ink-soft)">:9900</text>
+      <rect x="72" y="52" width="116" height="52" rx="8" fill="var(--bg)" stroke="var(--rule)" stroke-width="1.5"/>
+      <text x="130" y="74" text-anchor="middle" font-size="11.5" fill="var(--ink)">api-reviewer</text>
+      <text x="130" y="90" text-anchor="middle" font-size="10" fill="var(--ink-faint)">~/dev/api</text>
+      <rect x="72" y="196" width="116" height="52" rx="8" fill="var(--bg)" stroke="var(--rule)" stroke-width="1.5"/>
+      <text x="130" y="218" text-anchor="middle" font-size="11.5" fill="var(--ink)">web-worker</text>
+      <text x="130" y="234" text-anchor="middle" font-size="10" fill="var(--ink-faint)">~/dev/web</text>
+      <rect x="598" y="124" width="116" height="52" rx="8" fill="var(--bg)" stroke="var(--rule)" stroke-width="1.5"/>
+      <text x="656" y="146" text-anchor="middle" font-size="11.5" fill="var(--ink)">test-runner</text>
+      <text x="656" y="162" text-anchor="middle" font-size="10" fill="var(--ink-faint)">linux-box</text>
+      <text x="252" y="104" text-anchor="middle" font-size="9.5" fill="var(--ink-faint)">same device cert</text>
+      <text x="500" y="140" text-anchor="middle" font-size="9.5" fill="var(--ink-faint)">paired + pinned</text>
+      <text x="362" y="220" text-anchor="middle" font-size="10.5" fill="var(--ink-soft)">wss · TLS 1.3 mutual auth · SPKI pinned</text>
+      <text x="362" y="240" text-anchor="middle" font-size="10.5" fill="var(--ink-faint)">the hub reads and routes everything</text>
+    </svg>
+    <figcaption>
+      Terminals on one machine share a device certificate, so they join without pairing. A remote
+      machine has its own identity and is verified once, by comparing four words.
+    </figcaption>
+    </figure>
+
+    <h3>What "connected" means</h3>
+    <p>
+      Exactly one thing: <strong>authenticated and admitted</strong>. A socket that is open but not
+      yet approved reports <span class="mono">Pairing</span>, never
+      <span class="mono">Connected</span>. Discovery finding a hub is not a connection, and it is
+      never trust.
+    </p>
+  </section>
+
+  <!-- ═══════════════════════════════════════════════ -->
+  <section id="identity">
+    <p class="kicker">Model</p>
+    <h2>Four identities</h2>
+    <p>Every question about who may do what resolves to one of these four.</p>
+
+    <div class="tw"><table>
+      <tr><th>Identity</th><th>What it is</th><th>Lifetime</th><th>Lives in</th></tr>
+      <tr><td><strong>Device</strong></td><td>SHA-256 of the certificate's SPKI: <code>ed25519-sha256:5C:4E:…</code></td><td>Permanent, per machine</td><td><code>~/.omp/identity/</code></td></tr>
+      <tr><td><strong>Agent instance</strong></td><td>One running terminal; a random uuid at startup</td><td>The process</td><td>memory only</td></tr>
+      <tr><td><strong>Workspace</strong></td><td>A canonical repository root a peer may inspect</td><td>While registered</td><td>memory + per-device allow-list</td></tr>
+      <tr><td><strong>Room</strong></td><td>Opaque id bound to the hosting device's principal</td><td>Until you leave it</td><td><code>~/.omp/link.json</code></td></tr>
+    </table></div>
+
+    <div class="note">
+      <span class="lbl">Why a room is not a name</span>
+      <p>
+        If two machines both create a room called <span class="mono">backend</span>, those are two
+        different rooms that share a label. A room is the pair
+        <span class="mono">(roomId, hub principalId)</span>, so "same name" can never silently mean
+        "same room", and a host whose key changed can never inherit a room you already trusted.
+      </p>
+    </div>
+
+    <p>
+      Three terminals on one laptop are <strong>three agents</strong> — not three devices, and not
+      one recipient. That is why an execution grant issued to one terminal is unusable by the
+      terminal beside it: grants key on <span class="mono">(device, agent&nbsp;instance)</span>.
+    </p>
+  </section>
+
+  <!-- ═══════════════════════════════════════════════ -->
+  <section id="scenarios">
+    <p class="kicker">Scenario A</p>
+    <h2>Two codebases, one machine</h2>
+    <p>
+      An API repo and a web repo in two terminals. Terminals on one machine share a device
+      certificate, so the second is recognised as <em>you</em> and joins with no pairing ceremony.
+    </p>
+
+    <ol class="steps">
+      <li>
+        <h3>The second terminal just joins</h3>
+        <p class="muted">
+          It tries to create, finds the port held by a sibling, and joins instead of quietly
+          becoming something else. No verification code: it presented this device's own certificate.
+        </p>
+        <div class="term">
+          <div class="term-bar"><i></i><i></i><i></i><span>~/dev/web — omp</span></div>
+<pre><span class="p">/link</span> create backend
+
+<span class="c">A terminal on this machine is already hosting on port 9900.</span>
+<span class="c">Joined it instead of starting a second room.</span>
+
+<span class="b">Link · Connected</span>
+Room          backend
+This agent    web-worker · web (this)
+Other agents  1
+Network       lan · host 127.0.0.1:9900 · SPKI verified</pre>
+        </div>
+      </li>
+      <li>
+        <h3>Now they can reach each other</h3>
+        <p class="muted">
+          <span class="mono">link_exec</span> is a structured, path-confined RPC. It spends no model
+          turn on the far side, unlike <span class="mono">link_send</span>.
+        </p>
+        <div class="term">
+          <div class="term-bar"><i></i><i></i><i></i><span>~/dev/api — agent tool call</span></div>
+<pre><span class="p">›</span> link_exec  to=<span class="k">web-worker</span>  action=<span class="k">git_status</span>
+
+<span class="g">On branch feat/checkout</span>
+<span class="g">Changes not staged for commit:</span>
+        modified:   src/cart/total.ts</pre>
+        </div>
+      </li>
+    </ol>
+
+    <div class="note warn">
+      <span class="lbl">Current limitation</span>
+      <p>
+        Nested repositories share the parent's export: a terminal registers its
+        <span class="mono">cwd</span> as the <span class="mono">default</span> workspace. If
+        <span class="mono">~/dev/api</span> contains an inner repo, an inspect-capable peer sees
+        through to it. Named workspace exports are the next piece of work.
+      </p>
+    </div>
+  </section>
+
+  <!-- ═══════════════════════════════════════════════ -->
+  <section id="lan">
+    <p class="kicker">Scenario B</p>
+    <h2>Two machines on a LAN</h2>
+    <p>
+      A different machine is a different identity, so it is verified once, forever. Four words,
+      compared by a human on two screens. The words are <strong>never transmitted</strong>: both
+      sides derive them independently from the TLS session, so a match proves you share one channel
+      and nobody sits in the middle.
+    </p>
+
+    <div class="term">
+      <div class="term-bar"><i></i><i></i><i></i><span>linux-box — joining</span></div>
+<pre><span class="p">/link</span> join 192.168.1.105:9900
+
+<span class="w">Waiting to be verified by the host at 192.168.1.105:9900.</span>
+<span class="w">Compare this code on BOTH screens: CEDAR-ORBIT-MANGO-RIVER</span>
+Nothing is shared until the host approves.</pre>
+    </div>
+
+    <div class="term">
+      <div class="term-bar"><i></i><i></i><i></i><span>~/dev/api — the host</span></div>
+<pre><span class="b">Pairing request #1</span>
+  Device       "test-runner" from 192.168.1.183
+  Compare this code on BOTH screens:  <span class="w">CEDAR-ORBIT-MANGO-RIVER</span>
+  Approve      /link accept 1 CEDAR-ORBIT-MANGO-RIVER
+  Refuse       /link deny 1
+  Granting     messages and status only. Add access later with /link devices allow.
+
+<span class="p">/link</span> accept 1
+<span class="r">Usage: /link accept &lt;request-id&gt; &lt;code&gt;</span>
+<span class="r">The code is required: it proves you compared the words on both screens.</span></pre>
+    </div>
+
+    <p>
+      Access is then widened deliberately, never by default. A freshly paired device can send
+      messages and appear in the roster. Reading your source is a separate decision.
+    </p>
+
+    <div class="term">
+      <div class="term-bar"><i></i><i></i><i></i><span>widening access</span></div>
+<pre><span class="c"># the peer tries to read before you allow it</span>
+<span class="r">[Access Denied] Permission denied: "inspectMetadata" is explicitly
+denied for this device</span>
+
+<span class="p">/link</span> devices allow test-runner metadata,diff
+<span class="g">test-runner can now: send messages, see repo status, read diffs</span></pre>
+    </div>
+  </section>
+
+  <!-- ═══════════════════════════════════════════════ -->
+  <section id="tailscale">
+    <p class="kicker">Scenario C</p>
+    <h2>Across a Tailnet</h2>
+    <p>
+      Tailscale changes how machines <em>find and reach</em> each other. It changes nothing about
+      who is <em>allowed</em> to do what. Sharing a tailnet is not authorisation: you still pair,
+      you still compare four words, capabilities still start at messages only.
+    </p>
+
+    <div class="tw"><table>
+      <tr><th></th><th>LAN</th><th>Tailscale</th></tr>
+      <tr><td>Hub binds to</td><td>all interfaces</td><td>the detected <code>100.x</code> address only</td></tr>
+      <tr><td>Discovery</td><td>UDP broadcast on 9901, plus loopback</td><td><code>tailscale status --json</code>, peers in <code>100.64/10</code></td></tr>
+      <tr><td>Reachability</td><td>same subnet</td><td>anywhere the tailnet reaches</td></tr>
+      <tr><td>Pairing</td><td colspan="2">identical — four words, compared by a human</td></tr>
+      <tr><td>Pinning</td><td colspan="2">identical — SPKI pinned on first pair; a mismatch is a blocking state</td></tr>
+      <tr><td>Capabilities</td><td colspan="2">identical — messages and status only, until you widen them</td></tr>
+    </table></div>
+
+    <div class="term">
+      <div class="term-bar"><i></i><i></i><i></i><span>scanning a tailnet</span></div>
+<pre><span class="p">/link</span> scan
+
+Scanning tailscale for hubs...
+Reachable hubs (1). <span class="w">Unverified</span> — joining still requires a code or a pin:
+  100.99.86.63:9900 [tailscale] room 8f2c1d4a-…
+    join: /link join 100.99.86.63:9900</pre>
+    </div>
+
+    <p>
+      Note the word <strong>unverified</strong>. Discovery answers "who responded", never "who is
+      trustworthy". Even when exactly one hub replies, nothing auto-joins.
+    </p>
+
+    <div class="code">
+      <div class="code-head"><span>~/.omp/link.json</span><span>after joining</span></div>
+<pre><span class="cm">// A room record: an opaque id bound to the host's verified identity.</span>
+<span class="cm">// The label is for you. The pin is what actually decides trust.</span>
+{
+  <span class="st">"network"</span>: <span class="st">"tailscale"</span>,
+  <span class="st">"currentRoomId"</span>: <span class="st">"8f2c1d4a-…"</span>,
+  <span class="st">"rooms"</span>: [
+    {
+      <span class="st">"roomId"</span>:         <span class="st">"8f2c1d4a-…"</span>,
+      <span class="st">"label"</span>:          <span class="st">"backend"</span>,
+      <span class="st">"hubPrincipalId"</span>: <span class="st">"ed25519-sha256:5C:4E:B0:…"</span>,
+      <span class="st">"hubFingerprint"</span>: <span class="st">"5C:4E:B0:76:51:B8:…"</span>,
+      <span class="st">"endpoint"</span>:       <span class="st">"100.99.86.63:9900"</span>
+    }
+  ]
+}</pre>
+    </div>
+
+    <div class="note">
+      <span class="lbl">Without Tailscale</span>
+      <p>
+        Everything works on a plain LAN with no extra software; the only difference is reach. Same
+        subnet, use the LAN address. Different networks, Tailscale is the transport that makes the
+        machines adjacent. The trust model is unchanged either way.
+      </p>
+    </div>
+  </section>
+
+  <!-- ═══════════════════════════════════════════════ -->
+  <section id="mcp">
+    <p class="kicker">Beyond Pi</p>
+    <h2>From Claude Code, Codex and other MCP hosts</h2>
+    <p>
+      <code>omp-link-mcp</code> is a stdio MCP server: newline-delimited JSON-RPC 2.0 on
+      stdin/stdout, hand-rolled, no new dependency and no build step. A host that speaks MCP —
+      Claude Code, Codex CLI, Cursor — joins the same room as a Pi terminal, pairs the same way,
+      and is bound by the same capabilities and the same audit log.
+    </p>
+    <p>
+      It appears as its own terminal, named <span class="mono">&lt;name&gt;-mcp</span>, because it
+      is one. The Pi terminal and the MCP server on a single machine share a device certificate
+      but are two agents, and a peer aiming <code>link_send</code> at a name has to know which of
+      them it reached.
+    </p>
+
+    <h3>Claude Code</h3>
+    <div class="code">
+      <div class="code-head"><span>shell</span><span>omp-link on PATH</span></div>
+<pre>claude mcp add --transport stdio omp-link -- omp-link-mcp</pre>
+    </div>
+    <p>
+      Add <code>--scope project</code> to write <code>.mcp.json</code> into the repo instead of
+      your user config. From a git checkout, point at the launcher itself:
+    </p>
+    <div class="code">
+      <div class="code-head"><span>shell</span><span>from a checkout</span></div>
+<pre>claude mcp add --transport stdio omp-link -- node /absolute/path/to/omp-link/bin/omp-link-mcp.mjs</pre>
+    </div>
+    <div class="code">
+      <div class="code-head"><span>.mcp.json</span><span>project scope, by hand</span></div>
+<pre>{"mcpServers":{"omp-link":{"command":"omp-link-mcp","args":[]}}}</pre>
+    </div>
+    <p>
+      Confirm it registered with <code>claude mcp get omp-link</code>, or <code>/mcp</code> inside
+      the session.
+    </p>
+
+    <div class="note warn">
+      <span class="lbl">Three things that bite</span>
+      <p>The <code>--</code> is mandatory: everything after it is passed to the server untouched.</p>
+      <p>
+        Do not add a <code>type</code> field. An entry without one is read as stdio, which is what
+        this server speaks.
+      </p>
+      <p>
+        A project-scoped <code>.mcp.json</code> server sits at <em>Pending approval</em> until the
+        workspace is trusted — and a cloned repo cannot approve its own servers.
+      </p>
+    </div>
+
+    <h3>Codex CLI</h3>
+    <div class="code">
+      <div class="code-head"><span>shell</span></div>
+<pre>codex mcp add omp-link -- omp-link-mcp</pre>
+    </div>
+    <div class="code">
+      <div class="code-head"><span>~/.codex/config.toml</span><span>the same registration, by hand</span></div>
+<pre>[mcp_servers.omp-link]
+command = <span class="st">"omp-link-mcp"</span>
+args = []
+cwd = <span class="st">"/Users/you/dev/api"</span>
+
+[mcp_servers.omp-link.env]
+OMP_DIR = <span class="st">"/Users/you/.omp"</span></pre>
+    </div>
+    <p>
+      The table name is <span class="mono">mcp_servers</span> — snake_case and plural.
+      <code>cwd</code> and <code>env</code> are optional, and <code>cwd</code> is load-bearing: it
+      becomes the node's <span class="mono">workspaceRoot</span>, which is exactly what a peer's
+      <code>link_exec</code> inspects. Confirm with <code>codex mcp list</code>, or
+      <code>/mcp</code> inside the session.
+    </p>
+
+    <h3>Six tools, not seven</h3>
+    <p>
+      The Pi set minus one. <code>link_status</code> does one extra job here: it delivers messages
+      that arrived while no tool was running. MCP gives a server no way to push them, so they wait
+      and are cleared once reported.
+    </p>
+
+    <div class="tw"><table>
+      <tr><th>Tool</th><th>Use it for</th><th>Peer turn</th></tr>
+      <tr><td><code>link_status</code></td><td>State, room, peers, and any messages waiting</td><td>no</td></tr>
+      <tr><td><code>link_exec</code></td><td><code>git_status</code>, <code>git_diff</code>, <code>git_log</code>, <code>search_text</code>, <code>read_file</code>, <code>list_dir</code></td><td>no</td></tr>
+      <tr><td><code>link_list</code></td><td>Who is in the room</td><td>no</td></tr>
+      <tr><td><code>link_discover</code></td><td>Which hubs respond (unverified)</td><td>no</td></tr>
+      <tr><td><code>link_send</code></td><td>Delegating actual reasoning to a peer</td><td>yes</td></tr>
+      <tr><td><code>link_send_file</code></td><td>Streaming a file into a peer's quarantine inbox</td><td>no</td></tr>
+    </table></div>
+
+    <p>
+      <code>link_compact</code> is deliberately absent. Compaction only means anything where the
+      host exposes a compaction API for the agent's own context — Pi does, MCP has no such
+      primitive. Exposing it here would answer "compacted successfully" without compacting
+      anything, and a tool that silently does nothing is worse than an absent one.
+    </p>
+
+    <div class="note">
+      <span class="lbl">What the server will not do by itself</span>
+      <p>
+        It attaches to the room already recorded in <code>link.json</code>. It never creates a
+        room, never pairs on its own and never opens a listening port: a background process
+        started by an editor must not put a TLS server on your LAN because a config file remembers
+        a room. Creating and joining stay human decisions — <code>omp-link create &lt;name&gt;</code>,
+        <code>omp-link join &lt;ip:port&gt;</code> or <code>/link</code>. If a room appears while
+        the server is running, the next tool call attaches to it.
+      </p>
+      <p>
+        It also never serves shell execution. <code>--unsafe-remote-exec</code> is a per-launch
+        decision made at a terminal you are watching; peers can still ask it for structured
+        inspection, gated by the same capabilities as anywhere else.
+      </p>
+    </div>
+
+    <p class="muted">
+      Runs under bare <code>node</code>: Node 22.18+ strips types itself, a checkout that has run
+      <code>npm install</code> uses <code>tsx</code>, and Node 22.6–22.17 is re-executed with
+      <code>--experimental-strip-types</code>. <code>tools/list</code> answers even when the link
+      is down, so a host can build its tool catalogue before you have a room.
+    </p>
+
+    <p class="muted">
+      Host-side reference:
+      <a href="https://code.claude.com/docs/en/mcp">Claude Code MCP</a> ·
+      <a href="https://developers.openai.com/codex/mcp">Codex MCP</a>.
+    </p>
+  </section>
+
+  <!-- ═══════════════════════════════════════════════ -->
+  <section id="succession">
+    <p class="kicker">Lifecycle</p>
+    <h2>When the host leaves</h2>
+    <p>
+      The obvious failure of a peer-hosted design: close the hosting terminal and the room dies.
+      omp-link avoids it without a background service, using something already true — terminals on
+      one machine share a device certificate.
+    </p>
+    <p>
+      When the hosting terminal exits, a surviving local terminal claims port 9900 and presents
+      <em>the certificate remote peers already pinned</em>. Their pins stay valid. Nobody re-pairs.
+    </p>
+    <p>
+      An exit that closes its sockets is seen at once. A host that <em>freezes</em> — suspended,
+      lid shut, network gone — closes nothing, so the survivors wait out the silence timeout
+      first: succession is immediate on a clean exit and takes up to a minute on a wedged one.
+    </p>
+
+    <div class="term">
+      <div class="term-bar"><i></i><i></i><i></i><span>~/dev/web — the survivor</span></div>
+<pre><span class="c">(the terminal in ~/dev/api was closed)</span>
+
+The terminal hosting <span class="b">"backend"</span> exited. This terminal is now hosting
+the room; peers keep the same pinned identity and reconnect automatically.
+
+<span class="c">audit.log:</span> local_hub_succession</pre>
+    </div>
+
+    <p>
+      There is no <span class="mono">--keep</span> flag and no service to install, because there is
+      nothing for you to decide. If a local terminal survives, the room survives. An explicit
+      <span class="mono">/link off</span> never triggers a takeover of the port you just released.
+    </p>
+
+    <h3>How a dead peer is actually noticed</h3>
+    <p>
+      A suspended process, a closed laptop lid or a dropped Wi-Fi link leaves an established
+      socket that neither end notices for minutes — a <span class="mono">SIGSTOP</span>ped peer
+      still ACKs at the TCP layer. Only an unanswered WebSocket ping tells the two apart, so each
+      side pings every <span class="mono">heartbeatIntervalMs</span> and counts any inbound
+      traffic — a pong, or any frame at all — as proof of life.
+    </p>
+
+    <div class="tw"><table>
+      <tr><th></th><th>Hub watching a peer</th><th>Client watching the hub</th></tr>
+      <tr><td>Pings every</td><td colspan="2"><code>heartbeatIntervalMs</code> — 15s</td></tr>
+      <tr><td>Silence tolerated</td><td>30s: interval × <code>heartbeatMissesBeforeDrop</code> (2)</td><td>45s: <code>clientHubSilenceTimeoutMs</code></td></tr>
+      <tr><td>Noticed within</td><td>45s worst case — silence is judged on the next tick</td><td>60s worst case</td></tr>
+      <tr><td>Then</td><td>closed <code>4408</code>, grants revoked, transfers cleaned, roster rebroadcast, <code>peer_liveness_timeout</code> audited</td><td>the agent goes disconnected, and that transition is what triggers local succession</td></tr>
+    </table></div>
+
+    <p>
+      So the roster is <strong>bounded-stale, not live</strong>: a peer that vanished without a
+      close frame is still named for up to 45 seconds and no longer. A terminal that comes back —
+      after a crash, a sleep, a network flap — presents the same
+      <span class="mono">agentInstanceId</span> and evicts its own previous connection
+      (<span class="mono">peer_connection_superseded</span>, close <span class="mono">4409</span>)
+      rather than appearing in the room twice.
+    </p>
+    <p>
+      The asymmetry is deliberate. The client's deadline is the longer one because a client that
+      declares its hub dead too eagerly starts a takeover of a port that is still being served,
+      and a spurious succession is worse than a slightly stale roster. Every number here is a key
+      in <a href="#config"><code>link.json</code></a>; none of them is compiled in.
+    </p>
+
+    <div class="note warn">
+      <span class="lbl">Honest limit</span>
+      <p>
+        Succession is <strong>local only</strong>. If the last terminal on the hosting machine
+        exits, the room ends. Remote peers notice within their silence timeout and keep their pin,
+        but nothing re-dials for them: there is still no reconnect backoff, so they rejoin with
+        <span class="mono">/link on</span> once a host is back. Hosting never migrates between
+        machines — that is a different device identity, and every pin would rightly reject it.
+      </p>
+    </div>
+  </section>
+
+  <!-- ═══════════════════════════════════════════════ -->
+  <section id="commands">
+    <p class="kicker">Reference</p>
+    <h2>Commands</h2>
+    <p>
+      One registry generates both surfaces, so they cannot drift. <strong>P</strong> is
+      <code>/link</code> inside an agent and <code>omp-link</code> in a shell. Unknown flags are
+      errors, never silently ignored.
+    </p>
+
+    <div class="tw"><table>
+      <tr><th>Verb</th><th>Where</th><th>Usage</th><th>Does</th></tr>
+      <tr><td><code>status</code></td><td>both</td><td><code>status [--verbose]</code></td><td>The card. Never renders an unauthenticated terminal as active</td></tr>
+      <tr><td><code>on</code></td><td>agent</td><td><code>on</code></td><td>Rejoin the remembered room. Never creates one</td></tr>
+      <tr><td><code>create</code></td><td>agent</td><td><code>create &lt;name&gt;</code></td><td>Always creates. Never silently joins</td></tr>
+      <tr><td><code>join</code></td><td>agent</td><td><code>join [endpoint|invite]</code></td><td>Never creates. No target: lists candidates, does not pick</td></tr>
+      <tr><td><code>off</code></td><td>agent</td><td><code>off</code></td><td>Detach this agent only. Aliases <code>leave</code>, <code>link-leave</code></td></tr>
+      <tr><td><code>end</code></td><td>agent</td><td><code>end</code></td><td>Stop hosting for everyone. Hub only; names who gets dropped</td></tr>
+      <tr><td><code>scan</code></td><td>both</td><td><code>scan</code></td><td>Who responded. Labelled unverified</td></tr>
+      <tr><td><code>peers</code></td><td>agent</td><td><code>peers</code></td><td>Roster with what each peer may actually do</td></tr>
+      <tr><td><code>invite</code></td><td>agent</td><td><code>invite</code></td><td>Single-use code, 5 minutes. Hub only</td></tr>
+      <tr><td><code>accept</code></td><td>agent</td><td><code>accept &lt;id&gt; &lt;code&gt;</code></td><td>Code required. <code>--allow</code> sets initial capabilities</td></tr>
+      <tr><td><code>deny</code></td><td>agent</td><td><code>deny &lt;id&gt;</code></td><td>Refuse a pending request</td></tr>
+      <tr><td><code>devices</code></td><td>agent</td><td><code>devices [list|show|allow|deny|workspace|remove]</code></td><td>Inspect and edit trust</td></tr>
+      <tr><td><code>grant</code></td><td>agent</td><td><code>grant &lt;device&gt;</code></td><td>Single-use exec grant, bound to one agent instance</td></tr>
+      <tr><td><code>revoke</code></td><td>agent</td><td><code>revoke [device]</code></td><td>No argument: all grants. With one: grants plus unpair</td></tr>
+      <tr><td><code>shared</code></td><td>both</td><td><code>shared [--limit &lt;n&gt;]</code></td><td>Sharing receipt from the audit log</td></tr>
+      <tr><td><code>doctor</code></td><td>both</td><td><code>doctor</code></td><td>Measured diagnostics, not adjectives</td></tr>
+      <tr><td><code>cleanup</code></td><td>cli</td><td><code>cleanup [--apply]</code></td><td>Preview-only unless <code>--apply</code>; link-owned targets only</td></tr>
+      <tr><td><code>update</code></td><td>cli</td><td><code>update</code></td><td>Refuses to rebase a dirty tree without confirmation</td></tr>
+    </table></div>
+
+    <div class="note">
+      <span class="lbl">Two things to know</span>
+      <p>
+        <code>cleanup</code>, <code>update</code> and <code>version</code> are shell-only. Typing
+        <code>/link cleanup</code> in an agent is refused with
+        <em>"cleanup" runs in a terminal — type "omp-link cleanup" in a shell.</em>
+      </p>
+      <p>
+        <code>--json</code> and <code>--no-input</code> are shell-only globals, so
+        <code>/link status --json</code> is an unknown-flag error rather than a silent no-op.
+      </p>
+    </div>
+
+    <h3>Removed in v3.4.0</h3>
+    <p class="muted">Each removed verb names its replacement instead of reporting "unknown command".</p>
+    <div class="tw"><table>
+      <tr><th>Gone</th><th>Use</th><th>Why</th></tr>
+      <tr><td><code>start</code></td><td><code>create</code></td><td>It could silently join an existing room</td></tr>
+      <tr><td><code>revoke-grant</code>, <code>unpair</code></td><td><code>revoke</code></td><td>Three verbs for one intent</td></tr>
+      <tr><td><code>clean</code></td><td><code>cleanup</code></td><td>The old one SIGKILLed any pid on 9900/9901 without proving ownership</td></tr>
+      <tr><td><code>find</code></td><td><code>scan</code></td><td>It probed HTTP against an HTTPS-only hub and could never succeed</td></tr>
+    </table></div>
+  </section>
+
+  <!-- ═══════════════════════════════════════════════ -->
+  <section id="tools">
+    <p class="kicker">Reference</p>
+    <h2>Agent tools</h2>
+    <p>
+      Seven tools inside Pi; <a href="#mcp">six over MCP</a>, where
+      <code>link_compact</code> has no meaning. The instinct worth building:
+      <strong>prefer <code>link_exec</code></strong>. It runs a structured, path-confined
+      inspection on the peer and costs no model turn there. <code>link_send</code> wakes the other
+      agent and spends a turn — use it when you want reasoning, not a fact.
+    </p>
+
+    <div class="tw"><table>
+      <tr><th>Tool</th><th>Use it for</th><th>Peer turn</th></tr>
+      <tr><td><code>link_status</code></td><td>State, room, peers — structured, not scraped</td><td>no</td></tr>
+      <tr><td><code>link_exec</code></td><td><code>git_status</code>, <code>git_diff</code>, <code>git_log</code>, <code>search_text</code>, <code>read_file</code>, <code>list_dir</code></td><td>no</td></tr>
+      <tr><td><code>link_list</code></td><td>Who is in the room</td><td>no</td></tr>
+      <tr><td><code>link_discover</code></td><td>Which hubs respond (unverified)</td><td>no</td></tr>
+      <tr><td><code>link_send</code></td><td>Delegating actual reasoning to a peer</td><td>yes</td></tr>
+      <tr><td><code>link_compact</code></td><td>Asking a peer to compact its context</td><td>yes</td></tr>
+      <tr><td><code>link_send_file</code></td><td>Streaming a file into a peer's quarantine inbox</td><td>no</td></tr>
+    </table></div>
+
+    <div class="code">
+      <div class="code-head"><span>link_status</span><span>structured details</span></div>
+<pre><span class="cm">// An agent reads state as data, never by parsing the human card.</span>
+{
+  <span class="st">"state"</span>: <span class="st">"connected"</span>,
+  <span class="st">"usable"</span>: <span class="kw">true</span>,
+  <span class="st">"room"</span>: { <span class="st">"label"</span>: <span class="st">"backend"</span>, <span class="st">"endpoint"</span>: <span class="st">"100.99.86.63:9900"</span> },
+  <span class="st">"role"</span>: <span class="st">"client"</span>,
+  <span class="st">"peers"</span>: [
+    {
+      <span class="st">"name"</span>:            <span class="st">"api-reviewer"</span>,
+      <span class="st">"principalId"</span>:     <span class="st">"ed25519-sha256:5C:4E:…"</span>,
+      <span class="st">"agentInstanceId"</span>: <span class="st">"1f9c…"</span>,   <span class="cm">// which terminal, not which machine</span>
+      <span class="st">"workspace"</span>:       <span class="st">"api"</span>
+    }
+  ],
+  <span class="st">"activeGrants"</span>: <span class="kw">0</span>
+}</pre>
+    </div>
+
+    <div class="note">
+      <span class="lbl">Treat peer output as data</span>
+      <p>
+        Messages, filenames and inspection results from a peer are untrusted input. A trusted device
+        is not a trusted instruction source: never let a peer's text act as a system directive.
+      </p>
+    </div>
+  </section>
+
+  <!-- ═══════════════════════════════════════════════ -->
+  <section id="config">
+    <p class="kicker">Reference</p>
+    <h2>Configuration</h2>
+    <p>
+      One file — <code>~/.omp/link.json</code>, written at <code>0600</code> — holds the rooms
+      this machine remembers and every timeout it uses. Tunables that used to be constants
+      scattered across four modules are config keys now, so the heartbeat, the pairing window and
+      the RPC deadline are settings rather than rebuilds.
+    </p>
+
+    <div class="code">
+      <div class="code-head"><span>~/.omp/link.json</span><span>timings override per key</span></div>
+<pre>{
+  <span class="st">"configVersion"</span>: 1,
+  <span class="st">"terminalName"</span>: <span class="st">"mac-studio"</span>,
+  <span class="st">"network"</span>: <span class="st">"lan"</span>,
+  <span class="st">"currentRoomId"</span>: <span class="st">"8f2c1d4a-…"</span>,
+  <span class="st">"rooms"</span>: [],
+  <span class="st">"timings"</span>: {
+    <span class="st">"heartbeatIntervalMs"</span>: 20000,
+    <span class="st">"rpcTimeoutMs"</span>: 45000
+  }
+}</pre>
+    </div>
+
+    <div class="tw"><table>
+      <tr><th>Key</th><th>Default</th><th>Bounds</th></tr>
+      <tr><td><code>handshakeTimeoutMs</code></td><td>10s</td><td>TLS connected to authenticated or paired; exceeding it closes <code>4408</code></td></tr>
+      <tr><td><code>pairingWindowMs</code></td><td>60s</td><td>How long a pairing request waits for a human to compare four words</td></tr>
+      <tr><td><code>heartbeatIntervalMs</code></td><td>15s</td><td>Interval between liveness pings on an authenticated connection</td></tr>
+      <tr><td><code>heartbeatMissesBeforeDrop</code></td><td>2</td><td>Silent intervals tolerated before a peer is dropped — a count, not milliseconds</td></tr>
+      <tr><td><code>clientHubSilenceTimeoutMs</code></td><td>45s</td><td>Silence from the hub that means, to a client, that the hub is gone</td></tr>
+      <tr><td><code>rpcTimeoutMs</code></td><td>30s</td><td>How long <code>link_exec</code> waits for its correlated response</td></tr>
+      <tr><td><code>transferInactivityMs</code></td><td>30s</td><td>No chunk for this long fails an in-flight transfer</td></tr>
+      <tr><td><code>transferAbsoluteMs</code></td><td>120s</td><td>Ceiling on one transfer regardless of progress</td></tr>
+      <tr><td><code>discoveryProbeMs</code></td><td>1.2s</td><td>Budget for one discovery sweep: loopback, UDP broadcast, tailscale</td></tr>
+      <tr><td><code>grantDefaultMs</code></td><td>10min</td><td>Lifetime of an execution grant when the approver does not set one</td></tr>
+    </table></div>
+
+    <p>
+      Every value is validated per key against a floor, so a typo degrades to "slow", never to
+      "unusable", and one bad key never poisons its neighbour. Loading <strong>never throws</strong>:
+      a truncated, empty or hand-mangled file yields defaults plus a warning that
+      <code>doctor</code> prints on the <span class="mono">config problem</span> line. Keys this
+      build does not know are written back untouched, and a file from before v3.4.0 — one with no
+      <span class="mono">configVersion</span> — is migrated forward silently, because a room list
+      is not an authorization decision.
+    </p>
+
+    <div class="note">
+      <span class="lbl">What is deliberately not configurable</span>
+      <p>
+        Protocol and safety limits — chunk size, maximum file size, dedupe cache, rate-limit
+        windows, roster cap — are not keys. They are part of the wire contract or the security
+        model, and a config file must not be able to widen them. Timings are read once when a
+        terminal starts, so an edit takes effect on the next start, not mid-session.
+      </p>
+    </div>
+  </section>
+
+  <!-- ═══════════════════════════════════════════════ -->
+  <section id="trust">
+    <p class="kicker">Consent</p>
+    <h2>Consent and revocation</h2>
+    <p>
+      Every capability is off until you turn it on, and everything that leaves your machine is
+      written to a local log. <code>/link shared</code> renders that log as a receipt.
+    </p>
+
+    <div class="term">
+      <div class="term-bar"><i></i><i></i><i></i><span>the sharing receipt</span></div>
+<pre><span class="p">/link</span> shared
+
+What left this machine (most recent 6):
+  14:02:11  pairing_approved         test-runner
+  14:04:37  authorization_denied     test-runner
+  14:05:02  permissions_updated      test-runner
+  14:05:19  rpc_served               test-runner
+  14:07:44  file_transfer_received   test-runner
+  14:09:03  grant_created            test-runner
+
+Full record: /Users/you/.omp/audit.log
+Revoke everything now: /link revoke</pre>
+    </div>
+
+    <div class="tw"><table>
+      <tr><th>Capability</th><th>Permits</th><th>Default</th></tr>
+      <tr><td><code>observe</code></td><td>Appear in the roster, read status</td><td>on</td></tr>
+      <tr><td><code>message</code></td><td>Send you messages</td><td>on</td></tr>
+      <tr><td><code>inspectMetadata</code></td><td><code>git_status</code>, <code>git_log</code>, directory listings</td><td>off</td></tr>
+      <tr><td><code>readContent</code></td><td><code>read_file</code> and <code>search_text</code> within an export</td><td>off</td></tr>
+      <tr><td><code>readDiff</code></td><td><code>git_diff</code></td><td>off</td></tr>
+      <tr><td><code>fileInbox</code></td><td>Send files into your quarantine inbox</td><td>off</td></tr>
+      <tr><td><code>compact</code></td><td>Ask you to compact context</td><td>off</td></tr>
+      <tr><td><code>execRequest</code></td><td>Ask to run a shell command — and still needs a grant</td><td>off</td></tr>
+    </table></div>
+
+    <p>
+      Shell execution needs <strong>three</strong> independent things: the terminal started with
+      <code>--unsafe-remote-exec</code>, the device holding <code>execRequest</code>, and a live
+      single-use grant bound to one agent instance and one workspace. The flag is per-launch and
+      never persisted, so it must be re-stated every time — and granting it is equivalent to
+      handing that peer your local user account. Received files land in
+      <code>~/.omp/inbox/</code> at <code>0600</code>, never in your working tree.
+    </p>
+  </section>
+
+  <!-- ═══════════════════════════════════════════════ -->
+  <section id="trouble">
+    <p class="kicker">Reference</p>
+    <h2>Troubleshooting</h2>
+
+    <div class="tw"><table>
+      <tr><th>You see</th><th>Cause</th><th>Do</th></tr>
+      <tr>
+        <td><code>Port 9900 is in use by something that is not an omp-link hub</code></td>
+        <td>Another process holds the port</td>
+        <td><code>omp-link cleanup</code> to see what, without touching it</td>
+      </tr>
+      <tr>
+        <td><code>PAIRING_UNSUPPORTED_RUNTIME</code></td>
+        <td>The runtime cannot export TLS keying material, so no channel-bound code exists</td>
+        <td>Use a Node build with exporter support. There is deliberately no weaker fallback</td>
+      </tr>
+      <tr>
+        <td><code>Link · Blocked — identity changed</code></td>
+        <td>The host's SPKI no longer matches your pin</td>
+        <td>Stop. Confirm out of band before <code>/link devices remove</code></td>
+      </tr>
+      <tr>
+        <td><code>[Access Denied] Permission denied: "…" is explicitly denied</code></td>
+        <td>Working as designed — capabilities start closed</td>
+        <td><code>/link devices allow &lt;device&gt; &lt;capability&gt;</code></td>
+      </tr>
+      <tr>
+        <td>A received file is not in the repo</td>
+        <td>Also by design — quarantine, never the working tree</td>
+        <td>Look in <code>~/.omp/inbox/&lt;workspace&gt;/rx-&lt;pid&gt;-…/</code></td>
+      </tr>
+      <tr>
+        <td>Tailscale scan finds nothing</td>
+        <td>Peer offline, wrong network mode, or the hub bound to a LAN address</td>
+        <td><code>tailscale status --json</code>, then <code>doctor</code> for the bind address</td>
+      </tr>
+      <tr>
+        <td>Roster still lists a peer that is gone</td>
+        <td>Liveness is bounded, not instant: an unanswered ping needs up to 45s to drop the peer</td>
+        <td>Wait a sweep, or lower <code>heartbeatIntervalMs</code> in <code>link.json</code></td>
+      </tr>
+      <tr>
+        <td>A peer was closed with code <code>4408</code></td>
+        <td>It stopped answering pings — suspended process, closed lid, dead network</td>
+        <td>Nothing here; <code>peer_liveness_timeout</code> is in the audit log. The peer rejoins with <code>/link on</code></td>
+      </tr>
+      <tr>
+        <td><code>AUDIT LOG NOT WRITABLE</code> in <code>doctor</code></td>
+        <td>The state directory is read-only or full, so security decisions are not being recorded</td>
+        <td>Fix write access to <code>~/.omp</code>, or point <code>OMP_DIR</code> at a writable directory</td>
+      </tr>
+      <tr>
+        <td>An MCP tool answers that there is no room</td>
+        <td>The server attaches to the room in <code>link.json</code> and never creates one</td>
+        <td><code>omp-link create &lt;name&gt;</code> or <code>omp-link join &lt;ip:port&gt;</code>, then call the tool again</td>
+      </tr>
+    </table></div>
+  </section>
+
+  <!-- ═══════════════════════════════════════════════ -->
+  <section id="limits">
+    <p class="kicker">Boundaries</p>
+    <h2>What it does not do</h2>
+    <p>Stated plainly, because a security tool that oversells itself is worse than none.</p>
+
+    <div class="tw"><table>
+      <tr><th>Not this</th><th>Why it matters to you</th></tr>
+      <tr><td>Not end-to-end encrypted between clients</td><td>The hub terminates TLS and can read and log everything it routes. Host rooms on a machine you control</td></tr>
+      <tr><td>Not a sandbox</td><td>The Mutation Guard is advisory. Granting shell execution is equivalent to handing that peer your local user account</td></tr>
+      <tr><td>Not resistant to local compromise</td><td>Anything that can read <code>~/.omp</code> holds your device identity. Sibling-terminal admission rests on exactly this stated boundary</td></tr>
+      <tr><td>Not private source code</td><td>Granting inspect discloses non-sensitive repository contents. Sensitive paths (<code>.env</code>, keys, <code>*.pem</code>) are refused; the rest is readable</td></tr>
+      <tr><td>Not authorised by network membership</td><td>Sharing a tailnet grants nothing. Only pairing does</td></tr>
+      <tr><td>No host migration between machines</td><td>A different machine is a different identity. Succession is local only, by design</td></tr>
+      <tr><td>No reconnect backoff yet</td><td>Liveness notices a dropped link within a bounded window, but nothing re-dials: rejoin with <code>/link on</code></td></tr>
+      <tr><td>No compaction over MCP</td><td>MCP hosts expose no compaction API, so <code>link_compact</code> is absent there rather than faked</td></tr>
+      <tr><td>The MCP server never creates or joins a room</td><td>Rooms stay a human decision; a background process started by an editor must not open a port for you</td></tr>
+      <tr><td>Nested repos share the parent export</td><td>Named workspace exports are not implemented yet</td></tr>
+    </table></div>
+
+    <p class="muted">
+      Deeper reading lives beside the code: <code>docs/concepts.md</code>,
+      <code>docs/scenarios.md</code>, <code>docs/security.md</code> and the authoritative threat
+      model in <code>SECURITY.md</code>.
+    </p>
+  </section>
+
+  </main>
+</div>
+
+<footer>
+  <div class="footer-in">
+    <span>omp-link v3.4.0 · protocol 5 · MIT</span>
+    <span>Built for Oh My Pi and Pi; speaks MCP to everything else. Runs on your own machines.</span>
+  </div>
+</footer>
+
+<script>
+  (function () {
+    var root = document.documentElement;
+    var icon = document.getElementById("themeIcon");
+    var label = document.getElementById("themeLabel");
+
+    function apply(theme) {
+      root.setAttribute("data-theme", theme);
+      icon.textContent = theme === "dark" ? "☀" : "☾";
+      label.textContent = theme === "dark" ? "light" : "dark";
+      try { localStorage.setItem("omp-link-theme", theme); } catch (e) {}
+    }
+
+    var stored = null;
+    try { stored = localStorage.getItem("omp-link-theme"); } catch (e) {}
+    var prefersDark = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
+    apply(stored || (prefersDark ? "dark" : "light"));
+
+    document.getElementById("themeToggle").addEventListener("click", function () {
+      apply(root.getAttribute("data-theme") === "dark" ? "light" : "dark");
+    });
+
+    // Mobile nav
+    var side = document.getElementById("side");
+    document.getElementById("navBtn").addEventListener("click", function () {
+      side.classList.toggle("open");
+    });
+    side.addEventListener("click", function (e) {
+      if (e.target.tagName === "A") side.classList.remove("open");
+    });
+
+    // Copy buttons on every code and terminal block
+    document.querySelectorAll(".term, .code").forEach(function (block) {
+      var pre = block.querySelector("pre");
+      if (!pre) return;
+      var btn = document.createElement("button");
+      btn.className = "copy";
+      btn.type = "button";
+      btn.textContent = "copy";
+      btn.addEventListener("click", function () {
+        var text = pre.innerText;
+        var done = function () {
+          btn.textContent = "copied";
+          setTimeout(function () { btn.textContent = "copy"; }, 1400);
+        };
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(text).then(done, function () { btn.textContent = "failed"; });
+        } else {
+          var ta = document.createElement("textarea");
+          ta.value = text;
+          document.body.appendChild(ta);
+          ta.select();
+          try { document.execCommand("copy"); done(); } catch (e) { btn.textContent = "failed"; }
+          document.body.removeChild(ta);
+        }
+      });
+      block.appendChild(btn);
+    });
+
+    // Scroll spy
+    var links = Array.prototype.slice.call(document.querySelectorAll(".side a"));
+    var byId = {};
+    links.forEach(function (a) { byId[a.getAttribute("href").slice(1)] = a; });
+    var sections = links
+      .map(function (a) { return document.getElementById(a.getAttribute("href").slice(1)); })
+      .filter(Boolean);
+
+    if ("IntersectionObserver" in window) {
+      var seen = {};
+      var io = new IntersectionObserver(function (entries) {
+        entries.forEach(function (en) { seen[en.target.id] = en.isIntersecting; });
+        var current = null;
+        sections.forEach(function (s) { if (seen[s.id] && !current) current = s.id; });
+        if (!current) return;
+        links.forEach(function (a) { a.classList.remove("on"); });
+        if (byId[current]) byId[current].classList.add("on");
+      }, { rootMargin: "-84px 0px -68% 0px", threshold: 0 });
+      sections.forEach(function (s) { io.observe(s); });
+    }
+  })();
+</script>
+
+</body>
+</html>

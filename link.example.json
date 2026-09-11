@@ -1,8 +1,0 @@
-{
-  "port": 9900,
-  "bind": "0.0.0.0",
-  "hub": "100.64.0.1:9900",
-  "tailscaleOnly": false,
-  "secret": "",
-  "lanDiscovery": true
-}

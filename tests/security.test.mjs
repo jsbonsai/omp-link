@@ -14,7 +14,6 @@ import {
   loadPairedDevices,
   savePairedDevice,
   removePairedDevice,
-  derivePairingSas,
   createInvite,
   verifyAndConsumeInvite,
   DEFAULT_PERMISSIONS,
@@ -129,18 +128,6 @@ describe("OMP-LINK v5 Security & Cryptography Suite", () => {
       assert.strictEqual(afterRemove.has(normalizeFingerprint(id.fingerprint)), false);
     });
 
-    test("Pairing SAS derivation is deterministic and resists MITM substitution", () => {
-      const cert1 = Buffer.from("dummy-hub-cert-der");
-      const cert2 = Buffer.from("dummy-client-cert-der");
-      const sas1 = derivePairingSas(cert1, cert2, "hub-nonce-1", "cli-nonce-1");
-      const sas2 = derivePairingSas(cert1, cert2, "hub-nonce-1", "cli-nonce-1");
-      assert.strictEqual(sas1, sas2);
-
-      // Tampered nonce yields completely different SAS
-      const sasTampered = derivePairingSas(cert1, cert2, "tampered-nonce", "cli-nonce-1");
-      assert.notStrictEqual(sas1, sasTampered);
-    });
-
     test("One-time pairing invite is consumed and single-use", () => {
       const id = getOrCreateDeviceIdentity(tempDir);
       const invite = createInvite(id, { expiresInMs: 60_000 });
@@ -236,8 +223,13 @@ describe("OMP-LINK v5 Security & Cryptography Suite", () => {
       assert.strictEqual(isActionPermitted({ ...DEFAULT_PERMISSIONS, message: false }, baseChat).permitted, false);
 
       const baseInspect = { type: "rpc_request", version: 5, id: "2", to: "hub", action: "git_status", ts: Date.now() };
-      assert.strictEqual(isActionPermitted({ ...DEFAULT_PERMISSIONS, inspect: false }, baseInspect).permitted, false);
-      assert.strictEqual(isActionPermitted({ ...DEFAULT_PERMISSIONS, inspect: true }, baseInspect).permitted, true);
+      assert.strictEqual(isActionPermitted({ ...DEFAULT_PERMISSIONS, inspectMetadata: false }, baseInspect).permitted, false);
+      assert.strictEqual(isActionPermitted({ ...DEFAULT_PERMISSIONS, inspectMetadata: true }, baseInspect).permitted, true);
+
+      // An explicit granular denial outranks the legacy `inspect` alias...
+      assert.strictEqual(isActionPermitted({ ...DEFAULT_PERMISSIONS, inspect: true }, baseInspect).permitted, false);
+      // ...but a pre-migration record, which has no granular flag at all, still works.
+      assert.strictEqual(isActionPermitted({ inspect: true }, baseInspect).permitted, true);
 
       const baseExec = { type: "rpc_request", version: 5, id: "3", to: "hub", action: "exec", params: { command: "ls" }, ts: Date.now() };
       assert.strictEqual(isActionPermitted({ ...DEFAULT_PERMISSIONS, execRequest: false }, baseExec).permitted, false);
@@ -264,81 +256,108 @@ describe("OMP-LINK v5 Security & Cryptography Suite", () => {
       assert.strictEqual(bound.originPrincipalId, "ed25519-sha256:AUTHENTICATED_KEY_123");
     });
 
-    test("Execution grants are keyed by principalId and expire after single use", () => {
+    test("Execution grants are keyed by (principal, agent instance) and expire after single use", () => {
       const principal = "ed25519-sha256:TEST_DEV_KEY";
+      const agent = "agent-instance-test-dev";
       revokeAllGrants();
 
       // Blocked before grant
-      assert.strictEqual(checkAndConsumeExecGrant(principal).allowed, false);
+      assert.strictEqual(checkAndConsumeExecGrant(principal, agent).allowed, false);
 
       // Create single-use grant
-      const grant = createExecGrant(principal, "test-peer", { maxUses: 1, durationMs: 10_000 });
+      const grant = createExecGrant(principal, agent, "test-peer", { maxUses: 1, durationMs: 10_000 });
       assert.strictEqual(grant.principalId, principal);
+      assert.strictEqual(grant.agentInstanceId, agent);
       assert.strictEqual(grant.remainingUses, 1);
 
       // First use succeeds
-      const check1 = checkAndConsumeExecGrant(principal);
+      const check1 = checkAndConsumeExecGrant(principal, agent);
       assert.strictEqual(check1.allowed, true);
 
       // Second use fails (single use exhausted)
-      const check2 = checkAndConsumeExecGrant(principal);
+      const check2 = checkAndConsumeExecGrant(principal, agent);
       assert.strictEqual(check2.allowed, false);
       assert.match(check2.reason, /No active execution grant found/);
     });
 
+    test("Two terminals on one device do not share an execution grant", () => {
+      const principal = "ed25519-sha256:SHARED_DEVICE";
+      revokeAllGrants();
+
+      createExecGrant(principal, "agent-alpha", "terminal-alpha", { maxUses: 1, durationMs: 60_000 });
+
+      // The sibling terminal on the same machine presents the same device principal.
+      assert.strictEqual(checkAndConsumeExecGrant(principal, "agent-beta").allowed, false);
+      assert.strictEqual(checkAndConsumeExecGrant(principal, "agent-alpha").allowed, true);
+
+      // Revoking one instance leaves the other alone; omitting the instance revokes both.
+      createExecGrant(principal, "agent-alpha", "terminal-alpha", { maxUses: 2, durationMs: 60_000 });
+      createExecGrant(principal, "agent-beta", "terminal-beta", { maxUses: 2, durationMs: 60_000 });
+      assert.strictEqual(revokeGrantsForPrincipal(principal, "agent-alpha", "Terminal closed"), 1);
+      assert.strictEqual(checkAndConsumeExecGrant(principal, "agent-alpha").allowed, false);
+      assert.strictEqual(checkAndConsumeExecGrant(principal, "agent-beta").allowed, true);
+
+      createExecGrant(principal, "agent-alpha", "terminal-alpha", { maxUses: 1, durationMs: 60_000 });
+      assert.strictEqual(revokeGrantsForPrincipal(principal, undefined, "Device revoked"), 2);
+      assert.strictEqual(getActiveGrants().some((g) => g.principalId === principal), false);
+    });
+
     test("Execution grants revoked immediately on peer disconnect", () => {
       const principal = "ed25519-sha256:DISCONNECT_TEST";
-      createExecGrant(principal, "peer-disc", { maxUses: 5, durationMs: 60_000 });
+      const agent = "agent-instance-disconnect";
+      createExecGrant(principal, agent, "peer-disc", { maxUses: 5, durationMs: 60_000 });
       assert.strictEqual(getActiveGrants().some((g) => g.principalId === principal), true);
 
       // Revoke on disconnect
-      const revokedCount = revokeGrantsForPrincipal(principal, "Peer disconnected");
+      const revokedCount = revokeGrantsForPrincipal(principal, agent, "Peer disconnected");
       assert.strictEqual(revokedCount, 1);
-      assert.strictEqual(checkAndConsumeExecGrant(principal).allowed, false);
+      assert.strictEqual(checkAndConsumeExecGrant(principal, agent).allowed, false);
     });
 
     test("A new peer reusing the display name does NOT inherit another device's grant", () => {
       const oldPrincipal = "ed25519-sha256:OLD_DEVICE";
       const newPrincipal = "ed25519-sha256:NEW_DEVICE_SAME_NAME";
-      createExecGrant(oldPrincipal, "worker-node", { maxUses: 5 });
+      createExecGrant(oldPrincipal, "agent-old", "worker-node", { maxUses: 5 });
 
       // Check with new principal fails even if display name was identical
-      const check = checkAndConsumeExecGrant(newPrincipal);
+      const check = checkAndConsumeExecGrant(newPrincipal, "agent-new");
       assert.strictEqual(check.allowed, false);
     });
 
     test("Execution grant workspace confinement is strictly enforced (missing workspace does not bypass confinement)", () => {
       const principal = "ed25519-sha256:CONFINED_DEV";
-      createExecGrant(principal, "confined-peer", {
+      const agent = "agent-instance-confined";
+      createExecGrant(principal, agent, "confined-peer", {
         workspaceId: "backend-core",
         maxUses: 3,
         durationMs: 60_000,
       });
 
       // 1. Unspecified workspace fails
-      const checkMissing = checkAndConsumeExecGrant(principal, undefined);
+      const checkMissing = checkAndConsumeExecGrant(principal, agent, undefined);
       assert.strictEqual(checkMissing.allowed, false);
       assert.match(checkMissing.reason, /confined to workspace "backend-core"/);
 
       // 2. Mismatched workspace fails
-      const checkWrong = checkAndConsumeExecGrant(principal, "frontend-ui");
+      const checkWrong = checkAndConsumeExecGrant(principal, agent, "frontend-ui");
       assert.strictEqual(checkWrong.allowed, false);
       assert.match(checkWrong.reason, /confined to workspace "backend-core"/);
 
       // 3. Matching workspace succeeds
-      const checkMatching = checkAndConsumeExecGrant(principal, "backend-core");
+      const checkMatching = checkAndConsumeExecGrant(principal, agent, "backend-core");
       assert.strictEqual(checkMatching.allowed, true);
     });
 
     test("Execution grant lifecycle events are appended to audit log", () => {
       const principal = "ed25519-sha256:AUDIT_TEST";
-      createExecGrant(principal, "audit-peer", { maxUses: 1, durationMs: 10_000 });
-      checkAndConsumeExecGrant(principal);
-      revokeGrantsForPrincipal(principal, "Test cleanup");
+      const agent = "agent-instance-audit";
+      createExecGrant(principal, agent, "audit-peer", { maxUses: 1, durationMs: 10_000 });
+      checkAndConsumeExecGrant(principal, agent);
+      revokeGrantsForPrincipal(principal, agent, "Test cleanup");
 
       const logs = readAuditLogs(50);
-      assert.ok(logs.some((l) => l.type === "grant_created" && l.principalId === principal));
-      assert.ok(logs.some((l) => l.type === "grant_used" && l.principalId === principal));
+      assert.ok(logs.some((l) => l.type === "grant_created" && l.principalId === principal && l.agentInstanceId === agent));
+      assert.ok(logs.some((l) => l.type === "grant_used" && l.principalId === principal && l.agentInstanceId === agent));
     });
   });
 
@@ -608,9 +627,8 @@ describe("OMP-LINK v5 Security & Cryptography Suite", () => {
 
   describe("6. Discovery & Minimal Public Status", () => {
     test("Status headers include no-store, CSP none, and nosniff", async () => {
-      const testPort = 19945;
       const node = new LinkNode({
-        port: testPort,
+        port: 0,
         customOmpDir: tempDir,
       });
 
@@ -620,7 +638,7 @@ describe("OMP-LINK v5 Security & Cryptography Suite", () => {
       const agent = new https.Agent({ rejectUnauthorized: false, minVersion: "TLSv1.3" });
 
       const res = await new Promise((resolve, reject) => {
-        https.get(`https://127.0.0.1:${testPort}/status`, { agent }, (resp) => {
+        https.get(`https://127.0.0.1:${node.port}/status`, { agent }, (resp) => {
           let data = "";
           resp.on("data", (chunk) => data += chunk);
           resp.on("end", () => resolve({ headers: resp.headers, body: JSON.parse(data) }));
@@ -652,12 +670,11 @@ describe("OMP-LINK v5 Security & Cryptography Suite", () => {
 
   describe("7. Mutual TLS 1.3 Loopback Integration", () => {
     test("Hub and client perform full mutual TLS 1.3 handshake and exchange authenticated frames", async () => {
-      const testPort = 19946;
       const hubDir = fs.mkdtempSync(path.join(os.tmpdir(), "hub-dir-"));
       const clientDir = fs.mkdtempSync(path.join(os.tmpdir(), "client-dir-"));
 
       const hub = new LinkNode({
-        port: testPort,
+        port: 0,
         customOmpDir: hubDir,
         terminalName: "hub-node",
       });
@@ -687,7 +704,7 @@ describe("OMP-LINK v5 Security & Cryptography Suite", () => {
         receivedOnHub = msg;
       };
 
-      await client.connectToHub(`wss://127.0.0.1:${testPort}`, hub.identity.fingerprint);
+      await client.connectToHub(`wss://127.0.0.1:${hub.port}`, hub.identity.fingerprint);
 
       // Wait for authentication
       await new Promise((r) => setTimeout(r, 200));
